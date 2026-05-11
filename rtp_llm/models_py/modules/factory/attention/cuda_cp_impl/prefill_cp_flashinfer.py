@@ -158,13 +158,18 @@ class CPFlashInferImpl(FMHAImplBase):
 
         self.attn_inputs = attn_inputs
 
-    def support(self) -> bool:
-        """Check if this implementation supports current inputs."""
-        return self.fmha_impl.support(self.attn_inputs)
-
     @classmethod
     def support(cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs):
         return True
+
+    @classmethod
+    def support_parallelism_config(
+        cls, parallelism_config: Optional[ParallelismConfig]
+    ) -> bool:
+        if parallelism_config is None:
+            return False
+        cp_cfg = parallelism_config.prefill_cp_config
+        return cp_cfg.is_enabled() and cp_cfg.method in impl_map
 
     def fmha_type(self) -> FMHAType:
         return FMHAType.CP_FLASH_INFER

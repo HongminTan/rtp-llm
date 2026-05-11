@@ -28,6 +28,7 @@ from rtp_llm.models_py.modules.factory.attention.attn_factory import (
 )
 
 device_type = get_device_type()
+# currently append early means impl has higher priority
 if device_type == DeviceType.ROCm:
     # Import to register ROCm FMHA implementations
     from rtp_llm.models_py.modules.factory.attention.rocm_impl.aiter import (
@@ -45,88 +46,86 @@ if device_type == DeviceType.ROCm:
     DECODE_MHA_IMPS.append(AiterDecodeImplTriton)
     DECODE_MHA_IMPS.append(AiterDecodeImplAsm)
     DECODE_MHA_IMPS.append(AiterDecodeImplNonAsm)
-else:
-    # currently append early means impl has higher priority
-    if device_type == DeviceType.Cuda:
-        from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise import (
-            HeadWisePrefillImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise_fp8 import (
+elif device_type == DeviceType.Cuda:
+    from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_cp_flashinfer import (
+        CPFlashInferImpl,
+    )
+    from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise import (
+        HeadWisePrefillImpl,
+    )
+    from rtp_llm.models_py.modules.factory.attention.cuda_headwise_impl.headwise_fp8 import (
+        HeadWiseFP8PrefillImpl,
+    )
+    from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
+        PyFlashinferDecodeImpl,
+        PyFlashinferPagedPrefillImpl,
+        PyFlashinferPrefillImpl,
+    )
+    from rtp_llm.models_py.modules.factory.attention.cuda_impl.trt import (
+        TRTMHAImpl,
+        TRTPagedMHAImpl,
+    )
+    from rtp_llm.models_py.modules.factory.attention.cuda_impl.trtllm_gen import (
+        FlashInferTRTLLMDecodeImpl,
+        FlashInferTRTLLMPrefillImpl,
+        FlashInferTRTLLMSpecDecodeImpl,
+    )
+    from rtp_llm.models_py.modules.factory.attention.cuda_impl.xqa import get_xqa_impl
+    from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla_wrapper import (
+        MlaFlashInferDecodeImpl,
+        MlaFlashInferPrefillImpl,
+    )
+
+    PREFILL_MHA_IMPS.extend(
+        [
             HeadWiseFP8PrefillImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
-            PyFlashinferDecodeImpl,
-            PyFlashinferPagedPrefillImpl,
-            PyFlashinferPrefillImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.trt import (
-            TRTMHAImpl,
-            TRTPagedMHAImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.trtllm_gen import (
-            FlashInferTRTLLMDecodeImpl,
-            FlashInferTRTLLMPrefillImpl,
+            HeadWisePrefillImpl,
+            CPFlashInferImpl,
             FlashInferTRTLLMSpecDecodeImpl,
-        )
-        from rtp_llm.models_py.modules.factory.attention.cuda_impl.xqa import (
-            get_xqa_impl,
-        )
+            FlashInferTRTLLMPrefillImpl,
+            PyFlashinferPagedPrefillImpl,
+            TRTPagedMHAImpl,
+            PyFlashinferPrefillImpl,
+            TRTMHAImpl,
+        ]
+    )
+    DECODE_MHA_IMPS.append(FlashInferTRTLLMDecodeImpl)
+    DECODE_MHA_IMPS.append(get_xqa_impl())
+    DECODE_MHA_IMPS.append(PyFlashinferDecodeImpl)
 
-        PREFILL_MHA_IMPS.extend(
-            [
-                HeadWiseFP8PrefillImpl,
-                HeadWisePrefillImpl,
-                FlashInferTRTLLMSpecDecodeImpl,
-                FlashInferTRTLLMPrefillImpl,
-                TRTMHAImpl,
-                PyFlashinferPrefillImpl,
-                PyFlashinferPagedPrefillImpl,
-                TRTPagedMHAImpl,
-            ]
-        )
-        DECODE_MHA_IMPS.extend([FlashInferTRTLLMDecodeImpl])
-        DECODE_MHA_IMPS.append(get_xqa_impl())
+    DECODE_MLA_IMPS.append(MlaFlashInferDecodeImpl)
+    PREFILL_MLA_IMPS.append(MlaFlashInferPrefillImpl)
 
-        from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashinfer_mla_wrapper import (
-            MlaFlashInferDecodeImpl,
-            MlaFlashInferPrefillImpl,
-        )
+    # SparseMlaImpl requires CUDA >= 12.9 for flash_mla support
+    try:
+        import torch
 
-        DECODE_MLA_IMPS.append(MlaFlashInferDecodeImpl)
-        PREFILL_MLA_IMPS.append(MlaFlashInferPrefillImpl)
+        if torch.version.cuda:
+            major, minor = map(int, torch.version.cuda.split(".")[:2])
+            if (major, minor) >= (12, 9):
+                from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
+                    SparseMlaCpImpl,
+                )
+                from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
+                    SparseMlaImpl,
+                )
 
-        # SparseMlaImpl requires CUDA >= 12.9 for flash_mla support
-        try:
-            import torch
-
-            if torch.version.cuda:
-                major, minor = map(int, torch.version.cuda.split(".")[:2])
-                if (major, minor) >= (12, 9):
-                    from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_cp_impl import (
-                        SparseMlaCpImpl,
-                    )
-                    from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.flashmla_sparse_impl import (
-                        SparseMlaImpl,
-                    )
-
-                    DECODE_MLA_IMPS.append(SparseMlaImpl)
-                    PREFILL_MLA_IMPS.append(SparseMlaImpl)
-                    PREFILL_MLA_IMPS.append(SparseMlaCpImpl)
-        except (ImportError, AttributeError, ValueError):
-            pass  # Skip SparseMlaImpl if CUDA < 12.9 or flash_mla not available
-
+                DECODE_MLA_IMPS.append(SparseMlaImpl)
+                PREFILL_MLA_IMPS.append(SparseMlaImpl)
+                PREFILL_MLA_IMPS.append(SparseMlaCpImpl)
+    except (ImportError, AttributeError, ValueError):
+        pass  # Skip SparseMlaImpl if CUDA < 12.9 or flash_mla not available
+else:
+    from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_cp_flashinfer import (
+        CPFlashInferImpl,
+    )
     from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
         PyFlashinferDecodeImpl,
         PyFlashinferPagedPrefillImpl,
         PyFlashinferPrefillImpl,
     )
 
+    PREFILL_MHA_IMPS.append(CPFlashInferImpl)
     PREFILL_MHA_IMPS.append(PyFlashinferPrefillImpl)
     PREFILL_MHA_IMPS.append(PyFlashinferPagedPrefillImpl)
     DECODE_MHA_IMPS.append(PyFlashinferDecodeImpl)
-
-    from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_cp_flashinfer import (
-        CPFlashInferImpl,
-    )
-
-    PREFILL_MHA_IMPS.append(CPFlashInferImpl)
