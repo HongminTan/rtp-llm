@@ -62,6 +62,8 @@ elif device_type == DeviceType.Cuda:
         PyFlashinferPrefillImpl,
     )
     from rtp_llm.models_py.modules.factory.attention.cuda_impl.trt import (
+        FlashInferTRTLLMFMHAv2PagedPrefillImpl,
+        FlashInferTRTLLMFMHAv2PrefillImpl,
         TRTMHAImpl,
         TRTPagedMHAImpl,
     )
@@ -85,8 +87,10 @@ elif device_type == DeviceType.Cuda:
             FlashInferTRTLLMPrefillImpl,
             PyFlashinferPagedPrefillImpl,
             TRTPagedMHAImpl,
+            FlashInferTRTLLMFMHAv2PagedPrefillImpl,
             PyFlashinferPrefillImpl,
             TRTMHAImpl,
+            FlashInferTRTLLMFMHAv2PrefillImpl,
         ]
     )
     DECODE_MHA_IMPS.append(FlashInferTRTLLMDecodeImpl)

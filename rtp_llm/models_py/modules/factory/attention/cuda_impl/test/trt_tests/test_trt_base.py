@@ -543,7 +543,10 @@ class TRTAttnTestBase(BaseAttentionTest):
 
         attn_inputs.dtype = get_typemeta(qkv)
 
-        is_supported = attn_op.support(attn_inputs)
+        try:
+            is_supported = attn_op.support(attn_configs, attn_inputs)
+        except TypeError:
+            is_supported = attn_op.support(attn_inputs)
         print(f"{op_name} support check: {is_supported}", flush=True)
 
         if not is_supported:

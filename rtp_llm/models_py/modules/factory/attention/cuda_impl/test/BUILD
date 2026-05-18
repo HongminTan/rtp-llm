@@ -130,6 +130,37 @@ py_test(
     },
 )
 
+# PrefillImpl BenchTest
+py_test(
+    name = "bench_prefill_impls",
+    srcs = [
+        "bench_prefill_impls.py",
+        "bench_utils.py",
+        "attention_ref.py",
+        "base_attention_test.py",
+    ],
+    args = [
+        "--q-dtype=bf16",
+        "--kv-cache-dtype=bf16",
+        "--input-len=15,128,1024,4096,16384,65536",
+        "--reuse-cache-ratio=0,0.3,0.7",
+        "--batch-size=1",
+        "--preset=qwen3-8b",
+        "--page-size=128",
+        "--warmup=10",
+        "--repeat=50",
+    ],
+    deps = py_test_deps + select({
+        "@//:using_cuda12_9_x86": flashinfer_deps,
+        "@//:cuda_pre_12_9": flashinfer_deps,
+        "//conditions:default": []
+    }),
+    tags = ["manual", "H20"],
+    exec_properties = {
+        'gpu': 'H20',
+    },
+)
+
 # FlashInfer Prefill Tests - organized in test_flashinfer_prefill/ subdirectory
 
 # Test for PyFlashinferPrefillAttnOp ragged prefill attention implementation
@@ -195,6 +226,47 @@ py_test(
         "test_flashinfer_prefill/test_mha_rotary_emb.py",
     ],
     deps = py_test_deps,
+    tags = ["H20"],
+    exec_properties = {
+        'gpu': 'H20',
+    },
+)
+
+# Flashinfer TRT attention tests
+py_test(
+    name = "test_trtllm_fmha_v2_paged_prefill",
+    srcs = [
+        "test_trtllm_fmha_v2_paged_prefill.py",
+        "trt_tests/test_trt_base.py",
+        "trt_tests/trt_test_utils.py",
+        "attention_ref.py",
+        "base_attention_test.py",
+    ],
+    deps = py_test_deps + select({
+        "@//:using_cuda12_9_x86": flashinfer_deps,
+        "@//:cuda_pre_12_9": flashinfer_deps,
+        "//conditions:default": []
+    }),
+    tags = ["H20"],
+    exec_properties = {
+        'gpu': 'H20',
+    },
+)
+
+py_test(
+    name = "test_trtllm_fmha_v2_prefill",
+    srcs = [
+        "test_trtllm_fmha_v2_prefill.py",
+        "trt_tests/test_trt_base.py",
+        "trt_tests/trt_test_utils.py",
+        "attention_ref.py",
+        "base_attention_test.py",
+    ],
+    deps = py_test_deps + select({
+        "@//:using_cuda12_9_x86": flashinfer_deps,
+        "@//:cuda_pre_12_9": flashinfer_deps,
+        "//conditions:default": []
+    }),
     tags = ["H20"],
     exec_properties = {
         'gpu': 'H20',
