@@ -58,6 +58,7 @@ elif device_type == DeviceType.Cuda:
     )
     from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
         PyFlashinferDecodeImpl,
+        PyFlashinferHybridPrefillImpl,
         PyFlashinferPagedPrefillImpl,
         PyFlashinferPrefillImpl,
     )
@@ -85,6 +86,7 @@ elif device_type == DeviceType.Cuda:
             CPFlashInferImpl,
             FlashInferTRTLLMSpecDecodeImpl,
             FlashInferTRTLLMPrefillImpl,
+            PyFlashinferHybridPrefillImpl,
             PyFlashinferPagedPrefillImpl,
             TRTPagedMHAImpl,
             FlashInferTRTLLMFMHAv2PagedPrefillImpl,
@@ -125,11 +127,13 @@ else:
     )
     from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
         PyFlashinferDecodeImpl,
+        PyFlashinferHybridPrefillImpl,
         PyFlashinferPagedPrefillImpl,
         PyFlashinferPrefillImpl,
     )
 
     PREFILL_MHA_IMPS.append(CPFlashInferImpl)
     PREFILL_MHA_IMPS.append(PyFlashinferPrefillImpl)
+    PREFILL_MHA_IMPS.append(PyFlashinferHybridPrefillImpl)
     PREFILL_MHA_IMPS.append(PyFlashinferPagedPrefillImpl)
     DECODE_MHA_IMPS.append(PyFlashinferDecodeImpl)

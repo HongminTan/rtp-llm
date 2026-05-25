@@ -1,6 +1,7 @@
 from typing import Any, Optional
 
 import torch
+from flashinfer.cascade import merge_state_in_place
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
@@ -209,7 +210,7 @@ class PyFlashinferPrefillPagedAttnOp(object):
             self.head_dim_qk,
             self.page_size,
             causal=True,
-            q_data_type=self.datatype,
+            q_data_type=get_scalar_type(attn_inputs.dtype),
             kv_data_type=kv_datatype,
         )
         return self.fmha_params
@@ -411,6 +412,202 @@ class PyFlashinferPrefillAttnOp(object):
         return self.prefill_wrapper.run(q, k, v)
 
 
+class PyFlashinferHybridPrefillAttnOp(object):
+    """FlashInfer hybrid prefill op.
+
+    It evaluates attention over the newest ragged KV segment and the existing
+    prefix paged KV cache separately, then merges the two attention states with
+    FlashInfer's LSE merge.
+    """
+
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        backend: str = "auto",
+    ) -> None:
+        self.ragged_workspace_buffer = get_py_flashinfer_workspace_buffer()
+        self.prefix_paged_workspace_buffer = get_py_flashinfer_workspace_buffer()
+        self.local_head_num = attn_configs.head_num
+        self.local_kv_head_num = attn_configs.kv_head_num
+        self.head_dim_qk = attn_configs.size_per_head
+        self.head_dim_vo = attn_configs.size_per_head
+        self.page_size = attn_configs.kernel_tokens_per_block
+        self.datatype = attn_configs.dtype
+        self.kv_cache_dtype = attn_configs.kv_cache_dtype
+        self.fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+        self.ragged_wrapper = BatchPrefillWithRaggedKVCacheWrapper(
+            self.ragged_workspace_buffer,
+            backend=backend,
+        )
+        self.prefix_paged_wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            self.prefix_paged_workspace_buffer,
+            "HND",
+            backend=backend,
+        )
+        self.ragged_stream = torch.cuda.Stream(
+            device=self.ragged_workspace_buffer.device
+        )
+        self.prefix_paged_stream = torch.cuda.Stream(
+            device=self.prefix_paged_workspace_buffer.device
+        )
+        self.prefix_paged_kv_indptr: Optional[torch.Tensor] = None
+        self.prefix_paged_kv_indices: Optional[torch.Tensor] = None
+        self.prefix_paged_kv_last_page_len: Optional[torch.Tensor] = None
+
+    def __del__(self):
+        ragged_workspace_buffer = getattr(self, "ragged_workspace_buffer", None)
+        prefix_paged_workspace_buffer = getattr(
+            self, "prefix_paged_workspace_buffer", None
+        )
+        if ragged_workspace_buffer is not None:
+            release_py_flashinfer_workspace_buffer(ragged_workspace_buffer)
+        if prefix_paged_workspace_buffer is not None:
+            release_py_flashinfer_workspace_buffer(prefix_paged_workspace_buffer)
+
+    def set_params(self, params: rtp_llm_ops.FlashInferMlaAttnParams):
+        """Set the params object to be used by this op."""
+        self.fmha_params = params
+
+    def _kv_datatype(self, attn_inputs: PyAttentionInputs) -> torch.dtype:
+        if self.kv_cache_dtype == KvCacheDataType.INT8:
+            return torch.int8
+        if self.kv_cache_dtype == KvCacheDataType.FP8:
+            return torch.float8_e4m3fn
+        return get_scalar_type(attn_inputs.dtype)
+
+    def _build_prefix_page_table(
+        self, attn_inputs: PyAttentionInputs
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a prefix-only paged KV table for the existing cache segment."""
+        device = attn_inputs.cu_seqlens.device
+        prefix_lengths = attn_inputs.prefix_lengths.cpu()
+        block_table = attn_inputs.kv_cache_kernel_block_id_host.cpu()
+        batch_size = attn_inputs.input_lengths.size(0)
+
+        indptr = [0]
+        indices: list[int] = []
+        last_page_len: list[int] = []
+        for batch_idx in range(batch_size):
+            prefix_len = int(prefix_lengths[batch_idx].item())
+            if prefix_len <= 0:
+                raise ValueError(
+                    "PyFlashinferHybridPrefillAttnOp requires every batch item "
+                    "to have a non-empty prefix cache"
+                )
+            page_count = (prefix_len + self.page_size - 1) // self.page_size
+            indices.extend(int(v) for v in block_table[batch_idx, :page_count].tolist())
+            indptr.append(indptr[-1] + page_count)
+            last_page_len.append((prefix_len - 1) % self.page_size + 1)
+
+        return (
+            torch.tensor(indptr, dtype=torch.int32, device=device),
+            torch.tensor(indices, dtype=torch.int32, device=device),
+            torch.tensor(last_page_len, dtype=torch.int32, device=device),
+        )
+
+    def prepare(
+        self,
+        attn_inputs: PyAttentionInputs,
+        forbid_realloc: bool = False,
+    ) -> ParamsBase:
+        """Prepare ragged-new and paged-prefix FlashInfer wrappers."""
+        check_attention_inputs(attn_inputs)
+        self.fmha_params.fill_params(
+            attn_inputs.prefix_lengths,
+            attn_inputs.sequence_lengths,
+            attn_inputs.input_lengths,
+            attn_inputs.kv_cache_kernel_block_id_host,
+            self.page_size,
+            forbid_realloc,
+        )
+
+        batch_size = attn_inputs.input_lengths.size(0)
+        qo_indptr = attn_inputs.cu_seqlens[: batch_size + 1]
+        q_datatype = get_scalar_type(attn_inputs.dtype)
+
+        self.ragged_wrapper.plan(
+            qo_indptr,
+            qo_indptr,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.head_dim_vo,
+            causal=True,
+            q_data_type=q_datatype,
+        )
+
+        (
+            self.prefix_paged_kv_indptr,
+            self.prefix_paged_kv_indices,
+            self.prefix_paged_kv_last_page_len,
+        ) = self._build_prefix_page_table(attn_inputs)
+
+        self.prefix_paged_wrapper.plan(
+            qo_indptr,
+            self.prefix_paged_kv_indptr,
+            self.prefix_paged_kv_indices,
+            self.prefix_paged_kv_last_page_len,
+            self.local_head_num,
+            self.local_kv_head_num,
+            self.head_dim_qk,
+            self.page_size,
+            causal=False,
+            q_data_type=q_datatype,
+            kv_data_type=self._kv_datatype(attn_inputs),
+        )
+        return self.fmha_params
+
+    @staticmethod
+    def support(attn_inputs: PyAttentionInputs) -> bool:
+        prefix_lengths = attn_inputs.prefix_lengths
+        return (
+            prefix_lengths is not None
+            and prefix_lengths.numel() > 0
+            and prefix_lengths.min().item() > 0
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+    ) -> torch.Tensor:
+        assert kv_cache is not None, "kv_cache is required for hybrid prefill"
+        paged_kv_cache = kv_cache.kv_cache_base
+        if paged_kv_cache.dim() == 2:
+            paged_kv_cache = common.reshape_paged_kv_cache(
+                paged_kv_cache, self.local_kv_head_num, self.page_size, self.head_dim_qk
+            )
+
+        current_stream = torch.cuda.current_stream(q.device)
+        self.ragged_stream.wait_stream(current_stream)
+        self.prefix_paged_stream.wait_stream(current_stream)
+        q.record_stream(self.ragged_stream)
+        k.record_stream(self.ragged_stream)
+        v.record_stream(self.ragged_stream)
+        q.record_stream(self.prefix_paged_stream)
+        paged_kv_cache.record_stream(self.prefix_paged_stream)
+
+        with torch.cuda.stream(self.ragged_stream):
+            new_out, new_lse = self.ragged_wrapper.run(q, k, v, return_lse=True)
+
+        with torch.cuda.stream(self.prefix_paged_stream):
+            prefix_out, prefix_lse = self.prefix_paged_wrapper.run(
+                q, paged_kv_cache, return_lse=True
+            )
+
+        current_stream.wait_stream(self.ragged_stream)
+        current_stream.wait_stream(self.prefix_paged_stream)
+        new_out.record_stream(current_stream)
+        new_lse.record_stream(current_stream)
+        prefix_out.record_stream(current_stream)
+        prefix_lse.record_stream(current_stream)
+        merge_state_in_place(new_out, new_lse, prefix_out, prefix_lse)
+        return new_out
+
+
 class PyFlashinferPrefillImplBase(FMHAImplBase):
     """Base class for FlashInfer prefill implementations (Ragged and Paged)."""
 
@@ -575,6 +772,57 @@ class PyFlashinferPagedPrefillImpl(PyFlashinferPrefillImplBase):
 
     def support_cuda_graph(self) -> bool:
         return True
+
+
+class PyFlashinferHybridPrefillImpl(PyFlashinferPrefillImplBase):
+    """FlashInfer hybrid prefill implementation.
+
+    The current qkv chunk attends to new ragged KV and existing prefix paged KV
+    separately, merges the two states via LSE, and only then appends new KV into
+    the paged cache.
+    """
+
+    def _create_fmha_impl(
+        self, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
+    ) -> Any:
+        """Create hybrid FMHA implementation."""
+        return PyFlashinferHybridPrefillAttnOp(attn_configs, attn_inputs)
+
+    def _create_rope_impl(self, attn_configs: AttentionConfigs) -> Any:
+        """Create RoPE implementation for hybrid layout."""
+        if attn_configs.rope_config.style == RopeStyle.No:
+            return None
+        return MhaRotaryEmbeddingOp(attn_configs)
+
+    def forward(
+        self,
+        qkv: torch.Tensor,
+        kv_cache: Optional[LayerKVCache],
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """Run hybrid prefill and append the new KV only after attention."""
+        if self.need_rope_kv_cache and self.rope_impl is not None:
+            query, key, value = self.rope_impl.forward(qkv)
+        else:
+            query, key, value = self._split_qkv(qkv)
+
+        result = self.fmha_impl.forward(query, key, value, kv_cache)
+
+        # Match the base write gate, but keep Hybrid's attention-before-write order.
+        if self.need_rope_kv_cache:
+            self.kv_cache_write_op.forward(key, value, kv_cache)
+        common.apply_write_cache_store(
+            self.write_cache_store_impl, self.attn_inputs, kv_cache
+        )
+        return result
+
+    @staticmethod
+    def support(attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs) -> bool:
+        """Check if hybrid prefill implementation is supported."""
+        return not is_sm_100() and PyFlashinferHybridPrefillAttnOp.support(attn_inputs)
+
+    def support_cuda_graph(self) -> bool:
+        return False
 
 
 class PyFlashinferPrefillImpl(PyFlashinferPrefillImplBase):

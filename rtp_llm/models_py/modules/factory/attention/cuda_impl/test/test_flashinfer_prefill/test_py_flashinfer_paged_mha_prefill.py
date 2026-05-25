@@ -14,7 +14,7 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.test.base_attention_t
     BaseAttentionTest,
     compare_tensors,
 )
-from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs
+from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs, get_typemeta
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -85,6 +85,7 @@ class TestPyFlashinferPrefillPagedAttnOp(BaseAttentionTest):
         attn_inputs.cu_seqlens = torch.tensor(
             cu_seqlens, dtype=torch.int32, device=self.device
         )
+        attn_inputs.dtype = get_typemeta(torch.zeros([1], dtype=torch.float16))
 
         return attn_inputs
 
