@@ -263,15 +263,17 @@ class BaseAttentionTest(unittest.TestCase):
 
         # Create combined KV cache with shape [total_blocks, 2, num_kv_heads, seq_size_per_block, head_dim]
         # where dim=1, index=0 is K and index=1 is V
-        kv_cache_combined = torch.randn(
-            total_blocks,
-            2,  # K and V
-            num_kv_heads,
-            seq_size_per_block,
-            head_dim,
-            dtype=dtype,
-            device=self.device,
-        )
+        shape = (total_blocks, 2, num_kv_heads, seq_size_per_block, head_dim)
+        if dtype == torch.float8_e4m3fn:
+            kv_cache_combined = (
+                torch.rand(*shape, dtype=torch.bfloat16, device=self.device) * 2 - 1
+            ).to(torch.float8_e4m3fn)
+        else:
+            kv_cache_combined = torch.randn(
+                *shape,
+                dtype=dtype,
+                device=self.device,
+            )
 
         kv_cache.kv_cache_base = kv_cache_combined
 

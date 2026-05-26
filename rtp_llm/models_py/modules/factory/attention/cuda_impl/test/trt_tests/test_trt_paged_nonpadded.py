@@ -12,6 +12,7 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.test.trt_tests.test_t
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.test.trt_tests.trt_test_utils import (
     print_attn_inputs_detail,
 )
+from rtp_llm.ops import KvCacheDataType
 from rtp_llm.ops.compute_ops import TRTPagedAttnOp
 
 
@@ -186,6 +187,197 @@ class TestTRTPagedAttnOpNonPadded(TRTAttnTestBase):
             attn_inputs=attn_inputs,
             prefix_lengths=prefix_lengths,
             use_padded=False,
+        )
+
+
+class TestTRTPagedAttnOpNonPaddedFP8(TRTAttnTestBase):
+    """Test suite for TRTPagedAttnOp in non-padded mode with FP8 KV cache
+
+    TRTPagedAttnOp (TRTPagedPrefillOp):
+    - Paged prefill with prefix cache (prompt caching), FP8 KV cache
+    - prefix_lengths must be > 0 (already cached KV)
+    - Processes new input_lengths tokens with existing prefix_lengths cache
+    - Total KV length = prefix_lengths + input_lengths
+    - Non-padded mode: variable sequence lengths (no padding)
+    """
+
+    def test_basic(self):
+        """Test basic TRTPagedAttnOp with FP8 KV cache"""
+        print(
+            "\n=== Test TRTPagedAttnOp Non-Padded FP8: Basic (With Prefix) ===",
+            flush=True,
+        )
+
+        batch_size = 1
+        input_lengths = [12]
+        prefix_lengths = [2]
+        head_num = 8
+        head_num_kv = 2
+        size_per_head = 32
+        seq_size_per_block = 8
+
+        attn_configs = self._create_config(
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+        )
+        attn_configs.kv_cache_dtype = KvCacheDataType.FP8
+
+        attn_inputs = self._create_prefill_attention_inputs(
+            batch_size, input_lengths, seq_size_per_block, prefix_lengths=prefix_lengths
+        )
+
+        attn_op = TRTPagedAttnOp(attn_configs)
+
+        self.run_correctness_test(
+            attn_op=attn_op,
+            op_name="TRTPagedAttnOp(FP8)",
+            batch_size=batch_size,
+            input_lengths=input_lengths,
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+            attn_configs=attn_configs,
+            attn_inputs=attn_inputs,
+            prefix_lengths=prefix_lengths,
+            use_padded=False,
+            atol=0.04,
+            rtol=0.04,
+            max_mismatched_ratio=0.05,
+        )
+
+    def test_batch(self):
+        """Test TRTPagedAttnOp with FP8 KV cache and multiple sequences"""
+        print("\n=== Test TRTPagedAttnOp Non-Padded FP8: Batch ===", flush=True)
+
+        batch_size = 4
+        input_lengths = [32, 64, 128, 256]
+        prefix_lengths = [32, 64, 128, 256]
+        head_num = 32
+        head_num_kv = 8
+        size_per_head = 128
+        seq_size_per_block = 64
+
+        attn_configs = self._create_config(
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+        )
+        attn_configs.kv_cache_dtype = KvCacheDataType.FP8
+
+        attn_inputs = self._create_prefill_attention_inputs(
+            batch_size, input_lengths, seq_size_per_block, prefix_lengths=prefix_lengths
+        )
+
+        attn_op = TRTPagedAttnOp(attn_configs)
+
+        self.run_correctness_test(
+            attn_op=attn_op,
+            op_name="TRTPagedAttnOp(FP8)",
+            batch_size=batch_size,
+            input_lengths=input_lengths,
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+            attn_configs=attn_configs,
+            attn_inputs=attn_inputs,
+            prefix_lengths=prefix_lengths,
+            use_padded=False,
+            atol=0.04,
+            rtol=0.04,
+            max_mismatched_ratio=0.05,
+        )
+
+    def test_gqa(self):
+        """Test TRTPagedAttnOp with FP8 KV cache and grouped query attention"""
+        print("\n=== Test TRTPagedAttnOp Non-Padded FP8: GQA ===", flush=True)
+
+        batch_size = 2
+        input_lengths = [128, 256]
+        prefix_lengths = [128, 256]
+        head_num = 32
+        head_num_kv = 4
+        size_per_head = 128
+        seq_size_per_block = 64
+
+        attn_configs = self._create_config(
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+        )
+        attn_configs.kv_cache_dtype = KvCacheDataType.FP8
+
+        attn_inputs = self._create_prefill_attention_inputs(
+            batch_size, input_lengths, seq_size_per_block, prefix_lengths=prefix_lengths
+        )
+
+        attn_op = TRTPagedAttnOp(attn_configs)
+
+        self.run_correctness_test(
+            attn_op=attn_op,
+            op_name="TRTPagedAttnOp(FP8)",
+            batch_size=batch_size,
+            input_lengths=input_lengths,
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+            attn_configs=attn_configs,
+            attn_inputs=attn_inputs,
+            prefix_lengths=prefix_lengths,
+            use_padded=False,
+            atol=0.04,
+            rtol=0.04,
+            max_mismatched_ratio=0.05,
+        )
+
+    def test_long_sequence(self):
+        """Test TRTPagedAttnOp with FP8 KV cache and long sequences"""
+        print("\n=== Test TRTPagedAttnOp Non-Padded FP8: Long Sequence ===", flush=True)
+
+        batch_size = 2
+        input_lengths = [512, 1024]
+        prefix_lengths = [512, 1024]
+        head_num = 32
+        head_num_kv = 8
+        size_per_head = 128
+        seq_size_per_block = 64
+
+        attn_configs = self._create_config(
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+        )
+        attn_configs.kv_cache_dtype = KvCacheDataType.FP8
+
+        attn_inputs = self._create_prefill_attention_inputs(
+            batch_size, input_lengths, seq_size_per_block, prefix_lengths=prefix_lengths
+        )
+
+        attn_op = TRTPagedAttnOp(attn_configs)
+
+        self.run_correctness_test(
+            attn_op=attn_op,
+            op_name="TRTPagedAttnOp(FP8)",
+            batch_size=batch_size,
+            input_lengths=input_lengths,
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            seq_size_per_block=seq_size_per_block,
+            attn_configs=attn_configs,
+            attn_inputs=attn_inputs,
+            prefix_lengths=prefix_lengths,
+            use_padded=False,
+            atol=0.04,
+            rtol=0.04,
+            max_mismatched_ratio=0.05,
         )
 
 
