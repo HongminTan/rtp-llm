@@ -12,11 +12,12 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.test.base_attention_t
     BaseAttentionTest,
     compare_tensors,
 )
+from rtp_llm.ops import KvCacheDataType
 from rtp_llm.ops.compute_ops import LayerKVCache, PyAttentionInputs, get_typemeta
+from rtp_llm.test.utils.numeric_util import assert_close_with_mismatch_tolerance
 
 
 class TestPyFlashinferHybridPrefillAttnOp(BaseAttentionTest):
-    """Correctness tests for PyFlashinferHybridPrefillAttnOp."""
 
     def _create_chunked_prefill_attention_inputs(
         self,
@@ -124,6 +125,7 @@ class TestPyFlashinferHybridPrefillAttnOp(BaseAttentionTest):
         head_num_kv: int,
         size_per_head: int,
         page_size: int,
+        kv_cache_dtype: KvCacheDataType = KvCacheDataType.BASE,
     ):
         config = self._create_config(
             head_num=head_num,
@@ -131,6 +133,10 @@ class TestPyFlashinferHybridPrefillAttnOp(BaseAttentionTest):
             size_per_head=size_per_head,
             seq_size_per_block=page_size,
         )
+        config.attn_configs.kv_cache_dtype = kv_cache_dtype
+
+        is_fp8 = kv_cache_dtype == KvCacheDataType.FP8
+        compute_dtype = torch.float16
 
         attn_inputs = self._create_chunked_prefill_attention_inputs(
             batch_size, prefix_lengths, input_lengths, page_size
@@ -146,35 +152,95 @@ class TestPyFlashinferHybridPrefillAttnOp(BaseAttentionTest):
         v_prefix_chunks = []
         ref_chunks = []
         for prefix_len, input_len in zip(prefix_lengths, input_lengths):
-            q_new = torch.randn(
-                input_len,
-                head_num,
-                size_per_head,
-                dtype=torch.float16,
-                device=self.device,
-            )
-            k_prefix = torch.randn(
-                prefix_len,
-                head_num_kv,
-                size_per_head,
-                dtype=torch.float16,
-                device=self.device,
-            )
-            v_prefix = torch.randn_like(k_prefix)
-            k_new = torch.randn(
-                input_len,
-                head_num_kv,
-                size_per_head,
-                dtype=torch.float16,
-                device=self.device,
-            )
-            v_new = torch.randn_like(k_new)
+            if is_fp8:
+                q_new = (
+                    torch.rand(
+                        input_len,
+                        head_num,
+                        size_per_head,
+                        dtype=compute_dtype,
+                        device=self.device,
+                    )
+                    * 2
+                    - 1
+                )
+                k_prefix = (
+                    torch.rand(
+                        prefix_len,
+                        head_num_kv,
+                        size_per_head,
+                        dtype=compute_dtype,
+                        device=self.device,
+                    )
+                    * 2
+                    - 1
+                )
+                v_prefix = (
+                    torch.rand(
+                        prefix_len,
+                        head_num_kv,
+                        size_per_head,
+                        dtype=compute_dtype,
+                        device=self.device,
+                    )
+                    * 2
+                    - 1
+                )
+                k_new = (
+                    torch.rand(
+                        input_len,
+                        head_num_kv,
+                        size_per_head,
+                        dtype=compute_dtype,
+                        device=self.device,
+                    )
+                    * 2
+                    - 1
+                )
+                v_new = (
+                    torch.rand(
+                        input_len,
+                        head_num_kv,
+                        size_per_head,
+                        dtype=compute_dtype,
+                        device=self.device,
+                    )
+                    * 2
+                    - 1
+                )
+            else:
+                q_new = torch.randn(
+                    input_len,
+                    head_num,
+                    size_per_head,
+                    dtype=compute_dtype,
+                    device=self.device,
+                )
+                k_prefix = torch.randn(
+                    prefix_len,
+                    head_num_kv,
+                    size_per_head,
+                    dtype=compute_dtype,
+                    device=self.device,
+                )
+                v_prefix = torch.randn_like(k_prefix)
+                k_new = torch.randn(
+                    input_len,
+                    head_num_kv,
+                    size_per_head,
+                    dtype=compute_dtype,
+                    device=self.device,
+                )
+                v_new = torch.randn_like(k_new)
+
+            k_full = torch.cat([k_prefix, k_new], dim=0)
+            v_full = torch.cat([v_prefix, v_new], dim=0)
 
             ref_chunks.append(
                 self._reference_chunked_prefill(
                     q_new,
-                    torch.cat([k_prefix, k_new], dim=0),
-                    torch.cat([v_prefix, v_new], dim=0),
+                    k_full,
+                    v_full,
                     prefix_len,
                     input_len,
                 )
@@ -201,15 +267,26 @@ class TestPyFlashinferHybridPrefillAttnOp(BaseAttentionTest):
             size_per_head,
             attn_inputs.kv_cache_kernel_block_id_host,
         )
+        if is_fp8:
+            kv_cache.kv_cache_base = kv_cache.kv_cache_base.to(torch.float8_e4m3fn)
 
         output = attn_op.forward(q, k_new, v_new, kv_cache)
-        compare_tensors(
-            output,
-            ref_output,
-            rtol=1e-2,
-            atol=1e-2,
-            name="Hybrid prefill output",
-        )
+        if is_fp8:
+            assert_close_with_mismatch_tolerance(
+                output.float(),
+                ref_output.float(),
+                atol=0.04,
+                rtol=0.04,
+                max_mismatched_elements=int(1e-5 * ref_output.numel()),
+            )
+        else:
+            compare_tensors(
+                output,
+                ref_output,
+                rtol=1e-2,
+                atol=1e-2,
+                name=f"Hybrid prefill output ({kv_cache_dtype.name})",
+            )
 
     def test_chunked_prefill_single_batch(self):
         self._test_hybrid_prefill_correctness(
@@ -286,6 +363,31 @@ class TestPyFlashinferHybridPrefillAttnOp(BaseAttentionTest):
             head_num_kv=8,
             size_per_head=128,
             page_size=64,
+        )
+
+
+class TestPyFlashinferHybridPrefillAttnOpFP8(TestPyFlashinferHybridPrefillAttnOp):
+
+    def _test_hybrid_prefill_correctness(
+        self,
+        batch_size: int,
+        prefix_lengths: List[int],
+        input_lengths: List[int],
+        head_num: int,
+        head_num_kv: int,
+        size_per_head: int,
+        page_size: int,
+        kv_cache_dtype: KvCacheDataType = KvCacheDataType.FP8,
+    ):
+        super()._test_hybrid_prefill_correctness(
+            batch_size=batch_size,
+            prefix_lengths=prefix_lengths,
+            input_lengths=input_lengths,
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=size_per_head,
+            page_size=page_size,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
 
