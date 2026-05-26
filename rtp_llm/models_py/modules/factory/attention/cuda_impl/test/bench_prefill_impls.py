@@ -256,29 +256,42 @@ def _build_inputs(
     """
     dtype = _Q_DTYPE_MAP[case.q_dtype_name]
     full_kv_len = case.prefix_len + case.input_len
-    q = torch.randn(
-        case.batch_size,
-        case.input_len,
-        case.head_num,
-        case.head_dim,
-        dtype=dtype,
-        device=device,
+    # Uniform[-1, 1] avoids FP8 overflow in attention kernels
+    q = (
+        torch.rand(
+            case.batch_size,
+            case.input_len,
+            case.head_num,
+            case.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        * 2
+        - 1
     )
-    k = torch.randn(
-        case.batch_size,
-        full_kv_len,
-        case.kv_head_num,
-        case.head_dim,
-        dtype=dtype,
-        device=device,
+    k = (
+        torch.rand(
+            case.batch_size,
+            full_kv_len,
+            case.kv_head_num,
+            case.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        * 2
+        - 1
     )
-    v = torch.randn(
-        case.batch_size,
-        full_kv_len,
-        case.kv_head_num,
-        case.head_dim,
-        dtype=dtype,
-        device=device,
+    v = (
+        torch.rand(
+            case.batch_size,
+            full_kv_len,
+            case.kv_head_num,
+            case.head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        * 2
+        - 1
     )
     return q, k, v
 
