@@ -141,15 +141,16 @@ py_test(
     ],
     args = [
         "--q-dtype=bf16",
-        "--kv-cache-dtype=bf16",
-        "--input-len=15,128,1024,4096,16384,65536",
-        "--reuse-cache-ratio=0,0.3,0.7",
+        "--kv-cache-dtype=bf16,fp8",
+        "--input-len=4096,16384,65536,131072",
+        "--reuse-cache-ratio=0,0.3,0.7,0.9",
         "--batch-size=1",
         "--preset=qwen3-8b",
-        "--page-size=128",
+        "--page-size=64",
         "--warmup=10",
-        "--repeat=50",
+        "--repeat=30",
     ],
+    env = {"GPU_COUNT": "8"},
     deps = py_test_deps + select({
         "@//:using_cuda12_9_x86": flashinfer_deps,
         "@//:cuda_pre_12_9": flashinfer_deps,
@@ -158,6 +159,7 @@ py_test(
     tags = ["manual", "H20"],
     exec_properties = {
         'gpu': 'H20',
+        'gpu_count': '8',
     },
 )
 

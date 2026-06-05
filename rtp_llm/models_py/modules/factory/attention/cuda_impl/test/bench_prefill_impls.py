@@ -16,11 +16,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import statistics
+import subprocess
 import sys
+import tempfile
+import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -442,13 +447,12 @@ def _run_one_impl(
     def forward_fn():
         captured["out"] = instance.forward(input_tensor, kv_cache, 0)
 
-    # Trial run once for clean error classification (FAIL: forward vs FAIL: bench).
     try:
         forward_fn()
         torch.cuda.synchronize()
     except Exception as e:
         result.status = "FAIL"
-        result.note = f"forward() failed: {_short_err(e)}"
+        result.note = f"forward() failed: {e}\n{traceback.format_exc()}"
         return result
 
     if ref_output is not None and captured["out"] is not None:
@@ -502,7 +506,7 @@ def _run_one_impl(
         )
     except Exception as e:
         result.status = "FAIL"
-        result.note = f"bench failed: {_short_err(e)}"
+        result.note = f"bench failed: {e}\n{traceback.format_exc()}"
         return result
 
     sorted_times = sorted(times)
@@ -571,6 +575,42 @@ def _print_table(results: List[BenchResult]) -> None:
     _log("=" * len(header))
 
 
+def _print_failures(results: List[BenchResult]) -> None:
+    """Print deduplicated FAIL/MISMATCH table with case params and error details."""
+    fail_results = [r for r in results if r.status in ("FAIL", "MISMATCH")]
+    if not fail_results:
+        return
+
+    # Deduplicate: group by (impl_name, status, first_line_of_note)
+    # so same root cause with different tracebacks still deduplicates
+    seen: dict[str, tuple[str, List[BenchCase]]] = {}
+    for r in fail_results:
+        first_line = r.note.split("\n", 1)[0] if r.note else ""
+        dedup_key = f"{r.impl_name}|{r.status}|{first_line}"
+        if dedup_key not in seen:
+            seen[dedup_key] = (r.note, [])
+        seen[dedup_key][1].append(r.case)
+
+    _log(f"\n{'='*70}")
+    _log(
+        f"FAIL/MISMATCH ({len(seen)} unique errors from {len(fail_results)} occurrences):"
+    )
+    _log(f"{'='*70}")
+
+    for i, (dedup_key, (full_note, cases)) in enumerate(seen.items()):
+        impl_name, status, _ = dedup_key.split("|", 2)
+        case_strs = [f"seq={c.seq_len}/{c.mode_tag}" for c in cases[:5]]
+        if len(cases) > 5:
+            case_strs.append(f"...+{len(cases)-5} more")
+        _log(f"\n  [{i+1}] {impl_name} ({status})")
+        _log(f"      cases: {', '.join(case_strs)}")
+        _log(f"      error:")
+        for line in full_note.strip().splitlines():
+            _log(f"        {line}")
+
+    _log(f"\n{'='*70}")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -610,11 +650,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--repeat", type=int, default=50)
     p.add_argument(
-        "--impls",
+        "--run-impls",
         type=str,
-        default="",
-        help="case-insensitive substring filter on impl class names; "
-        "empty = all impls",
+        default="all",
+        help="comma-separated case-insensitive substring patterns; only "
+        "impls whose class name matches any pattern are run. "
+        "'all' (default) runs every impl",
     )
     p.add_argument(
         "--check-correctness",
@@ -659,6 +700,9 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="number of forward iterations to profile",
     )
+    p.add_argument("--_worker-id", type=int, default=-1, help=argparse.SUPPRESS)
+    p.add_argument("--_results-file", type=str, default="", help=argparse.SUPPRESS)
+    p.add_argument("--_counter-file", type=str, default="", help=argparse.SUPPRESS)
     return p.parse_args()
 
 
@@ -678,23 +722,14 @@ def _resolve_head_shape(args: argparse.Namespace) -> Tuple[int, int, int]:
     return head_num, kv_head_num, head_dim
 
 
-def main() -> int:
-    args = parse_args()
-    if not torch.cuda.is_available():
-        _log("CUDA not available, skipping benchmark")
-        return 0
-
-    set_seed(42)
-    device = torch.device("cuda")
-
-    try:
-        _setup_exec_ctx()
-    except Exception as e:
-        _log(f"warning: init_exec_ctx failed: {e}")
-
+def _build_all_cases(args: argparse.Namespace) -> List[BenchCase]:
+    """Build the full list of benchmark cases from parsed args."""
     head_num, kv_head_num, head_dim = _resolve_head_shape(args)
     q_dtypes = [d.strip() for d in args.q_dtype.split(",") if d.strip()]
     kv_dtypes = [d.strip() for d in args.kv_cache_dtype.split(",") if d.strip()]
+    input_lens = [int(x) for x in args.input_len.split(",") if x.strip()]
+    reuse_ratios = [float(x) for x in args.reuse_cache_ratio.split(",") if x.strip()]
+
     for q in q_dtypes:
         assert (
             q in _Q_DTYPE_MAP
@@ -703,116 +738,336 @@ def main() -> int:
         assert (
             kv in _KV_CACHE_DTYPE_MAP
         ), f"unknown --kv-cache-dtype '{kv}', supported: {list(_KV_CACHE_DTYPE_MAP)}"
-    input_lens = [int(x) for x in args.input_len.split(",") if x.strip()]
-    reuse_ratios = [float(x) for x in args.reuse_cache_ratio.split(",") if x.strip()]
     for r in reuse_ratios:
         assert 0.0 <= r < 1.0, f"--reuse-cache-ratio must be in [0, 1), got {r}"
-    impl_filter = args.impls.strip().lower()
 
-    selected_impls = [
-        cls
-        for cls in PREFILL_MHA_IMPS
-        if not impl_filter or impl_filter in cls.__name__.lower()
-    ]
-    _log(
-        f"GPU: {torch.cuda.get_device_name(0)}  CC: {torch.cuda.get_device_capability(0)}"
-    )
-    _log(
-        f"Registered impls: {len(PREFILL_MHA_IMPS)}, "
-        f"selected for benchmark: {len(selected_impls)}"
-    )
-    for cls in selected_impls:
-        _log(f"  - {cls.__name__}")
-    _log(
-        f"head_num={head_num}, kv_head_num={kv_head_num}, head_dim={head_dim}, "
-        f"page_size={args.page_size}, batch={args.batch_size}"
-    )
-
-    parallelism_config = _build_parallelism_config()
-    all_results: List[BenchResult] = []
-    impl_name_w = max(len(c.__name__) for c in selected_impls) + 2
-
+    cases = []
     for q_dtype_name in q_dtypes:
         for kv_dtype_name in kv_dtypes:
             for seq_len in input_lens:
                 for ratio in reuse_ratios:
-                    case = BenchCase(
-                        q_dtype_name=q_dtype_name,
-                        kv_dtype_name=kv_dtype_name,
-                        batch_size=args.batch_size,
-                        seq_len=seq_len,
-                        reuse_cache_ratio=ratio,
-                        head_num=head_num,
-                        kv_head_num=kv_head_num,
-                        head_dim=head_dim,
-                        page_size=args.page_size,
-                    )
-                    case_line = (
-                        f"[Case] q={q_dtype_name}  kv={kv_dtype_name}  "
-                        f"seq={seq_len}  prefix={case.prefix_len}  "
-                        f"input={case.input_len}  mode={case.mode_tag}"
-                    )
-                    _log("\n" + "-" * len(case_line))
-                    _log(case_line)
-                    _log("-" * len(case_line))
-                    cfg = _build_attn_configs(case)
-                    attn_inputs, block_ids = _build_prefill_inputs(case, device)
-                    q, k, v = _build_inputs(case, device)
-                    qkv_2d, q_3d = _pack_kernel_inputs(case, q, k, v)
-                    kv_cache = _build_kv_cache(case, block_ids, k, v, device)
-
-                    ref_output = None
-                    if args.check_correctness:
-                        try:
-                            ref_output = _compute_reference(case, q, k, v)
-                        except Exception as e:
-                            _log(f"  [warn] reference compute failed: {_short_err(e)}")
-                            ref_output = None
-
-                    for impl_cls in selected_impls:
-                        res = _run_one_impl(
-                            impl_cls,
-                            case,
-                            cfg,
-                            attn_inputs,
-                            kv_cache,
-                            qkv_2d,
-                            q_3d,
-                            parallelism_config,
-                            warmup_iters=args.warmup,
-                            repeat_iters=args.repeat,
-                            ref_output=ref_output,
-                            atol=args.atol,
-                            rtol=args.rtol,
-                            profile=args.profile,
-                            profile_dir=args.profile_dir,
-                            profile_iters=args.profile_iters,
+                    cases.append(
+                        BenchCase(
+                            q_dtype_name=q_dtype_name,
+                            kv_dtype_name=kv_dtype_name,
+                            batch_size=args.batch_size,
+                            seq_len=seq_len,
+                            reuse_cache_ratio=ratio,
+                            head_num=head_num,
+                            kv_head_num=kv_head_num,
+                            head_dim=head_dim,
+                            page_size=args.page_size,
                         )
-                        all_results.append(res)
-                        if res.status == "PASS":
-                            diff_str = (
-                                f" max_diff={res.max_diff:.2e}"
-                                if not math.isnan(res.max_diff)
-                                else ""
-                            )
-                            tail = (
-                                f"mean={res.mean_ms:.3f}ms "
-                                f"tflops={res.tflops:.2f}{diff_str}"
-                            )
-                        else:
-                            tail = res.note
-                        _log(f"  {res.impl_name:<{impl_name_w}}{res.status:<10}{tail}")
-                    del kv_cache, qkv_2d, q_3d, q, k, v, attn_inputs, ref_output
-                    torch.cuda.empty_cache()
+                    )
+    return cases
+
+
+def _nan_to_none(d: dict) -> dict:
+    """Replace NaN float values with None for JSON serialization."""
+    return {
+        k: (None if isinstance(v, float) and math.isnan(v) else v) for k, v in d.items()
+    }
+
+
+def _none_to_nan(d: dict) -> dict:
+    """Replace None values with NaN after JSON deserialization (inverse of _nan_to_none)."""
+    return {k: (float("nan") if v is None else v) for k, v in d.items()}
+
+
+def _serialize_results(results: List[BenchResult]) -> str:
+    """Serialize BenchResult list to JSON, handling NaN values."""
+    data = []
+    for r in results:
+        d = asdict(r)
+        d["case"] = _nan_to_none(d["case"])
+        d = _nan_to_none(d)
+        data.append(d)
+    return json.dumps(data)
+
+
+def _deserialize_results(s: str) -> List[BenchResult]:
+    """Deserialize JSON back to BenchResult list."""
+    data = json.loads(s)
+    results = []
+    for d in data:
+        case_d = _none_to_nan(d.pop("case"))
+        case = BenchCase(**case_d)
+        d = _none_to_nan(d)
+        results.append(BenchResult(case=case, **d))
+    return results
+
+
+def _atomic_next_case(counter_file: str, lock_file: str, total: int) -> int:
+    """Atomically fetch-and-increment the shared case counter. Returns -1 when exhausted."""
+    from filelock import FileLock, Timeout
+
+    for attempt in range(3):
+        try:
+            with FileLock(lock_file, timeout=30):
+                with open(counter_file, "r+") as f:
+                    idx = int(f.read().strip())
+                    if idx >= total:
+                        return -1
+                    f.seek(0)
+                    f.write(str(idx + 1))
+                    f.truncate()
+                    return idx
+        except Timeout:
+            if attempt < 2:
+                time.sleep(1)
+                continue
+            raise
+        except ValueError:
+            if attempt < 2:
+                time.sleep(0.5)
+                continue
+            raise
+
+
+def _dispatch_workers(args: argparse.Namespace) -> int:
+    """Launch one worker per GPU with dynamic work-stealing via shared counter."""
+    gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
+    gpu_ids = [g.strip() for g in gpu_ids if g.strip()]
+
+    cases = _build_all_cases(args)
+    if not cases:
+        _log("No cases to run")
+        return 0
+    num_workers = min(len(gpu_ids), len(cases))
+
+    _log(
+        f"Dispatching {len(cases)} cases across {num_workers} GPU(s) {gpu_ids[:num_workers]} (dynamic work-stealing)"
+    )
+
+    base_args = [
+        a
+        for a in sys.argv[1:]
+        if not a.startswith("--_worker-")
+        and not a.startswith("--_results-")
+        and not a.startswith("--_num-")
+        and not a.startswith("--_counter-")
+    ]
+
+    with tempfile.TemporaryDirectory(prefix="bench_prefill_") as tmpdir:
+        counter_file = os.path.join(tmpdir, "counter")
+        with open(counter_file, "w") as f:
+            f.write("0")
+
+        procs = []
+        result_files = []
+
+        for i in range(num_workers):
+            result_file = os.path.join(tmpdir, f"worker_{i}.json")
+            result_files.append(result_file)
+
+            worker_cmd = (
+                [sys.executable, sys.argv[0]]
+                + base_args
+                + [
+                    f"--_worker-id={i}",
+                    f"--_results-file={result_file}",
+                    f"--_counter-file={counter_file}",
+                ]
+            )
+
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = gpu_ids[i]
+            env["GPU_COUNT"] = "1"
+
+            _log(f"  [GPU {gpu_ids[i]}] worker {i}")
+            proc = subprocess.Popen(worker_cmd, env=env)
+            procs.append(proc)
+
+        # Poll with timeout — kill stuck workers after deadline
+        worker_timeout = int(os.environ.get("BENCH_WORKER_TIMEOUT", "3600"))
+        deadline = time.time() + worker_timeout
+        exit_codes = [None] * num_workers
+        timed_out = set()
+        while time.time() < deadline:
+            all_done = True
+            for i, p in enumerate(procs):
+                if exit_codes[i] is not None:
+                    continue
+                rc = p.poll()
+                if rc is not None:
+                    exit_codes[i] = rc
+                else:
+                    all_done = False
+            if all_done:
+                break
+            time.sleep(1)
+        else:
+            for i, p in enumerate(procs):
+                if exit_codes[i] is None:
+                    _log(f"  [!] worker {i} timed out after {worker_timeout}s, killing")
+                    p.kill()
+                    p.wait()
+                    exit_codes[i] = -9
+                    timed_out.add(i)
+        _log(f"\nAll workers finished. Exit codes: {exit_codes}")
+
+        failed_workers = [i for i, ec in enumerate(exit_codes) if ec != 0]
+        if failed_workers:
+            _log(f"[!] workers {failed_workers} exited with non-zero codes")
+
+        all_results: List[BenchResult] = []
+        for i, rf in enumerate(result_files):
+            if not os.path.exists(rf):
+                if i not in timed_out:
+                    _log(
+                        f"  [warn] worker {i} (exit_code={exit_codes[i]}) produced no results"
+                    )
+                continue
+            try:
+                with open(rf) as f:
+                    all_results.extend(_deserialize_results(f.read()))
+            except Exception as e:
+                _log(f"  [warn] failed to read results from worker {i}: {e}")
 
     _print_table(all_results)
+    _print_failures(all_results)
 
-    has_pass = any(r.status == "PASS" for r in all_results)
     has_mismatch = any(r.status == "MISMATCH" for r in all_results)
-    if has_mismatch:
-        _log("\n[!] one or more impls failed correctness check (MISMATCH)")
-        return 2
-    return 0 if has_pass else 1
+    if failed_workers:
+        return 1
+    return 2 if has_mismatch else 0
+
+
+def _run_cases_dynamic(
+    all_cases: List[BenchCase],
+    counter_file: str,
+    args: argparse.Namespace,
+    gpu_tag: str = "",
+) -> List[BenchResult]:
+    """Dynamically steal cases from shared counter. Returns results for cases this worker ran."""
+    device = torch.device("cuda")
+    prefix = f"[{gpu_tag}] " if gpu_tag else ""
+    lock_file = counter_file + ".lock"
+    total_cases = len(all_cases)
+
+    run_filter = args.run_impls.strip().lower()
+    if run_filter in ("", "all"):
+        selected_impls = list(PREFILL_MHA_IMPS)
+    else:
+        patterns = [f.strip().lower() for f in run_filter.split(",") if f.strip()]
+        selected_impls = [
+            cls
+            for cls in PREFILL_MHA_IMPS
+            if any(p in cls.__name__.lower() for p in patterns)
+        ]
+    if not selected_impls:
+        _log(f"{prefix}No impls matched '{args.run_impls}'")
+        return []
+    parallelism_config = _build_parallelism_config()
+
+    all_results: List[BenchResult] = []
+    while True:
+        case_idx = _atomic_next_case(counter_file, lock_file, total_cases)
+        if case_idx < 0:
+            break
+        case = all_cases[case_idx]
+
+        try:
+            cfg = _build_attn_configs(case)
+            attn_inputs, block_ids = _build_prefill_inputs(case, device)
+            q, k, v = _build_inputs(case, device)
+            qkv_2d, q_3d = _pack_kernel_inputs(case, q, k, v)
+            kv_cache = _build_kv_cache(case, block_ids, k, v, device)
+
+            ref_output = None
+            if args.check_correctness:
+                try:
+                    ref_output = _compute_reference(case, q, k, v)
+                except Exception as e:
+                    _log(
+                        f"{prefix}[warn] reference compute failed for seq={case.seq_len}: {_short_err(e)}"
+                    )
+                    ref_output = None
+
+            for impl_cls in selected_impls:
+                res = _run_one_impl(
+                    impl_cls,
+                    case,
+                    cfg,
+                    attn_inputs,
+                    kv_cache,
+                    qkv_2d,
+                    q_3d,
+                    parallelism_config,
+                    warmup_iters=args.warmup,
+                    repeat_iters=args.repeat,
+                    ref_output=ref_output,
+                    atol=args.atol,
+                    rtol=args.rtol,
+                    profile=args.profile,
+                    profile_dir=args.profile_dir,
+                    profile_iters=args.profile_iters,
+                )
+                all_results.append(res)
+
+            del kv_cache, qkv_2d, q_3d, q, k, v, attn_inputs, ref_output
+            torch.cuda.empty_cache()
+        except Exception as e:
+            tb = traceback.format_exc()
+            all_results.append(
+                BenchResult(
+                    impl_name="(case setup)",
+                    case=case,
+                    status="FAIL",
+                    note=f"{e}\n{tb}",
+                )
+            )
+            _log(
+                f"{prefix}case[{case_idx}] seq={case.seq_len} {case.mode_tag} CRASHED (skipping remaining)"
+            )
+            break
+
+        _log(
+            f"{prefix}case[{case_idx}] "
+            f"q={case.q_dtype_name} kv={case.kv_dtype_name} "
+            f"seq={case.seq_len} {case.mode_tag} done"
+        )
+
+    return all_results
+
+
+def main() -> int:
+    args = parse_args()
+
+    # Coordinator: dispatch workers across GPUs
+    if args._worker_id < 0:
+        return _dispatch_workers(args)
+
+    # Worker: run assigned case subset on this GPU
+    if not torch.cuda.is_available():
+        _log("CUDA not available, skipping benchmark")
+        return 0
+
+    set_seed(42)
+
+    try:
+        _setup_exec_ctx()
+    except Exception as e:
+        _log(f"warning: init_exec_ctx failed: {e}")
+
+    all_cases = _build_all_cases(args)
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
+    gpu_tag = f"GPU {gpu_id}"
+    _log(
+        f"[{gpu_tag}] worker {args._worker_id} started, {len(all_cases)} total cases, device={torch.cuda.get_device_name(0)}"
+    )
+
+    all_results: List[BenchResult] = []
+    try:
+        all_results = _run_cases_dynamic(
+            all_cases, args._counter_file, args, gpu_tag=gpu_tag
+        )
+    finally:
+        with open(args._results_file, "w") as f:
+            f.write(_serialize_results(all_results))
+
+    has_mismatch = any(r.status == "MISMATCH" for r in all_results)
+    return 2 if has_mismatch else 0
 
 
 if __name__ == "__main__":
