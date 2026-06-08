@@ -142,7 +142,7 @@ py_test(
     args = [
         "--q-dtype=bf16",
         "--kv-cache-dtype=bf16,fp8",
-        "--input-len=4096,16384,65536,131072",
+        "--input-len=4096,8192,16384,65536,131072",
         "--reuse-cache-ratio=0,0.3,0.7,0.9",
         "--batch-size=1",
         "--preset=qwen3-8b",

@@ -257,7 +257,6 @@ class TRTLLMFMHAv2PagedPrefillOp:
         return (
             (is_sm_90() or is_sm_120())
             and attn_inputs.is_prefill
-            and attn_configs.kv_cache_dtype != KvCacheDataType.FP8
             and attn_inputs.kv_cache_kernel_block_id_device is not None
         )
 
@@ -359,12 +358,7 @@ class TRTLLMFMHAv2PrefillOp:
             and attn_inputs.prefix_lengths.numel() > 0
             and attn_inputs.prefix_lengths.any().item()
         )
-        return (
-            (is_sm_90() or is_sm_120())
-            and attn_inputs.is_prefill
-            and not has_prefix
-            and attn_configs.kv_cache_dtype != KvCacheDataType.FP8
-        )
+        return (is_sm_90() or is_sm_120()) and attn_inputs.is_prefill and not has_prefix
 
     def prepare(self, attn_inputs: PyAttentionInputs) -> TRTLLMFMHAv2Params:
         input_lengths = torch.zeros_like(attn_inputs.input_lengths, device="cuda")

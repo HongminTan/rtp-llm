@@ -135,7 +135,10 @@ class BenchResult:
     p95_ms: float = float("nan")
     p99_ms: float = float("nan")
     tflops: float = float("nan")
-    max_diff: float = float("nan")
+    # max(|diff| / (atol + rtol*|ref|)); <=1.0 means PASS
+    tol_ratio: float = float("nan")
+    atol: float = float("nan")
+    rtol: float = float("nan")
     note: str = ""
 
 
@@ -357,13 +360,23 @@ def _build_kv_cache(
 def _compute_reference(
     case: BenchCase, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
 ) -> torch.Tensor:
-    """Compute ground-truth attention output via SDPA.
+    """Compute ground-truth attention output via flashinfer single_prefill_with_kv_cache.
+
+    Uses flashinfer's single-sequence flash attention as reference, which handles
+    arbitrary sequence lengths with FP32 online softmax accumulation.
+
+    NOTE: We do NOT use torch SDPA with explicit attn_mask because PyTorch 2.8's
+    memory-efficient attention has a bug where bool/float masks produce incorrect
+    results when seq_len > 65536 (maybe int16 index overflow).
+    Same Issue: https://github.com/pytorch/pytorch/issues/162588
 
     For FP8 KV cache, mirror the BF16 -> FP8 -> BF16 cast on K/V so the reference
     is a fair "ideal output given lossy KV" — kernel and ref see the same K/V.
 
     Returns: [total_tokens, H, D] in q's dtype.
     """
+    from flashinfer import single_prefill_with_kv_cache
+
     if case.kv_dtype_name == "fp8":
         k = k.to(torch.float8_e4m3fn).to(q.dtype)
         v = v.to(torch.float8_e4m3fn).to(q.dtype)
@@ -371,28 +384,29 @@ def _compute_reference(
     BS, qlen, H, D = q.shape
     _, klen, Hk, _ = k.shape
 
-    # GQA: replicate KV heads up to Q heads.
-    if H != Hk:
-        repeat = H // Hk
-        k = k.repeat_interleave(repeat, dim=2)
-        v = v.repeat_interleave(repeat, dim=2)
+    outputs = []
+    for b in range(BS):
+        q_seq = q[b, :, :, :]  # [qlen, H, D]
+        k_seq = k[b, :, :, :]  # [klen, Hk, D]
+        v_seq = v[b, :, :, :]  # [klen, Hk, D]
 
-    # SDPA wants [BS, H, seq, D].
-    q_t = q.transpose(1, 2).contiguous()
-    k_t = k.transpose(1, 2).contiguous()
-    v_t = v.transpose(1, 2).contiguous()
+        # For prefix reuse: Q is the last `qlen` tokens, K/V is full `klen` tokens.
+        # single_prefill_with_kv_cache with causal=True naturally handles this:
+        # Q_i at position (klen - qlen + i) attends to K_j where j <= klen - qlen + i.
+        out_seq = single_prefill_with_kv_cache(
+            q_seq, k_seq, v_seq, causal=True, kv_layout="NHD"
+        )
+        outputs.append(out_seq)
 
-    # Q_i sits at absolute position (prefix + i); it can attend to K_j iff prefix + i >= j.
-    prefix = case.prefix_len
-    i_idx = torch.arange(qlen, device=q.device).unsqueeze(1)
-    j_idx = torch.arange(klen, device=q.device).unsqueeze(0)
-    mask = (prefix + i_idx) >= j_idx  # [qlen, klen]
-
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q_t, k_t, v_t, attn_mask=mask, is_causal=False
-    )  # [BS, H, qlen, D]
-    out = out.transpose(1, 2).contiguous().reshape(BS * qlen, H, D)
+    out = torch.stack(outputs, dim=0).reshape(BS * qlen, H, D)
     return out
+
+
+_TOL_BY_KV_DTYPE = {
+    "bf16": (1.5e-2, 1e-2),
+    "fp16": (1.5e-2, 1e-2),
+    "fp8": (1.5e-1, 1.5e-1),
+}
 
 
 def _run_one_impl(
@@ -407,12 +421,11 @@ def _run_one_impl(
     warmup_iters: int,
     repeat_iters: int,
     ref_output: Optional[torch.Tensor] = None,
-    atol: float = 5e-2,
-    rtol: float = 1e-2,
     profile: bool = False,
     profile_dir: str = "/tmp/bench_traces",
     profile_iters: int = 5,
 ) -> BenchResult:
+    atol, rtol = _TOL_BY_KV_DTYPE.get(case.kv_dtype_name, (5e-2, 1e-2))
     impl_name = impl_cls.__name__
     result = BenchResult(impl_name=impl_name, case=case, status="SKIP")
 
@@ -459,18 +472,19 @@ def _run_one_impl(
         impl_out = captured["out"]
         if impl_out.dim() == 2:
             impl_out = impl_out.reshape(case.total_tokens, case.head_num, case.head_dim)
+        result.atol = atol
+        result.rtol = rtol
         try:
             diff = (impl_out.float() - ref_output.float()).abs()
-            result.max_diff = float(diff.max().item())
+            denom = atol + rtol * ref_output.float().abs()
+            result.tol_ratio = float((diff / denom).max().item())
         except Exception as e:
             result.status = "FAIL"
             result.note = f"diff calc failed: {_short_err(e)}"
             return result
-        if not torch.allclose(
-            impl_out.float(), ref_output.float(), atol=atol, rtol=rtol
-        ):
+        if result.tol_ratio > 1.0:
             result.status = "MISMATCH"
-            result.note = f"max_diff={result.max_diff:.3e} (atol={atol}, rtol={rtol})"
+            result.note = f"tol_ratio={result.tol_ratio:.3e} (atol={atol}, rtol={rtol})"
             return result
 
     if profile:
@@ -551,7 +565,7 @@ def _print_table(results: List[BenchResult]) -> None:
     header = (
         f"{'impl':<{w}}{'kv':<5}  {'seq':>6}  {'prefix':>6}  {'input':>6}  "
         f"{'mode':<10}  {'mean_ms':>9}  {'p50_ms':>9}  {'p95_ms':>9}  "
-        f"{'p99_ms':>9}  {'TFLOPs/s':>9}  {'max_diff':>10}"
+        f"{'p99_ms':>9}  {'TFLOPs/s':>9}  {'tol_ratio':>10}  {'atol':>9}  {'rtol':>9}"
     )
     _log("\n" + "=" * len(header))
     _log(header)
@@ -560,17 +574,27 @@ def _print_table(results: List[BenchResult]) -> None:
         _log("(no PASS results)")
         _log("=" * len(header))
         return
+    pass_results.sort(
+        key=lambda r: (
+            r.case.kv_dtype_name,
+            r.impl_name,
+            r.case.seq_len,
+            r.case.reuse_cache_ratio,
+        )
+    )
     for r in pass_results:
         c = r.case
-        diff_str = (
-            f"{r.max_diff:>10.3e}" if not math.isnan(r.max_diff) else f"{'-':>10}"
+        tol_str = (
+            f"{r.tol_ratio:>10.3e}" if not math.isnan(r.tol_ratio) else f"{'-':>10}"
         )
+        atol_str = f"{r.atol:>9.1e}" if not math.isnan(r.atol) else f"{'-':>9}"
+        rtol_str = f"{r.rtol:>9.1e}" if not math.isnan(r.rtol) else f"{'-':>9}"
         _log(
             f"{r.impl_name:<{w}}{c.kv_dtype_name:<5}  "
             f"{c.seq_len:>6}  {c.prefix_len:>6}  {c.input_len:>6}  "
             f"{c.mode_tag:<10}  "
             f"{r.mean_ms:>9.3f}  {r.p50_ms:>9.3f}  "
-            f"{r.p95_ms:>9.3f}  {r.p99_ms:>9.3f}  {r.tflops:>9.2f}  {diff_str}"
+            f"{r.p95_ms:>9.3f}  {r.p99_ms:>9.3f}  {r.tflops:>9.2f}  {tol_str}  {atol_str}  {rtol_str}"
         )
     _log("=" * len(header))
 
@@ -669,18 +693,6 @@ def parse_args() -> argparse.Namespace:
         dest="check_correctness",
         action="store_false",
         help="disable correctness check (saves ref-compute time on " "long sequences)",
-    )
-    p.add_argument(
-        "--atol",
-        type=float,
-        default=5e-2,
-        help="absolute tolerance for correctness check",
-    )
-    p.add_argument(
-        "--rtol",
-        type=float,
-        default=1e-2,
-        help="relative tolerance for correctness check",
     )
     p.add_argument(
         "--profile",
@@ -997,8 +1009,6 @@ def _run_cases_dynamic(
                     warmup_iters=args.warmup,
                     repeat_iters=args.repeat,
                     ref_output=ref_output,
-                    atol=args.atol,
-                    rtol=args.rtol,
                     profile=args.profile,
                     profile_dir=args.profile_dir,
                     profile_iters=args.profile_iters,
