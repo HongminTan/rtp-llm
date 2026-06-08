@@ -344,6 +344,7 @@ class TRTLLMFMHAv2PrefillOp:
         self.q_size = self.head_num * self.head_dim
         self.kv_size = self.kv_head_num * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.kv_cache_dtype = attn_configs.kv_cache_dtype
         self.workspace_buffer = _get_trtllm_fmha_v2_workspace()
 
     def __del__(self) -> None:
@@ -386,9 +387,20 @@ class TRTLLMFMHAv2PrefillOp:
         import flashinfer.prefill
 
         q_type = qkv.dtype
-        q = qkv[:, : self.q_size].contiguous().view(-1, self.head_num, self.head_dim)
+        compute_dtype = (
+            torch.float8_e4m3fn
+            if self.kv_cache_dtype == KvCacheDataType.FP8
+            else q_type
+        )
+        q = (
+            qkv[:, : self.q_size]
+            .to(compute_dtype)
+            .contiguous()
+            .view(-1, self.head_num, self.head_dim)
+        )
         kv = (
             qkv[:, self.q_size :]
+            .to(compute_dtype)
             .contiguous()
             .view(-1, 2, self.kv_head_num, self.head_dim)
         )
