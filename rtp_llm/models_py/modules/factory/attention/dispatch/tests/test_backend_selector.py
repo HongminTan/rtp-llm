@@ -4,6 +4,8 @@ Pure-CPU: DECODE_MHA_IMPS is monkeypatched with fake impls; the *real*
 _is_fmha_impl_disabled (class-name matching) is exercised. No GPU / torch compute.
 The probe tests also replace torch allocation, benchmarking, fatal termination,
 and TP broadcast so failure-boundary behavior is deterministic.
+An explicitly supplied precision allowlist is intersected with the support and
+configuration filters; production callers currently leave that path disconnected.
 """
 
 import contextlib
@@ -118,6 +120,26 @@ def test_eligible_none_fmha_config_keeps_all():
     with _patch_impls(_NAMES):
         eligible = backend_selector._eligible(None, None, None, None)
     assert set(eligible) == set(_NAMES)
+
+
+def test_eligible_intersects_precision_gate():
+    with _patch_impls(_NAMES):
+        eligible = backend_selector._eligible(
+            None,
+            None,
+            None,
+            _fmha_config(),
+            frozenset({"XQADecodeImpl"}),
+        )
+    assert eligible == ["XQADecodeImpl"]
+
+
+def test_eligible_empty_precision_gate_excludes_all():
+    with _patch_impls(_NAMES):
+        eligible = backend_selector._eligible(
+            None, None, None, _fmha_config(), frozenset()
+        )
+    assert eligible == []
 
 
 def test_eligible_support_false_is_normal_and_does_not_construct():
@@ -534,6 +556,7 @@ def _select_on_root_for_test(
         attn_configs,
         attn_inputs,
         parallelism_config,
+        None,
         [8],
         selector,
         1,

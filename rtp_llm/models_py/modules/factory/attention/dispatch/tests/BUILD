@@ -12,6 +12,7 @@ py_test(
     srcs = [
         "test_backend_bench.py",
         "test_backend_selector.py",
+        "test_decode_gate.py",
         "test_selector.py",
     ],
     deps = py_test_deps,

@@ -21,6 +21,11 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.benchmark_workspace i
     benchmark_workspace_scope,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch import backend_bench
+from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate import (
+    GateResult,
+    gate_to_mask,
+    mask_to_gate,
+)
 from rtp_llm.models_py.modules.factory.attention.dispatch.selector import (
     STABLE_CLUSTER_MARGIN,
     STABLE_THRESHOLD,
@@ -148,8 +153,38 @@ def _tp_geometry(parallelism_config):
     return tp_size, (tp_rank == 0), dp_rank * tp_size
 
 
+def reduce_gate_across_tp(local: GateResult, parallelism_config) -> frozenset:
+    """Pre-landed TP gate merge helper; not called by production selection yet."""
+    registry = _decode_registry()
+    tp_size, _, _ = _tp_geometry(parallelism_config)
+    passed_mask = torch.tensor(
+        gate_to_mask(local.passed, registry), dtype=torch.int32, device="cuda"
+    )
+    verified_mask = torch.tensor(
+        gate_to_mask(local.verified, registry), dtype=torch.int32, device="cuda"
+    )
+    if tp_size > 1:
+        from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
+
+        all_reduce(passed_mask, group=Group.TP)
+        all_reduce(verified_mask, group=Group.TP)
+    merged, asymmetric = mask_to_gate(
+        passed_mask.tolist(), verified_mask.tolist(), registry, tp_size
+    )
+    if asymmetric:
+        logger.warning(
+            "[gate] asymmetric verification (some ranks lack golden/record), excluded: %s",
+            asymmetric,
+        )
+    return merged
+
+
 def _eligible(
-    attn_configs, attn_inputs, parallelism_config, fmha_config=None
+    attn_configs,
+    attn_inputs,
+    parallelism_config,
+    fmha_config=None,
+    gate_passed=None,
 ) -> List[str]:
     from rtp_llm.models_py.modules.factory.attention.attn_factory import (
         DECODE_MHA_IMPS,
@@ -171,6 +206,8 @@ def _eligible(
                 # ...), mirroring the fixed-priority get_fmha_impl path.
                 if _is_fmha_impl_disabled(name, fmha_config):
                     continue
+                if gate_passed is not None and name not in gate_passed:
+                    continue
                 probe_started = True
                 if not impl.support(attn_configs, attn_inputs):
                     continue
@@ -190,6 +227,7 @@ def run_backend_selection(
     model,
     inputs,
     *,
+    gate_passed: Optional[frozenset] = None,
     selector: Optional[Selector] = None,
     warmup: int = 10,
     iters: int = 50,
@@ -199,6 +237,8 @@ def run_backend_selection(
 
     Only rank0 does the real-machine benchmark + selection; the winner registry
     index is broadcast to Group.TP so every rank gets the same winner.
+    gate_passed=None leaves precision filtering dormant and uses support-only
+    eligibility until the warmup recorder supplies gate records.
     """
     parallelism_config = model.parallelism_config
     attn_configs = model.config.getAttentionConfigs(
@@ -230,6 +270,7 @@ def run_backend_selection(
                 attn_configs,
                 attn_inputs,
                 parallelism_config,
+                gate_passed,
                 grid,
                 selector,
                 bs,
@@ -323,6 +364,7 @@ def _select_on_root(
     attn_configs,
     attn_inputs,
     parallelism_config,
+    gate_passed,
     grid,
     selector,
     bs,
@@ -349,7 +391,11 @@ def _select_on_root(
     # or launch GPU work, so after _eligible starts there is no safe in-process
     # fallback or TP broadcast path for an unexpected exception.
     eligible = _eligible(
-        attn_configs, attn_inputs, parallelism_config, model.fmha_config
+        attn_configs,
+        attn_inputs,
+        parallelism_config,
+        model.fmha_config,
+        gate_passed,
     )
     probe_backend = eligible[0] if eligible else "support-probe"
     try:

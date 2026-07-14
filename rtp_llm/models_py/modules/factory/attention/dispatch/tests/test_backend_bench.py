@@ -653,6 +653,7 @@ del _name, _fn  # don't leak a class/func ref that unittest would re-collect
 if __name__ == "__main__":
     from rtp_llm.models_py.modules.factory.attention.dispatch.tests import (
         test_backend_selector,
+        test_decode_gate,
         test_selector,
     )
 
@@ -661,6 +662,7 @@ if __name__ == "__main__":
         [
             loader.loadTestsFromModule(sys.modules[__name__]),
             loader.loadTestsFromModule(test_backend_selector),
+            loader.loadTestsFromModule(test_decode_gate),
             loader.loadTestsFromModule(test_selector),
         ]
     )
