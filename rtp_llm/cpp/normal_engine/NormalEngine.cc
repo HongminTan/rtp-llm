@@ -3,6 +3,7 @@
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
+#include "rtp_llm/cpp/normal_engine/accuracy/AccuracyChecker.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/PDFusionRatioScheduler.h"
@@ -94,8 +95,13 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
     } else {
         RTP_LLM_LOG_INFO("skip warm up.");
     }
+
+    if (auto accuracy_status = runAccuracyCheckWithTemporaryCache(params, warm_up_result); !accuracy_status.ok()) {
+        RTP_LLM_LOG_WARNING("accuracy check did not complete, continuing startup: %s",
+                            accuracy_status.ToString().c_str());
+    }
 #else
-    RTP_LLM_LOG_INFO("skip warm up on non-CUDA platform.");
+    RTP_LLM_LOG_INFO("skip warm up and accuracy check on non-CUDA platform.");
 #endif
     initCacheManager(warm_up_result);
     RTP_LLM_LOG_INFO("create cache manager done");
@@ -267,8 +273,9 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
     fake_input->generate_config->calculate_loss       = int(runtime_config.warm_up_with_loss);
     rtp_llm::setTraceMemory(true);
 
-    auto cache_config      = CacheConfigCreator::createBasicConfig(model_config_, parallelism_config, false, 0);
-    cache_config.block_num = 5;
+    auto cache_config = CacheConfigCreator::createBasicConfig(model_config_, parallelism_config, false, 0);
+    cache_config.seq_size_per_block = model_config_.attn_config.tokens_per_block;
+    cache_config.block_num          = 5;
     ParallelismConfig temp_parallelism_config;
     RuntimeConfig     temp_runtime_config;
     auto              cache_manager = make_shared<KVCacheManager>(
@@ -572,6 +579,72 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
             streams.emplace_back(createMinFakeStream(1));
         }
     }
+}
+
+absl::Status NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&            params,
+                                                              const std::optional<WarmUpResult>& warm_up_result) {
+    if (!runtime_config.enable_accuracy_check) {
+        return absl::OkStatus();
+    }
+    if (propose_params_ || model_config_.mm_model_config.is_multimodal
+        || ffn_disaggregate_config.enable_ffn_disaggregate || model_config_.attn_config.use_mla
+        || parallelism_config.prefill_cp_config.is_enabled()
+        || parallelism_config.prefill_cp_config.is_prefill_enabled()) {
+        RTP_LLM_LOG_WARNING("skip accuracy check: unsupported model/config");
+        return absl::OkStatus();
+    }
+
+    auto old_cache_manager = resource_context_.cache_manager;
+    auto old_role_type     = resource_context_.role_type;
+    auto old_group_num     = kv_cache_group_num_;
+
+    // hook executor with tmp kv_cache_manager
+    KVCacheConfig tmp_kv_cache_config = kv_cache_config;
+    tmp_kv_cache_config.test_block_num =
+        static_cast<int>(AccuracyChecker::computeTemporaryBlockNum(model_config_, kv_cache_config));
+    tmp_kv_cache_config.reuse_cache                = false;
+    tmp_kv_cache_config.enable_memory_cache        = false;
+    tmp_kv_cache_config.enable_remote_cache        = false;
+    tmp_kv_cache_config.enable_tiered_memory_cache = false;
+    auto config                                    = CacheConfigCreator::createConfig(
+        model_config_, parallelism_config, runtime_config, tmp_kv_cache_config, warm_up_result);
+    if (config.groupNums() != 1) {
+        RTP_LLM_LOG_WARNING("skip accuracy check: requires a single kv-cache group (got %d)", config.groupNums());
+        return absl::OkStatus();
+    }
+    auto tmp_cache_manager =
+        make_shared<KVCacheManager>(config, false, nullptr, tmp_kv_cache_config, parallelism_config, runtime_config);
+    if (!tmp_cache_manager->init()) {
+        RTP_LLM_LOG_WARNING("skip accuracy check: temporary kv cache init failed (insufficient memory?)");
+        return absl::OkStatus();
+    }
+    RTP_LLM_LOG_INFO("accuracy check: temporary kv cache created with %d blocks", config.block_num);
+    absl::Status check_status;
+    try {
+        resource_context_.cache_manager = tmp_cache_manager;
+        resource_context_.role_type     = pd_sep_config.role_type;
+        kv_cache_group_num_             = config.groupNums();
+        initExecutor(params, propose_params_);
+
+        AccuracyChecker checker(model_config_, runtime_config, parallelism_config);
+        check_status = checker.runAll(executor_.get(), resource_context_);
+    } catch (const std::exception& e) {
+        check_status = absl::InternalError(std::string("accuracy check threw: ") + e.what());
+    } catch (...) {
+        check_status = absl::InternalError("accuracy check threw: unknown");
+    }
+
+    // restore executor
+    executor_.reset(nullptr);
+    resource_context_.cache_manager = old_cache_manager;
+    resource_context_.role_type     = old_role_type;
+    kv_cache_group_num_             = old_group_num;
+
+    // release memory
+    tmp_cache_manager.reset();
+    cudaDeviceSynchronize();
+    c10::cuda::CUDACachingAllocator::emptyCache();
+    return check_status;
 }
 
 }  // namespace rtp_llm
