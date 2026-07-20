@@ -32,6 +32,11 @@ public:
                        bool                            copy_last_block,
                        std::vector<TaggedBlockIdPair>& block_update_mapping) override;
 
+    bool referenceRequestBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                                int                            batch_id,
+                                int                            group_id,
+                                const BlockIndicesType&        src_block_ids) override;
+
     int seqSizePerBlock() const override;
     int singleBatchNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
                               int                            seq_len,

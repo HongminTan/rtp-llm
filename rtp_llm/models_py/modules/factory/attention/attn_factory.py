@@ -139,6 +139,19 @@ def _is_fmha_impl_disabled(
     return False
 
 
+def get_all_supported_impls(
+    attn_configs, attn_inputs, fmha_config=None, parallelism_config=None
+) -> List[type[FMHAImplBase]]:
+    impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
+    return [
+        impl
+        for impl in impls
+        if not _is_fmha_impl_disabled(impl.__name__, fmha_config)
+        and impl.support(attn_configs, attn_inputs)
+        and impl.support_parallelism_config(parallelism_config)
+    ]
+
+
 def get_fmha_impl(
     attn_configs: AttentionConfigs,
     weight: ModelWeights,
@@ -149,36 +162,18 @@ def get_fmha_impl(
     max_seq_len: int = 0,
     parallelism_config: Optional[ParallelismConfig] = None,
 ) -> FMHAImplBase:
-    # Set is_cuda_graph as dynamic attribute on attn_inputs for base class to read
     attn_inputs.is_cuda_graph = is_cuda_graph
-
-    mha_impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
-
-    for impl in mha_impls:
-        # Check if this FMHA implementation is disabled before creating instance
-        impl_class_name = impl.__name__
-
-        # Skip if this FMHA implementation is disabled in config
-        if _is_fmha_impl_disabled(impl_class_name, fmha_config):
-            continue
-
-        # Check support before creating instance
-        if not impl.support(attn_configs, attn_inputs):
-            continue
-
-        # Check if implementation supports parallelism config
-        if not impl.support_parallelism_config(parallelism_config):
-            continue
+    for impl in get_all_supported_impls(
+        attn_configs, attn_inputs, fmha_config, parallelism_config
+    ):
         try:
             instance = impl(attn_configs, attn_inputs, parallelism_config)
-            if not is_cuda_graph or instance.support_cuda_graph():
-                return instance
-
         except Exception as e:
-            # If instantiation fails, continue to next impl
-            logging.warning(f"Failed to instantiate {impl_class_name}: {e}")
+            logging.warning(f"Failed to instantiate {impl.__name__}: {e}")
             continue
-    raise Exception(f"can not find mha type")
+        if not is_cuda_graph or instance.support_cuda_graph():
+            return instance
+    raise Exception("can not find mha type")
 
 
 class AttnImplFactory(object):

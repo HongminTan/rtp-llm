@@ -60,6 +60,13 @@ public:
     // deferred / CUDA graph is disabled (then it is a no-op).
     void triggerInitCapture() override;
 
+    py::object& getPyModel() {
+        return py_model_;
+    }
+    void setAccuracyRecording(bool v) {
+        accuracy_recording_ = v;
+    }
+
 private:
     std::optional<PyCacheStoreInputs> prepareWriteCacheParams(const GptModelInputs& inputs);
 
@@ -108,6 +115,7 @@ private:
     py::object py_model_;
     py::object held_attn_pyobj_;
     bool       enable_cuda_graph_{false};
+    bool       accuracy_recording_{false};
     bool       is_prefill_cuda_graph_mode_{false};
     bool       use_spec_decoding_{false};
     bool       enable_device_perf_{false};

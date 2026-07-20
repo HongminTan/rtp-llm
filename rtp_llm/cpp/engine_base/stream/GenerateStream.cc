@@ -337,6 +337,14 @@ int GenerateStream::initialReuseLength() const {
     return initial_reuse_length_;
 }
 
+void GenerateStream::setKVBlockUpdateMapping(const std::vector<TaggedBlockIdPair>& block_update_mapping) {
+    stream_cache_resource_->setKVBlockUpdateMapping(block_update_mapping);
+}
+
+void GenerateStream::referenceRequestBlocks(const BlockIndicesType& src_block_ids) {
+    stream_cache_resource_->referenceRequestBlocks(src_block_ids);
+}
+
 void GenerateStream::setReuseLength(int reuse_length) {
     reuse_length_ = reuse_length;
 }

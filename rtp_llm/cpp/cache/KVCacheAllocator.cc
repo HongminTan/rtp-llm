@@ -93,6 +93,14 @@ MallocResult KVCacheAllocator::malloc(const MallocInfo& malloc_info) {
     }
 }
 
+bool KVCacheAllocator::referenceRequestBlocks(const BatchKVCacheResourcePtr& /*batch_kv_cache_resource*/,
+                                              int /*batch_id*/,
+                                              int /*group_id*/,
+                                              const BlockIndicesType& /*src_block_ids*/) {
+    RTP_LLM_FAIL("referenceRequestBlocks is not supported by this allocator");
+    return false;
+}
+
 int KVCacheAllocator::estimateBatchPeakNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
                                                   int                            seq_len,
                                                   int                            common_seq_len,

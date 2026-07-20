@@ -433,6 +433,22 @@ bool SingleTypeKVCacheAllocator::updateKVBlock(const BatchKVCacheResourcePtr&  k
     return true;
 }
 
+bool SingleTypeKVCacheAllocator::referenceRequestBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                                                        int                            batch_id,
+                                                        int                            group_id,
+                                                        const BlockIndicesType&        src_block_ids) {
+    RTP_LLM_CHECK_WITH_INFO(
+        group_id == 0, "referenceRequestBlocks only supports single group, got group_id=%d", group_id);
+    RTP_LLM_CHECK_WITH_INFO(batch_kv_cache_resource->blocksNum(batch_id, group_id) == 0,
+                            "referenceRequestBlocks expects an empty destination block table, got %d blocks",
+                            batch_kv_cache_resource->blocksNum(batch_id, group_id));
+    if (src_block_ids.empty()) {
+        return true;
+    }
+    full_kv_cache_group_->reference(batch_kv_cache_resource->mutableBlockIds(batch_id, group_id), src_block_ids);
+    return true;
+}
+
 int SingleTypeKVCacheAllocator::seqSizePerBlock() const {
     return full_kv_cache_group_->seqSizePerBlock();
 }

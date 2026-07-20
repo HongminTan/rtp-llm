@@ -348,6 +348,13 @@ bool KVCacheManager::updateKVBlock(const BatchKVCacheResourcePtr&  batch_kv_cach
     return allocator_->updateKVBlock(batch_kv_cache_resource, block_src_batch, copy_last_block, block_update_mapping);
 }
 
+bool KVCacheManager::referenceRequestBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                                            int                            batch_id,
+                                            int                            group_id,
+                                            const BlockIndicesType&        src_block_ids) {
+    return allocator_->referenceRequestBlocks(batch_kv_cache_resource, batch_id, group_id, src_block_ids);
+}
+
 // 地址转换和缓冲区访问
 
 BlockAddrInfo KVCacheManager::convertIndexToAddr(int block_index, int layer_id) const {

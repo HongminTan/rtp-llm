@@ -288,6 +288,8 @@ public:
 
     const ResourceContext&      resourceContext() const;
     void                        setKVCache(const BatchKVCacheResource& kv_cache_resource);
+    void                        setKVBlockUpdateMapping(const std::vector<TaggedBlockIdPair>& block_update_mapping);
+    void                        referenceRequestBlocks(const BlockIndicesType& src_block_ids);
     void                        setLoss(const torch::Tensor& loss);
     void                        setSoftmaxProbs(const torch::Tensor& softmax_probs, int start_pos);
     const BatchKVCacheResource& kvCache() const;

@@ -71,10 +71,16 @@ public:
                                                   const std::vector<int>&         block_src_batch,
                                                   bool                            copy_last_block,
                                                   std::vector<TaggedBlockIdPair>& block_update_mapping) = 0;
-    virtual int                     seqSizePerBlock() const                                             = 0;
-    virtual int                     singleBatchNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
-                                                          int                            seq_len,
-                                                          int                            reserve_step) const                       = 0;
+    // Reference externally-owned physical blocks into batch_kv_cache_resource[batch_id][group_id].
+    // Single-group only (group_id=0).
+    virtual bool referenceRequestBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                                        int                            batch_id,
+                                        int                            group_id,
+                                        const BlockIndicesType&        src_block_ids);
+    virtual int  seqSizePerBlock() const                       = 0;
+    virtual int  singleBatchNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                                       int                            seq_len,
+                                       int                            reserve_step) const = 0;
     // Common-prefix growth is charged once; non-common growth is charged once per target sequence.
     int estimateBatchPeakNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
                                     int                            seq_len,
