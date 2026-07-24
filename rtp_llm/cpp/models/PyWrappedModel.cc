@@ -71,6 +71,18 @@ void PyWrappedModel::triggerInitCapture() {
 #endif
 }
 
+void PyWrappedModel::setDecodeBackendGate(const std::string&              status,
+                                          const std::vector<std::string>& passed,
+                                          const std::vector<std::string>& verified,
+                                          const std::string&              reason,
+                                          int64_t                         registry_fingerprint,
+                                          int64_t                         manifest_fingerprint) {
+    RTP_LLM_CHECK_WITH_INFO(!capture_done_, "decode backend gate must be injected before CUDA graph capture");
+    py::gil_scoped_acquire gil;
+    py_model_.attr("set_decode_backend_gate")(
+        status, passed, verified, reason, registry_fingerprint, manifest_fingerprint);
+}
+
 void PyWrappedModel::releaseBuffers() {
     if (held_attn_pyobj_.ptr()) {
         py::gil_scoped_acquire gil;

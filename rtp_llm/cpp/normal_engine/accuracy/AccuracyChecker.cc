@@ -1,11 +1,15 @@
 #include "rtp_llm/cpp/normal_engine/accuracy/AccuracyChecker.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <list>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <pybind11/stl.h>
 
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
@@ -22,6 +26,19 @@ using namespace std;
 namespace rtp_llm {
 
 namespace {
+
+constexpr uint64_t kSplitMixIncrement = 0x9E3779B97F4A7C15ULL;
+constexpr uint64_t kSequenceSeedSalt  = 0xD1B54A32D192ED03ULL;
+
+uint64_t splitMix64(uint64_t value) {
+    value += kSplitMixIncrement;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
+}
+
+}  // namespace
+
 // RAII for release Stream resources (KV block...)
 struct StreamReleaseGuard {
     GenerateStreamPtr stream_;
@@ -52,6 +69,8 @@ struct StreamReleaseGuard {
         release();
     }
 };
+
+namespace {
 
 // RAII for closing the Python recorder and clearing accuracy_recording_.
 struct RecordingSession {
@@ -125,24 +144,55 @@ bool buildBatch(bool                                                            
 }  // namespace
 
 static const std::vector<AccuracyScenario> kDefaultAccuracyScenarios = {
-    {{{0, 128, 0}}},                                     // N=1 plain (ragged)
-    {{{512, 512, 0}}},                                   // N=1 prefix (paged/hybrid)
-    {{{512, 512, 5}}},                                   // N=1 prefix + decode
-    {{{0, 128, 0}, {0, 777, 0}, {0, 2048, 0}}},          // N=3 variable-length plain
-    {{{512, 512, 0}, {256, 1024, 0}, {2048, 2048, 0}}},  // N=3 variable-length prefix
-    {{{512, 512, 1}, {512, 512, 3}, {512, 512, 7}}},     // N=3 shrinking decode
-    {{{0, 64, 16},
-      {0, 64, 16},
-      {0, 64, 16},
-      {0, 64, 16},
-      {0, 64, 16},
-      {0, 64, 16},
-      {0, 64, 16},
-      {0, 64, 16}}},  // N=8 large-batch decode
+    {{{0, 128, 0}}, true, 0xA11CE00000000001ULL},    // N=1 plain (ragged)
+    {{{0, 64, 4}}, true, 0xA11CE00000000002ULL},     // N=1 decode for small context/token limits
+    {{{512, 512, 0}}, true, 0xA11CE00000000003ULL},  // N=1 prefix (paged/hybrid)
+    {{{512, 512, 5}}, true, 0xA11CE00000000004ULL},  // N=1 prefix + decode
+    {{{0, 128, 0}, {0, 777, 0}, {0, 2048, 0}}, false, 0xA11CE00000000005ULL},          // N=3 variable-length plain
+    {{{512, 512, 0}, {256, 1024, 0}, {2048, 2048, 0}}, false, 0xA11CE00000000006ULL},  // N=3 variable-length prefix
+    {{{512, 512, 1}, {512, 512, 3}, {512, 512, 7}}, false, 0xA11CE00000000007ULL},     // N=3 shrinking decode
+    {{{0, 64, 16}, {0, 64, 16}, {0, 64, 16}, {0, 64, 16}, {0, 64, 16}, {0, 64, 16}, {0, 64, 16}, {0, 64, 16}},
+     false,
+     0xA11CE00000000008ULL},  // N=8 large-batch decode
 };
 
 const std::vector<AccuracyScenario>& AccuracyChecker::defaultScenarios() {
     return kDefaultAccuracyScenarios;
+}
+
+std::vector<AccuracyScenario> AccuracyChecker::scenariosForMoeConfig(const MoeConfig& moe_config) {
+    if (!moe_config.use_deepep_moe || !moe_config.use_deepep_low_latency) {
+        return kDefaultAccuracyScenarios;
+    }
+    constexpr size_t kMinLowLatencyTokenBudget = 8;
+    if (moe_config.ll_num_max_token < static_cast<int>(kMinLowLatencyTokenBudget)) {
+        return {};
+    }
+
+    const size_t token_budget = static_cast<size_t>(moe_config.ll_num_max_token);
+
+    // Preserve the exact qualifying decode contexts. Long prefills are executed
+    // through chunked golden bootstrap; shortening them would weaken a global allowlist.
+    std::vector<AccuracyScenario> scenarios = {kDefaultAccuracyScenarios[1], kDefaultAccuracyScenarios[3]};
+
+    const size_t b3_len0 = std::max<size_t>(1, token_budget / 8);
+    const size_t b3_len1 = std::max<size_t>(1, token_budget / 4);
+    const size_t b3_len2 = token_budget - b3_len0 - b3_len1;
+    scenarios.push_back({{{b3_len0 / 2, b3_len0 - b3_len0 / 2, 1},
+                          {b3_len1 / 2, b3_len1 - b3_len1 / 2, 3},
+                          {b3_len2 / 2, b3_len2 - b3_len2 / 2, 7}},
+                         false,
+                         0xA11CE00000000007ULL});
+
+    std::vector<AccuracySeq> b8_seqs;
+    b8_seqs.reserve(8);
+    const size_t b8_base      = token_budget / 8;
+    const size_t b8_remainder = token_budget % 8;
+    for (size_t seq_id = 0; seq_id < 8; ++seq_id) {
+        b8_seqs.push_back({0, b8_base + (seq_id < b8_remainder ? 1 : 0), 16});
+    }
+    scenarios.push_back({std::move(b8_seqs), false, 0xA11CE00000000008ULL});
+    return scenarios;
 }
 
 AccuracyChecker::AccuracyChecker(const ModelConfig&       model_config,
@@ -150,11 +200,41 @@ AccuracyChecker::AccuracyChecker(const ModelConfig&       model_config,
                                  const ParallelismConfig& parallelism_config):
     model_config_(model_config), runtime_config_(runtime_config), parallelism_config_(parallelism_config) {}
 
-torch::Tensor AccuracyChecker::makeCheckPrompt(size_t len) {
-    int64_t token_size = model_config_.embedding_size ?
-                             std::min(model_config_.embedding_size, model_config_.vocab_size) :
-                             model_config_.vocab_size;
-    return torch::randint(0, token_size, {(int64_t)len}, torch::kInt32);
+torch::Tensor
+AccuracyChecker::makeDeterministicPrompt(size_t len, int64_t token_size, uint64_t prompt_seed, size_t sequence_id) {
+    RTP_LLM_CHECK_WITH_INFO(token_size > 0 && token_size <= std::numeric_limits<int32_t>::max(),
+                            "accuracy check token size must fit positive int32, got %ld",
+                            token_size);
+    RTP_LLM_CHECK_WITH_INFO(len <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+                            "accuracy check prompt length is too large: %zu",
+                            len);
+
+    auto prompt = torch::empty({static_cast<int64_t>(len)}, torch::TensorOptions().dtype(torch::kInt32));
+    auto tokens = prompt.data_ptr<int32_t>();
+
+    // Derive an independent stream per sequence, then address each token by index.
+    const uint64_t sequence_seed =
+        splitMix64(prompt_seed ^ (kSequenceSeedSalt * (static_cast<uint64_t>(sequence_id) + 1)));
+    for (size_t token_idx = 0; token_idx < len; ++token_idx) {
+        const uint64_t sample = splitMix64(sequence_seed + kSplitMixIncrement * static_cast<uint64_t>(token_idx));
+        tokens[token_idx]     = static_cast<int32_t>(sample % static_cast<uint64_t>(token_size));
+    }
+    return prompt;
+}
+
+torch::Tensor AccuracyChecker::makeCheckPrompt(size_t len, uint64_t prompt_seed, size_t sequence_id) {
+    const int64_t token_size = model_config_.embedding_size ?
+                                   std::min(model_config_.embedding_size, model_config_.vocab_size) :
+                                   model_config_.vocab_size;
+    return makeDeterministicPrompt(len, token_size, prompt_seed, sequence_id);
+}
+
+bool AccuracyChecker::acceptsWorldBackend(int32_t passed_sum,
+                                          int32_t verified_sum,
+                                          int32_t soft_outlier_sum,
+                                          int32_t world_size) {
+    return world_size > 0 && passed_sum == world_size && verified_sum == world_size && soft_outlier_sum >= 0
+           && soft_outlier_sum <= 1;
 }
 
 std::shared_ptr<GenerateInput> AccuracyChecker::wrapAccuracyInput(torch::Tensor input_ids, bool need_release) {
@@ -306,20 +386,75 @@ absl::Status AccuracyChecker::abortIfFailed(bool step_flag, const std::string& w
     return absl::InternalError("accuracy check aborted at " + where + " (some rank failed)");
 }
 
+absl::Status AccuracyChecker::validateWorldMetadata(const std::vector<int64_t>& local_metadata,
+                                                    const std::string&          where) {
+    if (parallelism_config_.world_size <= 1) {
+        return absl::OkStatus();
+    }
+    const int64_t world_size = parallelism_config_.world_size;
+    const int64_t world_rank = parallelism_config_.world_rank;
+    RTP_LLM_CHECK_WITH_INFO(world_rank >= 0 && world_rank < world_size,
+                            "accuracy check invalid world rank %ld for size %ld",
+                            (long)world_rank,
+                            (long)world_size);
+    auto  options  = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
+    auto  gathered = torch::zeros({world_size, static_cast<int64_t>(local_metadata.size())}, options);
+    auto* data     = gathered.data_ptr<int64_t>();
+    for (size_t i = 0; i < local_metadata.size(); ++i) {
+        data[world_rank * local_metadata.size() + i] = local_metadata[i];
+    }
+    execAllGather({{gathered}, ParallelMode::DP_AND_TP});
+    execSyncCommunication(false);
+    cudaSyncAndCheck();
+
+    auto accessor = gathered.accessor<int64_t, 2>();
+    for (int64_t rank = 0; rank < world_size; ++rank) {
+        for (size_t i = 0; i < local_metadata.size(); ++i) {
+            if (accessor[rank][i] != local_metadata[i]) {
+                return absl::FailedPreconditionError("accuracy check metadata mismatch at " + where);
+            }
+        }
+    }
+    return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<int32_t>> AccuracyChecker::sumWorldMask(const std::vector<int32_t>& local_mask,
+                                                                   const std::string&          where) {
+    if (parallelism_config_.world_size <= 1) {
+        return local_mask;
+    }
+    try {
+        auto mask = torch::tensor(local_mask, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        mask      = execAllReduce({mask, ReduceOp::Sum, false, ParallelMode::DP_AND_TP}).buffer;
+        cudaSyncAndCheck();
+        auto                 cpu = mask.to(torch::kCPU).contiguous();
+        std::vector<int32_t> out(static_cast<size_t>(cpu.numel()));
+        const auto*          data = cpu.data_ptr<int32_t>();
+        std::copy(data, data + cpu.numel(), out.begin());
+        return out;
+    } catch (const std::exception& e) {
+        return absl::InternalError("accuracy check mask reduction failed at " + where + ": " + e.what());
+    }
+}
+
 // Check the scheduler and sequence-length limits
 bool AccuracyChecker::runCheck(const AccuracyScenario& scenario, const std::string& scenario_base_name) {
     size_t max_seq_len   = 0;
     size_t max_plain_len = 0;
+    size_t plain_tokens  = 0;
     for (const auto& seq : scenario.seqs) {
         const size_t plain_len = seq.prefix_len + seq.chunk_len;
-        max_plain_len          = std::max(max_plain_len, plain_len);
-        max_seq_len            = std::max(max_seq_len, plain_len + seq.decode_steps);
+        plain_tokens += plain_len;
+        max_plain_len = std::max(max_plain_len, plain_len);
+        max_seq_len   = std::max(max_seq_len, plain_len + seq.decode_steps);
     }
     const bool batch_size_check_flag =
-        scenario.seqs.size() <= static_cast<size_t>(runtime_config_.max_generate_batch_size);
+        scenario.seqs.size() <= static_cast<size_t>(runtime_config_.max_generate_batch_size)
+        && (max_forward_tokens_ == 0 || scenario.seqs.size() <= max_forward_tokens_);
     const size_t max_batch_tokens = static_cast<size_t>(runtime_config_.fifo_scheduler_config.max_batch_tokens_size);
-    const size_t batch_tokens     = max_plain_len * scenario.seqs.size();
-    const bool   batch_tokens_check_flag = (max_batch_tokens == 0) || (batch_tokens < max_batch_tokens);
+    const size_t batch_tokens =
+        max_forward_tokens_ == 0 ? max_plain_len * scenario.seqs.size() : std::min(plain_tokens, max_forward_tokens_);
+    const bool batch_tokens_check_flag = (max_batch_tokens == 0) || (batch_tokens < max_batch_tokens);
     // PyTorch SDPA may produce incorrect results for sequences longer than 65536 tokens
     // The fix is expected in torch 2.14
     const bool sequence_length_check_flag =
@@ -339,21 +474,186 @@ bool AccuracyChecker::runCheck(const AccuracyScenario& scenario, const std::stri
     return true;
 }
 
-absl::StatusOr<std::vector<std::string>> AccuracyChecker::listCandidates(const py::object&  recorder,
-                                                                         const std::string& phase) {
-    std::vector<std::string> candidates;
-    bool                     list_candidates_flag = true;
+absl::Status AccuracyChecker::forwardGoldenBootstrap(const py::object&                     recorder,
+                                                     const std::string&                    scenario_base_name,
+                                                     const std::string&                    phase,
+                                                     const std::vector<GenerateStreamPtr>& active_streams,
+                                                     const std::vector<size_t>&            active_seq_ids,
+                                                     bool                                  build_streams_flag) {
+    const bool        root           = (parallelism_config_.tp_rank == 0);
+    const std::string bootstrap_name = scenario_base_name + "::golden_bootstrap::" + phase;
+    bool              setup_flag     = build_streams_flag;
+    if (setup_flag) {
+        try {
+            py::gil_scoped_acquire gil;
+            recorder.attr("start_golden_bootstrap")(scenario_base_name, phase, active_seq_ids);
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("accuracy check bootstrap setup failed at %s: %s", bootstrap_name.c_str(), e.what());
+            setup_flag = false;
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("accuracy check bootstrap setup failed at %s: unknown", bootstrap_name.c_str());
+            setup_flag = false;
+        }
+    }
+    RETURN_IF_STATUS_ERROR(abortIfFailed(setup_flag, "setup " + bootstrap_name));
+
+    bool forward_flag = true;
+    try {
+        std::list<GenerateStreamPtr> streams;
+        if (root) {
+            for (const auto& stream : active_streams) {
+                streams.push_back(stream);
+            }
+        }
+        forward_flag = executor_->process(streams).ok();
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_ERROR("accuracy check bootstrap failed at %s: %s", bootstrap_name.c_str(), e.what());
+        forward_flag = false;
+    } catch (...) {
+        RTP_LLM_LOG_ERROR("accuracy check bootstrap failed at %s: unknown", bootstrap_name.c_str());
+        forward_flag = false;
+    }
     try {
         py::gil_scoped_acquire gil;
-        candidates = recorder.attr("list_candidates")(phase).cast<std::vector<std::string>>();
+        recorder.attr("stop_golden_bootstrap")(bootstrap_name, forward_flag);
     } catch (const std::exception& e) {
-        RTP_LLM_LOG_ERROR("accuracy check list_candidates(%s) failed: %s", phase.c_str(), e.what());
-        list_candidates_flag = false;
+        RTP_LLM_LOG_ERROR("accuracy check bootstrap cleanup failed at %s: %s", bootstrap_name.c_str(), e.what());
+        forward_flag = false;
     } catch (...) {
-        RTP_LLM_LOG_ERROR("accuracy check list_candidates(%s) failed: unknown", phase.c_str());
-        list_candidates_flag = false;
+        RTP_LLM_LOG_ERROR("accuracy check bootstrap cleanup failed at %s: unknown", bootstrap_name.c_str());
+        forward_flag = false;
     }
-    RETURN_IF_STATUS_ERROR(abortIfFailed(list_candidates_flag, "list_candidates " + phase));
+    return abortIfFailed(forward_flag, bootstrap_name);
+}
+
+absl::Status AccuracyChecker::bootstrapGoldenHistory(const py::object&                 recorder,
+                                                     const std::string&                scenario_base_name,
+                                                     const AccuracyScenario&           scenario,
+                                                     const std::vector<torch::Tensor>& prompts,
+                                                     std::vector<GenerateStreamPtr>&   golden_streams,
+                                                     std::vector<StreamReleaseGuard>&  golden_guards) {
+    RTP_LLM_CHECK_WITH_INFO(max_forward_tokens_ > 0, "accuracy check bootstrap requires a positive token budget");
+    const bool root = (parallelism_config_.tp_rank == 0);
+    golden_streams.resize(scenario.seqs.size());
+    golden_guards.resize(scenario.seqs.size());
+
+    for (size_t seq_id = 0; seq_id < scenario.seqs.size(); ++seq_id) {
+        const size_t       total_len   = scenario.seqs[seq_id].prefix_len + scenario.seqs[seq_id].chunk_len;
+        size_t             history_len = 0;
+        size_t             chunk_idx   = 0;
+        GenerateStreamPtr  current_stream;
+        StreamReleaseGuard current_guard;
+        while (history_len < total_len) {
+            const size_t                    chunk_end = std::min(total_len, history_len + max_forward_tokens_);
+            std::vector<GenerateStreamPtr>  chunk_streams;
+            std::vector<StreamReleaseGuard> chunk_guards;
+            const std::vector<size_t>       active_seq_ids{seq_id};
+            const std::string phase = "bootstrap_s" + std::to_string(seq_id) + "_chunk_" + std::to_string(chunk_idx);
+            const bool        build_flag = buildBatch(
+                root,
+                active_seq_ids,
+                [&](size_t) -> absl::StatusOr<GenerateStreamPtr> {
+                    auto chunk_prompt = prompts[seq_id].narrow(0, 0, static_cast<int64_t>(chunk_end));
+                    if (history_len == 0) {
+                        return buildAccuracyStream(chunk_prompt, /*need_release=*/false);
+                    }
+                    return makeForkStream(chunk_prompt,
+                                          history_len,
+                                          /*is_decode=*/false,
+                                          /*cur_token=*/0,
+                                          current_stream);
+                },
+                chunk_streams,
+                chunk_guards,
+                "golden_bootstrap",
+                phase);
+            RETURN_IF_STATUS_ERROR(
+                forwardGoldenBootstrap(recorder, scenario_base_name, phase, chunk_streams, active_seq_ids, build_flag));
+            if (root) {
+                RTP_LLM_CHECK_WITH_INFO(chunk_streams.size() == 1 && chunk_guards.size() == 1,
+                                        "accuracy check bootstrap expected one stream for seq %zu",
+                                        seq_id);
+                current_stream = chunk_streams.front();
+                current_guard  = std::move(chunk_guards.front());
+            }
+            history_len = chunk_end;
+            ++chunk_idx;
+        }
+        if (root) {
+            golden_streams[seq_id] = current_stream;
+            golden_guards[seq_id]  = std::move(current_guard);
+        }
+    }
+    return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<std::string>> AccuracyChecker::listCandidates(const py::object&  recorder,
+                                                                         const std::string& phase) {
+    constexpr int64_t        kCandidateProtocolVersion = 2;
+    std::vector<std::string> registry;
+    std::vector<int32_t>     local_mask;
+    int64_t                  protocol_version     = 0;
+    int64_t                  registry_fingerprint = 0;
+    bool                     snapshot_ok          = true;
+    try {
+        py::gil_scoped_acquire gil;
+        py::dict               snapshot = recorder.attr("candidate_snapshot")(phase).cast<py::dict>();
+        protocol_version                = snapshot["protocol_version"].cast<int64_t>();
+        registry                        = snapshot["registry"].cast<std::vector<std::string>>();
+        registry_fingerprint            = snapshot["registry_fingerprint"].cast<int64_t>();
+        local_mask                      = snapshot["viable_mask"].cast<std::vector<int32_t>>();
+        snapshot_ok = protocol_version == kCandidateProtocolVersion && local_mask.size() == registry.size()
+                      && std::all_of(
+                          local_mask.begin(), local_mask.end(), [](int32_t value) { return value == 0 || value == 1; });
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_ERROR("accuracy check candidate_snapshot(%s) failed: %s", phase.c_str(), e.what());
+        snapshot_ok = false;
+    } catch (...) {
+        RTP_LLM_LOG_ERROR("accuracy check candidate_snapshot(%s) failed: unknown", phase.c_str());
+        snapshot_ok = false;
+    }
+
+    // Dry construction may have launched device work. Do not enter a collective
+    // with a poisoned device; the process supervisor must stop the worker group.
+    cudaSyncAndCheck();
+    if (!worldAll(snapshot_ok)) {
+        return absl::FailedPreconditionError("decode gate candidate snapshot invalid at " + phase);
+    }
+    auto metadata_status = validateWorldMetadata(
+        {protocol_version, static_cast<int64_t>(registry.size()), registry_fingerprint}, "candidate " + phase);
+    if (!metadata_status.ok()) {
+        return absl::FailedPreconditionError("decode gate candidate metadata mismatch at " + phase);
+    }
+
+    auto sums_or = sumWorldMask(local_mask, "candidate " + phase);
+    RETURN_IF_STATUS_OR_ERROR(sums_or);
+    auto                     sums = std::move(sums_or).value();
+    std::vector<std::string> candidates;
+    const int32_t            world_size = static_cast<int32_t>(parallelism_config_.world_size);
+    for (size_t i = 0; i < registry.size(); ++i) {
+        if (sums[i] == world_size) {
+            candidates.push_back(registry[i]);
+        } else if (sums[i] > 0) {
+            RTP_LLM_LOG_WARNING("accuracy check candidate asymmetric phase=%s backend=%s viable_ranks=%d world=%d",
+                                phase.c_str(),
+                                registry[i].c_str(),
+                                sums[i],
+                                world_size);
+        }
+    }
+
+    bool manifest_ok = true;
+    try {
+        py::gil_scoped_acquire gil;
+        recorder.attr("set_expected_candidates")(phase, candidates);
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_ERROR("accuracy check set_expected_candidates(%s) failed: %s", phase.c_str(), e.what());
+        manifest_ok = false;
+    } catch (...) {
+        RTP_LLM_LOG_ERROR("accuracy check set_expected_candidates(%s) failed: unknown", phase.c_str());
+        manifest_ok = false;
+    }
+    RETURN_IF_STATUS_ERROR(abortIfFailed(manifest_ok, "set_expected_candidates " + phase));
     return candidates;
 }
 
@@ -364,14 +664,15 @@ absl::Status AccuracyChecker::forward(const py::object&                     reco
                                       const std::string&                    phase,
                                       const std::vector<GenerateStreamPtr>& active_streams,
                                       const std::vector<size_t>&            active_seq_ids,
-                                      bool                                  build_streams_flag) {
+                                      bool                                  build_streams_flag,
+                                      bool                                  gate_qualifying) {
     const bool        root          = (parallelism_config_.tp_rank == 0);
     const std::string scenario_name = scenario_base_name + "::" + impl_name + "::" + phase;
     bool              setup_flag    = build_streams_flag;
     if (setup_flag) {
         try {
             py::gil_scoped_acquire gil;
-            recorder.attr("start_run")(scenario_base_name, impl_name, phase, active_seq_ids);
+            recorder.attr("start_run")(scenario_base_name, impl_name, phase, active_seq_ids, gate_qualifying);
         } catch (const std::exception& e) {
             RTP_LLM_LOG_ERROR("accuracy check start_run failed at %s: %s", scenario_name.c_str(), e.what());
             setup_flag = false;
@@ -436,7 +737,8 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
     if (root) {
         prompts.reserve(batch_size);
         for (size_t seq_id = 0; seq_id < batch_size; ++seq_id) {
-            prompts.push_back(makeCheckPrompt(scenario.seqs[seq_id].prefix_len + scenario.seqs[seq_id].chunk_len));
+            prompts.push_back(makeCheckPrompt(
+                scenario.seqs[seq_id].prefix_len + scenario.seqs[seq_id].chunk_len, scenario.prompt_seed, seq_id));
         }
     }
     std::vector<size_t> all_seq_ids(batch_size);
@@ -444,94 +746,128 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
         all_seq_ids[seq_id] = seq_id;
     }
 
+    size_t total_plain_tokens = 0;
+    for (const auto& seq : scenario.seqs) {
+        total_plain_tokens += seq.prefix_len + seq.chunk_len;
+    }
+    const bool chunked_bootstrap = max_forward_tokens_ > 0 && total_plain_tokens > max_forward_tokens_;
+
     // phase plain: batch golden streams plain prefill, one batched forward; golden kept alive for the whole scenario
     std::vector<GenerateStreamPtr>  golden_streams;
     std::vector<StreamReleaseGuard> golden_guards;
-    bool                            build_golden_flag = buildBatch(
-        root,
-        all_seq_ids,
-        [&](size_t seq_id) { return buildAccuracyStream(prompts[seq_id], /*need_release=*/false); },
-        golden_streams,
-        golden_guards,
-        "golden",
-        "plain");
-    RETURN_IF_STATUS_ERROR(
-        forward(recorder, scenario_base_name, "golden", "plain", golden_streams, all_seq_ids, build_golden_flag));
-
-    auto plain_candidates_or = listCandidates(recorder, "plain");
-    RETURN_IF_STATUS_OR_ERROR(plain_candidates_or);
-    auto plain_candidates = std::move(plain_candidates_or).value();
-    for (auto& impl_name : plain_candidates) {
-        std::vector<GenerateStreamPtr>  plain_streams;
-        std::vector<StreamReleaseGuard> plain_guards;
-        bool                            build_plain_flag = buildBatch(
+    if (chunked_bootstrap) {
+        RTP_LLM_LOG_INFO("accuracy check: chunked golden bootstrap scenario=%s tokens=%zu budget=%zu",
+                         scenario_base_name.c_str(),
+                         total_plain_tokens,
+                         max_forward_tokens_);
+        RETURN_IF_STATUS_ERROR(
+            bootstrapGoldenHistory(recorder, scenario_base_name, scenario, prompts, golden_streams, golden_guards));
+    } else {
+        bool build_golden_flag = buildBatch(
             root,
             all_seq_ids,
-            [&](size_t seq_id) { return buildAccuracyStream(prompts[seq_id], /*need_release=*/true); },
-            plain_streams,
-            plain_guards,
-            impl_name,
+            [&](size_t seq_id) { return buildAccuracyStream(prompts[seq_id], /*need_release=*/false); },
+            golden_streams,
+            golden_guards,
+            "golden",
             "plain");
-        RETURN_IF_STATUS_ERROR(
-            forward(recorder, scenario_base_name, impl_name, "plain", plain_streams, all_seq_ids, build_plain_flag));
-    }
-
-    // phase prefix: sequences with a prefix, each fork referencing its golden history kv blocks and run paged attention
-    std::vector<size_t> prefix_seq_ids;
-    for (size_t seq_id = 0; seq_id < batch_size; ++seq_id) {
-        if (scenario.seqs[seq_id].prefix_len > 0) {
-            prefix_seq_ids.push_back(seq_id);
-        }
-    }
-    if (!prefix_seq_ids.empty()) {
-        {  // scope guard for release golden prefix streams before running candidates
-            std::vector<GenerateStreamPtr>  golden_prefix_streams;
-            std::vector<StreamReleaseGuard> golden_prefix_guards;
-            bool                            build_golden_prefix_flag = buildBatch(
+        RETURN_IF_STATUS_ERROR(forward(recorder,
+                                       scenario_base_name,
+                                       "golden",
+                                       "plain",
+                                       golden_streams,
+                                       all_seq_ids,
+                                       build_golden_flag,
+                                       scenario.gate_qualifying));
+        auto plain_candidates_or = listCandidates(recorder, "plain");
+        RETURN_IF_STATUS_OR_ERROR(plain_candidates_or);
+        auto plain_candidates = std::move(plain_candidates_or).value();
+        for (auto& impl_name : plain_candidates) {
+            std::vector<GenerateStreamPtr>  plain_streams;
+            std::vector<StreamReleaseGuard> plain_guards;
+            bool                            build_plain_flag = buildBatch(
                 root,
-                prefix_seq_ids,
-                [&](size_t seq_id) {
-                    return makeForkStream(prompts[seq_id],
-                                          scenario.seqs[seq_id].prefix_len,
-                                          /*is_decode=*/false,
-                                          /*cur_token=*/0,
-                                          golden_streams[seq_id]);
-                },
-                golden_prefix_streams,
-                golden_prefix_guards,
-                "golden",
-                "prefix");
+                all_seq_ids,
+                [&](size_t seq_id) { return buildAccuracyStream(prompts[seq_id], /*need_release=*/true); },
+                plain_streams,
+                plain_guards,
+                impl_name,
+                "plain");
             RETURN_IF_STATUS_ERROR(forward(recorder,
                                            scenario_base_name,
-                                           "golden",
-                                           "prefix",
-                                           golden_prefix_streams,
-                                           prefix_seq_ids,
-                                           build_golden_prefix_flag));
+                                           impl_name,
+                                           "plain",
+                                           plain_streams,
+                                           all_seq_ids,
+                                           build_plain_flag,
+                                           scenario.gate_qualifying));
         }
 
-        auto prefix_candidates_or = listCandidates(recorder, "prefix");
-        RETURN_IF_STATUS_OR_ERROR(prefix_candidates_or);
-        auto prefix_candidates = std::move(prefix_candidates_or).value();
-        for (auto& impl_name : prefix_candidates) {
-            std::vector<GenerateStreamPtr>  prefix_streams;
-            std::vector<StreamReleaseGuard> prefix_guards;
-            bool                            build_prefix_flag = buildBatch(
-                root,
-                prefix_seq_ids,
-                [&](size_t seq_id) {
-                    return makeForkStream(prompts[seq_id],
-                                          scenario.seqs[seq_id].prefix_len,
-                                          /*is_decode=*/false,
-                                          /*cur_token=*/0,
-                                          golden_streams[seq_id]);
-                },
-                prefix_streams,
-                prefix_guards,
-                impl_name,
-                "prefix");
-            RETURN_IF_STATUS_ERROR(forward(
-                recorder, scenario_base_name, impl_name, "prefix", prefix_streams, prefix_seq_ids, build_prefix_flag));
+        // phase prefix: sequences with a prefix, each fork referencing its golden history kv blocks and run paged
+        // attention
+        std::vector<size_t> prefix_seq_ids;
+        for (size_t seq_id = 0; seq_id < batch_size; ++seq_id) {
+            if (scenario.seqs[seq_id].prefix_len > 0) {
+                prefix_seq_ids.push_back(seq_id);
+            }
+        }
+        if (!prefix_seq_ids.empty()) {
+            {  // scope guard for release golden prefix streams before running candidates
+                std::vector<GenerateStreamPtr>  golden_prefix_streams;
+                std::vector<StreamReleaseGuard> golden_prefix_guards;
+                bool                            build_golden_prefix_flag = buildBatch(
+                    root,
+                    prefix_seq_ids,
+                    [&](size_t seq_id) {
+                        return makeForkStream(prompts[seq_id],
+                                              scenario.seqs[seq_id].prefix_len,
+                                              /*is_decode=*/false,
+                                              /*cur_token=*/0,
+                                              golden_streams[seq_id]);
+                    },
+                    golden_prefix_streams,
+                    golden_prefix_guards,
+                    "golden",
+                    "prefix");
+                RETURN_IF_STATUS_ERROR(forward(recorder,
+                                               scenario_base_name,
+                                               "golden",
+                                               "prefix",
+                                               golden_prefix_streams,
+                                               prefix_seq_ids,
+                                               build_golden_prefix_flag,
+                                               scenario.gate_qualifying));
+            }
+
+            auto prefix_candidates_or = listCandidates(recorder, "prefix");
+            RETURN_IF_STATUS_OR_ERROR(prefix_candidates_or);
+            auto prefix_candidates = std::move(prefix_candidates_or).value();
+            for (auto& impl_name : prefix_candidates) {
+                std::vector<GenerateStreamPtr>  prefix_streams;
+                std::vector<StreamReleaseGuard> prefix_guards;
+                bool                            build_prefix_flag = buildBatch(
+                    root,
+                    prefix_seq_ids,
+                    [&](size_t seq_id) {
+                        return makeForkStream(prompts[seq_id],
+                                              scenario.seqs[seq_id].prefix_len,
+                                              /*is_decode=*/false,
+                                              /*cur_token=*/0,
+                                              golden_streams[seq_id]);
+                    },
+                    prefix_streams,
+                    prefix_guards,
+                    impl_name,
+                    "prefix");
+                RETURN_IF_STATUS_ERROR(forward(recorder,
+                                               scenario_base_name,
+                                               impl_name,
+                                               "prefix",
+                                               prefix_streams,
+                                               prefix_seq_ids,
+                                               build_prefix_flag,
+                                               scenario.gate_qualifying));
+            }
         }
     }
 
@@ -595,7 +931,8 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
                                            "decode_" + std::to_string(step),
                                            golden_decode_streams,
                                            active_seq_ids,
-                                           golden_block_flag));
+                                           golden_block_flag,
+                                           scenario.gate_qualifying));
             // append active_seqs golden tokens on rank0
             if (root) {
                 for (size_t seq_id : active_seq_ids) {
@@ -664,7 +1001,8 @@ absl::Status AccuracyChecker::runScenario(const py::object& recorder, const Accu
                                                decode_phase,
                                                decode_streams,
                                                active_seq_ids,
-                                               build_decode_flag));
+                                               build_decode_flag,
+                                               scenario.gate_qualifying));
             }
         }
     }
@@ -705,11 +1043,164 @@ size_t AccuracyChecker::computeTemporaryBlockNum(const ModelConfig&             
     return required_blocks + 1;  // + reserved block 0
 }
 
-absl::Status AccuracyChecker::runAll(Executor*                            executor,
-                                     ResourceContext&                     resource_context,
-                                     const std::vector<AccuracyScenario>& scenarios) {
-    executor_         = executor;
-    resource_context_ = &resource_context;
+absl::StatusOr<DecodeBackendGate> AccuracyChecker::finalizeDecodeGate(const py::object& recorder) {
+    constexpr int64_t        kGateProtocolVersion = 2;
+    std::string              local_status;
+    std::string              local_reason;
+    int64_t                  protocol_version     = 0;
+    int64_t                  registry_fingerprint = 0;
+    int64_t                  manifest_fingerprint = 0;
+    std::vector<std::string> registry;
+    std::vector<int32_t>     applicable_mask;
+    std::vector<int32_t>     verified_mask;
+    std::vector<int32_t>     passed_mask;
+    std::vector<int32_t>     soft_outlier_counts;
+    bool                     finalize_ok = true;
+    try {
+        py::gil_scoped_acquire gil;
+        py::dict               local_gate =
+            recorder.attr("finalize_decode_gate")(model_config_.attn_config.kv_cache_dtype).cast<py::dict>();
+        local_status         = local_gate["status"].cast<std::string>();
+        local_reason         = local_gate["reason"].cast<std::string>();
+        protocol_version     = local_gate["protocol_version"].cast<int64_t>();
+        registry             = local_gate["registry"].cast<std::vector<std::string>>();
+        registry_fingerprint = local_gate["registry_fingerprint"].cast<int64_t>();
+        manifest_fingerprint = local_gate["manifest_fingerprint"].cast<int64_t>();
+        applicable_mask      = local_gate["applicable_mask"].cast<std::vector<int32_t>>();
+        verified_mask        = local_gate["verified_mask"].cast<std::vector<int32_t>>();
+        passed_mask          = local_gate["passed_mask"].cast<std::vector<int32_t>>();
+        soft_outlier_counts  = local_gate["soft_outlier_counts"].cast<std::vector<int32_t>>();
+        finalize_ok          = protocol_version == kGateProtocolVersion && applicable_mask.size() == registry.size()
+                      && verified_mask.size() == registry.size() && passed_mask.size() == registry.size()
+                      && soft_outlier_counts.size() == registry.size()
+                      && (local_status == "READY" || local_status == "UNAVAILABLE");
+        for (size_t i = 0; finalize_ok && i < registry.size(); ++i) {
+            const bool masks_are_binary = (applicable_mask[i] == 0 || applicable_mask[i] == 1)
+                                          && (verified_mask[i] == 0 || verified_mask[i] == 1)
+                                          && (passed_mask[i] == 0 || passed_mask[i] == 1);
+            finalize_ok = masks_are_binary && soft_outlier_counts[i] >= 0 && passed_mask[i] <= verified_mask[i]
+                          && verified_mask[i] <= applicable_mask[i];
+        }
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_ERROR("accuracy check finalize_decode_gate failed: %s", e.what());
+        finalize_ok = false;
+    } catch (...) {
+        RTP_LLM_LOG_ERROR("accuracy check finalize_decode_gate failed: unknown");
+        finalize_ok = false;
+    }
+
+    cudaSyncAndCheck();
+    if (!worldAll(finalize_ok)) {
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=invalid_local_gate_schema");
+        return DecodeBackendGate::unavailable("invalid_local_gate_schema");
+    }
+
+    auto registry_status = validateWorldMetadata(
+        {protocol_version, static_cast<int64_t>(registry.size()), registry_fingerprint}, "decode gate registry");
+    if (!registry_status.ok()) {
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=registry_mismatch");
+        auto gate                 = DecodeBackendGate::unavailable("registry_mismatch");
+        gate.protocol_version     = protocol_version;
+        gate.registry_fingerprint = registry_fingerprint;
+        gate.manifest_fingerprint = manifest_fingerprint;
+        return gate;
+    }
+
+    if (!worldAll(local_status == "READY")) {
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=rank_local_gate_unavailable "
+                            "local_reason=%s",
+                            local_reason.c_str());
+        auto gate                 = DecodeBackendGate::unavailable("rank_local_gate_unavailable");
+        gate.protocol_version     = protocol_version;
+        gate.registry_fingerprint = registry_fingerprint;
+        gate.manifest_fingerprint = manifest_fingerprint;
+        return gate;
+    }
+
+    auto manifest_status = validateWorldMetadata({manifest_fingerprint}, "decode gate manifest");
+    if (!manifest_status.ok()) {
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=manifest_mismatch");
+        auto gate                 = DecodeBackendGate::unavailable("manifest_mismatch");
+        gate.protocol_version     = protocol_version;
+        gate.registry_fingerprint = registry_fingerprint;
+        gate.manifest_fingerprint = manifest_fingerprint;
+        return gate;
+    }
+
+    std::vector<int32_t> stacked;
+    stacked.reserve(registry.size() * 4);
+    stacked.insert(stacked.end(), applicable_mask.begin(), applicable_mask.end());
+    stacked.insert(stacked.end(), verified_mask.begin(), verified_mask.end());
+    stacked.insert(stacked.end(), passed_mask.begin(), passed_mask.end());
+    stacked.insert(stacked.end(), soft_outlier_counts.begin(), soft_outlier_counts.end());
+    auto sums_or = sumWorldMask(stacked, "decode gate masks");
+    RETURN_IF_STATUS_OR_ERROR(sums_or);
+    auto sums = std::move(sums_or).value();
+
+    DecodeBackendGate gate;
+    gate.status                 = DecodeBackendGateStatus::READY;
+    gate.protocol_version       = protocol_version;
+    gate.registry_fingerprint   = registry_fingerprint;
+    gate.manifest_fingerprint   = manifest_fingerprint;
+    const int32_t world_size    = static_cast<int32_t>(parallelism_config_.world_size);
+    const size_t  registry_size = registry.size();
+    for (size_t i = 0; i < registry_size; ++i) {
+        const int32_t applicable_sum   = sums[i];
+        const int32_t verified_sum     = sums[registry_size + i];
+        const int32_t passed_sum       = sums[2 * registry_size + i];
+        const int32_t soft_outlier_sum = sums[3 * registry_size + i];
+        if (applicable_sum == world_size) {
+            gate.applicable.push_back(registry[i]);
+        }
+        if (verified_sum == world_size) {
+            gate.verified.push_back(registry[i]);
+        }
+        if (acceptsWorldBackend(passed_sum, verified_sum, soft_outlier_sum, world_size)) {
+            gate.passed.push_back(registry[i]);
+        }
+        if (passed_sum == world_size && verified_sum == world_size && soft_outlier_sum > 1) {
+            RTP_LLM_LOG_WARNING("dynamic_decode_gate_soft_outlier_budget_exceeded backend=%s count=%d limit=1",
+                                registry[i].c_str(),
+                                soft_outlier_sum);
+        }
+        if ((applicable_sum > 0 && applicable_sum < world_size) || (verified_sum > 0 && verified_sum < world_size)
+            || (passed_sum > 0 && passed_sum < world_size)) {
+            RTP_LLM_LOG_WARNING("dynamic_decode_gate_asymmetric backend=%s applicable=%d verified=%d passed=%d "
+                                "world=%d",
+                                registry[i].c_str(),
+                                applicable_sum,
+                                verified_sum,
+                                passed_sum,
+                                world_size);
+        }
+    }
+    if (gate.applicable.empty()) {
+        gate.reason = "no_applicable_backend";
+    } else if (gate.verified.empty()) {
+        gate.reason = "no_backend_verified";
+    } else if (gate.passed.empty()) {
+        gate.reason = "no_backend_passed";
+    } else {
+        gate.reason = "complete";
+    }
+    RTP_LLM_LOG_INFO("dynamic_decode_gate_merged status=READY applicable=%zu verified=%zu passed=%zu "
+                     "reason=%s registry_fp=%ld manifest_fp=%ld",
+                     gate.applicable.size(),
+                     gate.verified.size(),
+                     gate.passed.size(),
+                     gate.reason.c_str(),
+                     (long)gate.registry_fingerprint,
+                     (long)gate.manifest_fingerprint);
+    return gate;
+}
+
+absl::StatusOr<DecodeBackendGate> AccuracyChecker::runAll(Executor*                            executor,
+                                                          ResourceContext&                     resource_context,
+                                                          const std::vector<AccuracyScenario>& scenarios,
+                                                          size_t                               max_forward_tokens) {
+    executor_           = executor;
+    resource_context_   = &resource_context;
+    max_forward_tokens_ = max_forward_tokens;
 
     auto* normal_executor = dynamic_cast<NormalExecutor*>(executor_);
     RTP_LLM_CHECK_WITH_INFO(normal_executor, "accuracy check requires NormalExecutor");
@@ -721,14 +1212,22 @@ absl::Status AccuracyChecker::runAll(Executor*                            execut
         py::gil_scoped_acquire gil;
         auto                   recorder_module =
             py::module::import("rtp_llm.models_py.modules.factory.attention.accuracy.tensor_recorder");
-        session.recorder_ = recorder_module.attr("TensorRecorder")(py_model->getPyModel());
+        session.recorder_ = recorder_module.attr("TensorRecorder")(
+            py_model->getPyModel(), /*record_qkv=*/runtime_config_.enable_accuracy_check);
     }
     py_model->setAccuracyRecording(true);
 
     const int64_t record_begin_us = autil::TimeUtility::currentTimeInMicroSeconds();
     try {
         for (const auto& scenario : scenarios) {
-            RETURN_IF_STATUS_ERROR(runScenario(session.recorder_, scenario));
+            auto scenario_status = runScenario(session.recorder_, scenario);
+            if (absl::IsFailedPrecondition(scenario_status)) {
+                RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=candidate_schema_invalid "
+                                    "detail=%s",
+                                    scenario_status.ToString().c_str());
+                return DecodeBackendGate::unavailable("candidate_schema_invalid");
+            }
+            RETURN_IF_STATUS_ERROR(scenario_status);
         }
     } catch (const std::exception& e) {
         return absl::InternalError(std::string("accuracy check scenario threw: ") + e.what());
@@ -738,7 +1237,7 @@ absl::Status AccuracyChecker::runAll(Executor*                            execut
     const int64_t record_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - record_begin_us;
     RTP_LLM_LOG_INFO("accuracy check: recording completed in %.3f seconds", record_time_us / 1000000.0);
 
-    return absl::OkStatus();
+    return finalizeDecodeGate(session.recorder_);
 }
 
 }  // namespace rtp_llm

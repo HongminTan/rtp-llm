@@ -23,10 +23,11 @@ class NormalExecutor: public Executor {
 public:
     explicit NormalExecutor(const EngineInitParams&                params,
                             const std::shared_ptr<KVCacheManager>& cache_manager,
-                            bool                                   warm_up             = false,
-                            bool                                   is_propose          = false,
-                            int                                    propose_model_index = 0,
-                            MlaOpsType                             mla_ops_type        = MlaOpsType::AUTO);
+                            bool                                   warm_up                 = false,
+                            bool                                   is_propose              = false,
+                            int                                    propose_model_index     = 0,
+                            MlaOpsType                             mla_ops_type            = MlaOpsType::AUTO,
+                            bool                                   accuracy_check_executor = false);
     ~NormalExecutor();
     absl::Status process(const std::list<GenerateStreamPtr>& streams) override;
     void         reportMetrics(const StreamGroups&             stream_groups,

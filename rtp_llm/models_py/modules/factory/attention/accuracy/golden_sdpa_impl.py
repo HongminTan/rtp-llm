@@ -24,10 +24,12 @@ class GoldenSDPAImpl(FMHAImplBase):
         attn_configs: AttentionConfigs,
         attn_inputs: PyAttentionInputs,
         history: GoldenKVHistoryView,
+        append_prefill_history: bool = False,
     ) -> None:
         self.attn_configs = attn_configs
         self.attn_inputs = attn_inputs
         self.history = history
+        self.append_prefill_history = bool(append_prefill_history)
         self.head_num = attn_configs.head_num
         self.kv_head_num = attn_configs.kv_head_num
         self.head_dim = attn_configs.size_per_head
@@ -70,6 +72,11 @@ class GoldenSDPAImpl(FMHAImplBase):
                 seg_k, seg_v = k[s:e], v[s:e]
                 if prefix_len > 0:  # prefix: prepend this sequence's golden history
                     history_k, history_v = self.history.get_prefix(batch_idx, layer_idx)
+                    if self.append_prefill_history and history_k.shape[0] != prefix_len:
+                        raise RuntimeError(
+                            "golden bootstrap history length differs from prefix length: "
+                            f"history={history_k.shape[0]}, prefix={prefix_len}"
+                        )
                     seg_k = torch.cat([history_k[:prefix_len], seg_k], 0)
                     seg_v = torch.cat([history_v[:prefix_len], seg_v], 0)
                 else:  # plain: store this [P+C] segment as golden history for later decode
@@ -77,6 +84,8 @@ class GoldenSDPAImpl(FMHAImplBase):
                 outputs.append(
                     self._sdpa(q[s:e], seg_k, seg_v, prefix_len=prefix_len, causal=True)
                 )
+                if prefix_len > 0 and self.append_prefill_history:
+                    self.history.append_prefill(batch_idx, layer_idx, k[s:e], v[s:e])
         else:  # decode: one row per sequence
             sequence_lengths = attention_inputs.sequence_lengths.tolist()
             assert len(sequence_lengths) == len(self.history)

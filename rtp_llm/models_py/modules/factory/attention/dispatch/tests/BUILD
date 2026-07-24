@@ -14,6 +14,7 @@ py_test(
         "test_backend_selector.py",
         "test_decode_gate.py",
         "test_selector.py",
+        "test_tensor_recorder.py",
     ],
     deps = py_test_deps,
     tags = ["H20"],

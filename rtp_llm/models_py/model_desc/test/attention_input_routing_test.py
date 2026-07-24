@@ -1,13 +1,17 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import torch
 from torch import nn
 
 from rtp_llm.device.device_type import DeviceType
 from rtp_llm.models_py.model_desc.block_map import get_group_tags_for_layers
-from rtp_llm.models_py.model_desc.module_base import GptModelBase
+from rtp_llm.models_py.model_desc.module_base import (
+    DecodeBackendGateState,
+    DecodeBackendGateStatus,
+    GptModelBase,
+)
 from rtp_llm.models_py.model_desc.qwen3_next import (
     Qwen3NextMetadata,
     _maybe_write_cp_cache_store,
@@ -41,6 +45,17 @@ def _dynamic_routing_model():
     model.py_hw_kernel_config = SimpleNamespace(enable_dynamic_decode_backend=True)
     model.backend_plan = {}
     model._logged_decode_backend = {}
+    model._decode_backend_gate = DecodeBackendGateState(
+        status=DecodeBackendGateStatus.NOT_REQUESTED,
+        passed=frozenset(),
+        verified=frozenset(),
+        reason="",
+        registry_fingerprint="",
+        manifest_fingerprint="",
+    )
+    model._decode_backend_gate_injected = False
+    model._decode_backend_gate_frozen = False
+    model._logged_decode_gate_fallback = set()
     model.device_type = DeviceType.Cuda
     model.kv_cache = object()
     model.fmha_config = object()
@@ -305,33 +320,149 @@ class AttentionInputRoutingTest(unittest.TestCase):
         factory.assert_not_called()
         self.assertEqual(model._logged_decode_backend, {})
 
-    def test_selection_miss_and_recoverable_exception_write_explicit_none(self):
+    def test_not_requested_gate_writes_explicit_miss_without_selector(self):
         model = _dynamic_routing_model()
         attention_inputs = _decode_inputs()
         from rtp_llm.models_py.modules.factory.attention.dispatch import (
             backend_selector,
         )
 
+        with (
+            patch(
+                "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
+                return_value=attention_inputs,
+            ),
+            patch.object(backend_selector, "run_backend_selection") as selector,
+            patch(
+                "rtp_llm.models_py.model_desc.module_base.logging.warning"
+            ) as warning,
+        ):
+            model.select_decode_backend(object())
+            model.select_decode_backend(object())
+
+        self.assertEqual(model.backend_plan, {2: None})
+        selector.assert_not_called()
+        warning.assert_called_once()
+        self.assertTrue(model._decode_backend_gate_frozen)
+        with self.assertRaisesRegex(RuntimeError, "frozen after selector use"):
+            model.set_decode_backend_gate(
+                "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
+            )
+
+    def test_unavailable_and_ready_empty_gates_do_not_call_selector(self):
+        from rtp_llm.models_py.modules.factory.attention.dispatch import (
+            backend_selector,
+        )
+
+        for status, verified, reason in (
+            ("UNAVAILABLE", [], "manifest_mismatch"),
+            ("READY", ["XQADecodeImpl"], "precision_failed"),
+        ):
+            with self.subTest(status=status):
+                model = _dynamic_routing_model()
+                model.set_decode_backend_gate(
+                    status, [], verified, reason, "registry", "manifest"
+                )
+                with (
+                    patch(
+                        "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
+                        return_value=_decode_inputs(),
+                    ),
+                    patch.object(backend_selector, "run_backend_selection") as selector,
+                ):
+                    model.select_decode_backend(object())
+
+                self.assertEqual(model.backend_plan, {2: None})
+                selector.assert_not_called()
+
+    def test_ready_gate_filters_selector_and_records_normal_plan_miss(self):
+        from rtp_llm.models_py.modules.factory.attention.dispatch import (
+            backend_selector,
+        )
+
+        model = _dynamic_routing_model()
+        model.set_decode_backend_gate(
+            "READY",
+            ["XQADecodeImpl"],
+            ["XQAImpl", "XQADecodeImpl"],
+            "",
+            123,
+            456,
+        )
+        with (
+            patch(
+                "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
+                return_value=_decode_inputs(),
+            ),
+            patch.object(
+                backend_selector, "run_backend_selection", return_value=None
+            ) as selector,
+        ):
+            model.select_decode_backend(object())
+
+        selector.assert_called_once_with(
+            model, ANY, gate_passed=frozenset({"XQADecodeImpl"})
+        )
+        self.assertEqual(model.backend_plan, {2: None})
+
+    def test_gate_setter_clears_plans_and_rejects_updates_after_selection(self):
+        model = _dynamic_routing_model()
+        model.backend_plan[2] = "OldImpl"
+        model._logged_decode_backend[2] = "OldImpl"
+        model._logged_decode_gate_fallback.add((2, "old", "old"))
+
+        model.set_decode_backend_gate(
+            "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
+        )
+        self.assertEqual(model.backend_plan, {})
+        self.assertEqual(model._logged_decode_backend, {})
+        self.assertEqual(model._logged_decode_gate_fallback, set())
+        with self.assertRaisesRegex(RuntimeError, "already been injected"):
+            model.set_decode_backend_gate(
+                "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
+            )
+
         with patch(
             "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
-            return_value=attention_inputs,
+            return_value=_decode_inputs(),
         ):
+            from rtp_llm.models_py.modules.factory.attention.dispatch import (
+                backend_selector,
+            )
+
             with patch.object(
                 backend_selector, "run_backend_selection", return_value=None
             ):
                 model.select_decode_backend(object())
-            self.assertIn(2, model.backend_plan)
-            self.assertIsNone(model.backend_plan[2])
+        with self.assertRaisesRegex(RuntimeError, "frozen after selector use"):
+            model.set_decode_backend_gate(
+                "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
+            )
 
-            model.backend_plan.clear()
-            with patch.object(
+    def test_unexpected_selector_exception_propagates_without_plan(self):
+        from rtp_llm.models_py.modules.factory.attention.dispatch import (
+            backend_selector,
+        )
+
+        model = _dynamic_routing_model()
+        model.set_decode_backend_gate(
+            "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
+        )
+        with (
+            patch(
+                "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
+                return_value=_decode_inputs(),
+            ),
+            patch.object(
                 backend_selector,
                 "run_backend_selection",
-                side_effect=RuntimeError("pre-probe failure"),
-            ):
+                side_effect=RuntimeError("unexpected"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected"):
                 model.select_decode_backend(object())
-            self.assertIn(2, model.backend_plan)
-            self.assertIsNone(model.backend_plan[2])
+
+        self.assertEqual(model.backend_plan, {})
 
     def test_capability_guard_and_nonfinal_paths_keep_plan_and_logs_empty(self):
         model = _dynamic_routing_model()
@@ -343,6 +474,7 @@ class AttentionInputRoutingTest(unittest.TestCase):
         ):
             model.select_decode_backend(object())
         self.assertEqual(model.backend_plan, {})
+        self.assertFalse(model._decode_backend_gate_frozen)
 
         model.py_hw_kernel_config.enable_dynamic_decode_backend = True
         with (

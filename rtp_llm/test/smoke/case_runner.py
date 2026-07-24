@@ -141,6 +141,50 @@ class CaseRunner(object):
             dict
         )
         applied: Dict[int, Dict[Tuple[int, int], str]] = defaultdict(dict)
+        gate_by_rank: Dict[Tuple[int, int], Tuple[set[str], set[str], str, str]] = {}
+
+        for (
+            status,
+            passed,
+            verified,
+            registry_fp,
+            manifest_fp,
+            tp_rank,
+            dp_rank,
+        ) in re.findall(
+            r"dynamic_decode_gate_injected status=([A-Z_]+) "
+            r"passed=([A-Za-z_][A-Za-z0-9_]*(?:,[A-Za-z_][A-Za-z0-9_]*)*|-) "
+            r"verified=([A-Za-z_][A-Za-z0-9_]*(?:,[A-Za-z_][A-Za-z0-9_]*)*|-) "
+            r"reason=\S+ registry_fp=(\S+) manifest_fp=(\S+) "
+            r"tp_rank=(\d+) dp_rank=(\d+)",
+            process_log,
+        ):
+            rank = (int(dp_rank), int(tp_rank))
+            assert rank not in gate_by_rank, (
+                "duplicate canonical dynamic decode gate injection for "
+                f"dp_rank={rank[0]} tp_rank={rank[1]}"
+            )
+            assert status == "READY", (
+                "dynamic decode precision gate is not READY for "
+                f"dp_rank={rank[0]} tp_rank={rank[1]}: status={status}"
+            )
+            passed_names = set() if passed == "-" else set(passed.split(","))
+            verified_names = set() if verified == "-" else set(verified.split(","))
+            assert passed_names, (
+                "dynamic decode precision gate passed no backend for "
+                f"dp_rank={rank[0]} tp_rank={rank[1]}"
+            )
+            assert passed_names <= verified_names, (
+                "dynamic decode gate passed set is not a subset of verified for "
+                f"dp_rank={rank[0]} tp_rank={rank[1]}: "
+                f"passed={sorted(passed_names)}, verified={sorted(verified_names)}"
+            )
+            gate_by_rank[rank] = (
+                passed_names,
+                verified_names,
+                registry_fp,
+                manifest_fp,
+            )
 
         for bs, registry_idx, backend, tp_rank, tp_size, dp_rank in re.findall(
             r"dynamic_decode_plan_received bs=(\d+) registry_idx=(\d+) "
@@ -170,6 +214,29 @@ class CaseRunner(object):
             applied[bucket][rank] = backend
 
         assert capture_buckets, "dynamic decode smoke captured no decode buckets"
+        expected_ranks = {
+            (dp_rank, tp_rank)
+            for dp_rank in range(expected_dp_size)
+            for tp_rank in range(expected_tp_size)
+        }
+        assert set(gate_by_rank) == expected_ranks, (
+            "dynamic decode gate injection ranks are incomplete: "
+            f"expected={sorted(expected_ranks)}, actual={sorted(gate_by_rank)}"
+        )
+        merged_gates = {
+            (frozenset(record[0]), frozenset(record[1]), record[2], record[3])
+            for record in gate_by_rank.values()
+        }
+        assert len(merged_gates) == 1, (
+            "dynamic decode gate payloads differ across ranks: "
+            f"{sorted(str(record) for record in merged_gates)}"
+        )
+        assert (
+            "dynamic_decode_fallback_static" not in process_log
+        ), "dynamic decode used a gate/static fallback"
+        assert (
+            "(fixed-priority)" not in process_log
+        ), "dynamic decode capture used a fixed-priority backend"
         assert capture_buckets == set(received), (
             "dynamic decode received buckets do not match captured buckets: "
             f"captured={sorted(capture_buckets)}, received={sorted(received)}"
@@ -187,11 +254,6 @@ class CaseRunner(object):
                 f"unexpected tp_size in dynamic decode plan for bs={bucket}: "
                 f"expected={expected_tp_size}, actual={sorted(tp_sizes)}"
             )
-            expected_ranks = {
-                (dp_rank, tp_rank)
-                for dp_rank in range(expected_dp_size)
-                for tp_rank in range(expected_tp_size)
-            }
             assert set(received_by_rank) == expected_ranks, (
                 f"missing received ranks for bs={bucket}: "
                 f"expected={sorted(expected_ranks)}, "
@@ -212,6 +274,11 @@ class CaseRunner(object):
                     f"bs={bucket} dp_rank={dp_rank}: {sorted(selections)}"
                 )
             for rank, (_, backend, _) in received_by_rank.items():
+                assert backend in gate_by_rank[rank][0], (
+                    f"dynamic decode selected backend outside the precision gate for "
+                    f"bs={bucket} dp_rank={rank[0]} tp_rank={rank[1]}: "
+                    f"selected={backend}, passed={sorted(gate_by_rank[rank][0])}"
+                )
                 assert applied_by_rank[rank] == backend, (
                     f"dynamic decode plan was not applied for bs={bucket} "
                     f"dp_rank={rank[0]} tp_rank={rank[1]}: received={backend}, "

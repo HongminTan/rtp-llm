@@ -5,7 +5,7 @@ _is_fmha_impl_disabled (class-name matching) is exercised. No GPU / torch comput
 The probe tests also replace torch allocation, benchmarking, fatal termination,
 and TP broadcast so failure-boundary behavior is deterministic.
 An explicitly supplied precision allowlist is intersected with the support and
-configuration filters; production callers currently leave that path disconnected.
+configuration filters; the production API requires that allowlist explicitly.
 """
 
 import contextlib
@@ -95,7 +95,11 @@ _NAMES = ["PyFlashinferDecodeImpl", "XQADecodeImpl"]
 def test_eligible_excludes_flashinfer_when_disabled():
     with _patch_impls(_NAMES):
         eligible = backend_selector._eligible(
-            None, None, None, _fmha_config(disable_flashinfer_native=True)
+            None,
+            None,
+            None,
+            _fmha_config(disable_flashinfer_native=True),
+            frozenset(_NAMES),
         )
     assert "PyFlashinferDecodeImpl" not in eligible
     assert "XQADecodeImpl" in eligible
@@ -104,7 +108,11 @@ def test_eligible_excludes_flashinfer_when_disabled():
 def test_eligible_excludes_xqa_when_disabled():
     with _patch_impls(_NAMES):
         eligible = backend_selector._eligible(
-            None, None, None, _fmha_config(enable_xqa=False)
+            None,
+            None,
+            None,
+            _fmha_config(enable_xqa=False),
+            frozenset(_NAMES),
         )
     assert "XQADecodeImpl" not in eligible
     assert "PyFlashinferDecodeImpl" in eligible
@@ -112,13 +120,15 @@ def test_eligible_excludes_xqa_when_disabled():
 
 def test_eligible_keeps_all_when_nothing_disabled():
     with _patch_impls(_NAMES):
-        eligible = backend_selector._eligible(None, None, None, _fmha_config())
+        eligible = backend_selector._eligible(
+            None, None, None, _fmha_config(), frozenset(_NAMES)
+        )
     assert set(eligible) == set(_NAMES)
 
 
 def test_eligible_none_fmha_config_keeps_all():
     with _patch_impls(_NAMES):
-        eligible = backend_selector._eligible(None, None, None, None)
+        eligible = backend_selector._eligible(None, None, None, None, frozenset(_NAMES))
     assert set(eligible) == set(_NAMES)
 
 
@@ -142,6 +152,19 @@ def test_eligible_empty_precision_gate_excludes_all():
     assert eligible == []
 
 
+def test_run_backend_selection_requires_explicit_precision_gate():
+    model, inputs, _, _ = _selection_fixture()
+    with unittest.TestCase().assertRaisesRegex(TypeError, "gate_passed"):
+        backend_selector.run_backend_selection(model, inputs)
+
+    with (
+        mock.patch.object(backend_selector.torch, "full") as allocate_control,
+        unittest.TestCase().assertRaisesRegex(TypeError, "explicit frozenset"),
+    ):
+        backend_selector.run_backend_selection(model, inputs, gate_passed=None)
+    allocate_control.assert_not_called()
+
+
 def test_eligible_support_false_is_normal_and_does_not_construct():
     support_scope = []
     unsupported = _make_fake_impl(
@@ -150,7 +173,13 @@ def test_eligible_support_false_is_normal_and_does_not_construct():
         support_observer=lambda: support_scope.append(in_benchmark_workspace_scope()),
     )
     with mock.patch(f"{_ATTN_FACTORY}.DECODE_MHA_IMPS", [unsupported]):
-        eligible = backend_selector._eligible(None, None, None, _fmha_config())
+        eligible = backend_selector._eligible(
+            None,
+            None,
+            None,
+            _fmha_config(),
+            frozenset({unsupported.__name__}),
+        )
 
     assert eligible == []
     assert unsupported.construction_count == 0
@@ -161,7 +190,13 @@ def test_eligible_support_false_is_normal_and_does_not_construct():
 def test_eligible_does_not_construct_only_to_check_cuda_graph_support():
     candidate = _make_fake_impl("PyFlashinferDecodeImpl")
     with mock.patch(f"{_ATTN_FACTORY}.DECODE_MHA_IMPS", [candidate]):
-        eligible = backend_selector._eligible(None, None, None, _fmha_config())
+        eligible = backend_selector._eligible(
+            None,
+            None,
+            None,
+            _fmha_config(),
+            frozenset({candidate.__name__}),
+        )
 
     assert eligible == ["PyFlashinferDecodeImpl"]
     assert candidate.construction_count == 0
@@ -333,7 +368,13 @@ def _assert_fatal_probe(
             )
 
         try:
-            backend_selector.run_backend_selection(model, inputs, warmup=0, iters=1)
+            backend_selector.run_backend_selection(
+                model,
+                inputs,
+                gate_passed=frozenset({impl_cls.__name__}),
+                warmup=0,
+                iters=1,
+            )
         except RuntimeError as error:
             assert str(error) == "fatal probe termination returned unexpectedly"
         else:
@@ -414,7 +455,12 @@ def test_post_probe_winner_code_write_exception_is_fatal():
 
 
 def _assert_selection_control_failure(
-    *, tp_rank, full_side_effect=None, broadcast_side_effect=None, code=None
+    *,
+    tp_rank,
+    full_side_effect=None,
+    broadcast_side_effect=None,
+    select_side_effect=None,
+    code=None,
 ):
     model, inputs, _, _ = _selection_fixture(tp_size=2, tp_rank=tp_rank)
     collective_module = types.ModuleType("collective_torch")
@@ -440,7 +486,12 @@ def _assert_selection_control_failure(
             )
         )
         stack.enter_context(
-            mock.patch.object(backend_selector, "_select_on_root", return_value=None)
+            mock.patch.object(
+                backend_selector,
+                "_select_on_root",
+                return_value=None,
+                side_effect=select_side_effect,
+            )
         )
         stack.enter_context(
             mock.patch.object(backend_selector, "_terminate_probe_worker", fatal)
@@ -455,7 +506,9 @@ def _assert_selection_control_failure(
         )
 
         try:
-            backend_selector.run_backend_selection(model, inputs)
+            backend_selector.run_backend_selection(
+                model, inputs, gate_passed=frozenset()
+            )
         except RuntimeError as error:
             assert str(error) == "fatal probe termination returned unexpectedly"
         else:
@@ -476,6 +529,14 @@ def test_control_tensor_allocation_failure_is_fatal_on_every_tp_rank():
             full_side_effect=RuntimeError("control tensor allocation failed"),
         )
         broadcast.assert_not_called()
+
+
+def test_root_preprobe_exception_is_fatal_before_tp_broadcast():
+    broadcast = _assert_selection_control_failure(
+        tp_rank=0,
+        select_side_effect=RuntimeError("sequence length readback failed"),
+    )
+    broadcast.assert_not_called()
 
 
 def test_tp_broadcast_failure_is_fatal():
@@ -527,7 +588,9 @@ def test_non_root_logs_received_plan_after_tp_broadcast():
                 },
             )
         )
-        choice = backend_selector.run_backend_selection(model, inputs)
+        choice = backend_selector.run_backend_selection(
+            model, inputs, gate_passed=frozenset()
+        )
 
     assert choice == "XQADecodeImpl"
     collective_module.broadcast.assert_called_once()
@@ -556,7 +619,7 @@ def _select_on_root_for_test(
         attn_configs,
         attn_inputs,
         parallelism_config,
-        None,
+        frozenset(),
         [8],
         selector,
         1,
@@ -748,7 +811,9 @@ def test_invalid_production_selector_config_fails_before_probe():
             backend_selector.DynamicDecodeFatalError,
             "fatal configuration termination returned unexpectedly",
         ):
-            backend_selector.run_backend_selection(model, inputs)
+            backend_selector.run_backend_selection(
+                model, inputs, gate_passed=frozenset()
+            )
 
     fatal.assert_called_once()
     assert fatal.call_args.args[0] == 1
@@ -954,9 +1019,16 @@ def test_invalid_nonnegative_broadcast_index_is_fatal_but_minus_one_is_miss():
                 with unittest.TestCase().assertRaises(
                     backend_selector.DynamicDecodeFatalError
                 ):
-                    backend_selector.run_backend_selection(model, inputs)
+                    backend_selector.run_backend_selection(
+                        model, inputs, gate_passed=frozenset()
+                    )
             else:
-                assert backend_selector.run_backend_selection(model, inputs) is None
+                assert (
+                    backend_selector.run_backend_selection(
+                        model, inputs, gate_passed=frozenset()
+                    )
+                    is None
+                )
 
         if should_fail:
             fatal.assert_called_once()

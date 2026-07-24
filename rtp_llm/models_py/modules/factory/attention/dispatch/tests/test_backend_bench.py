@@ -655,6 +655,7 @@ if __name__ == "__main__":
         test_backend_selector,
         test_decode_gate,
         test_selector,
+        test_tensor_recorder,
     )
 
     loader = unittest.TestLoader()
@@ -664,6 +665,7 @@ if __name__ == "__main__":
             loader.loadTestsFromModule(test_backend_selector),
             loader.loadTestsFromModule(test_decode_gate),
             loader.loadTestsFromModule(test_selector),
+            loader.loadTestsFromModule(test_tensor_recorder),
         ]
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

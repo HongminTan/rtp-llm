@@ -183,13 +183,16 @@ def _eligible(
     attn_configs,
     attn_inputs,
     parallelism_config,
-    fmha_config=None,
-    gate_passed=None,
+    fmha_config,
+    gate_passed: frozenset,
 ) -> List[str]:
     from rtp_llm.models_py.modules.factory.attention.attn_factory import (
         DECODE_MHA_IMPS,
         _is_fmha_impl_disabled,
     )
+
+    if not isinstance(gate_passed, frozenset):
+        raise TypeError("gate_passed must be an explicit frozenset")
 
     names: List[str] = []
     # Registry contract: a decode implementation must be registered for dynamic
@@ -206,7 +209,7 @@ def _eligible(
                 # ...), mirroring the fixed-priority get_fmha_impl path.
                 if _is_fmha_impl_disabled(name, fmha_config):
                     continue
-                if gate_passed is not None and name not in gate_passed:
+                if name not in gate_passed:
                     continue
                 probe_started = True
                 if not impl.support(attn_configs, attn_inputs):
@@ -227,7 +230,7 @@ def run_backend_selection(
     model,
     inputs,
     *,
-    gate_passed: Optional[frozenset] = None,
+    gate_passed: frozenset,
     selector: Optional[Selector] = None,
     warmup: int = 10,
     iters: int = 50,
@@ -236,10 +239,12 @@ def run_backend_selection(
     """Select the decode backend for a single capture bs, returning the winner class name (None = left empty, capture falls back to fixed priority).
 
     Only rank0 does the real-machine benchmark + selection; the winner registry
-    index is broadcast to Group.TP so every rank gets the same winner.
-    gate_passed=None leaves precision filtering dormant and uses support-only
-    eligibility until the warmup recorder supplies gate records.
+    index is broadcast to Group.TP so every rank gets the same winner. The precision
+    allowlist is mandatory so no caller can accidentally select by support alone.
     """
+    if not isinstance(gate_passed, frozenset):
+        raise TypeError("gate_passed must be an explicit frozenset")
+
     parallelism_config = model.parallelism_config
     attn_configs = model.config.getAttentionConfigs(
         parallelism_config.get_attn_tp_size()
@@ -297,13 +302,13 @@ def run_backend_selection(
                 "fatal probe termination returned unexpectedly"
             ) from e
         except Exception as e:
-            # Pre-probe orchestration errors remain normal plan misses. Root must
-            # still broadcast the empty code so all healthy ranks stay in lockstep.
-            logger.warning(
-                "[dispatcher] bs=%d root selection exception, no dynamic plan: %r",
-                bs,
-                e,
-            )
+            # Normal misses return None explicitly. Unknown orchestration errors
+            # include CUDA readback and KV-cache access failures; do not enter a
+            # TP collective or fixed-priority capture with an unknown device state.
+            _terminate_probe_worker(bs, "selection-control", e)
+            raise DynamicDecodeFatalError(
+                "fatal probe termination returned unexpectedly"
+            ) from e
 
     try:
         if tp_size > 1:

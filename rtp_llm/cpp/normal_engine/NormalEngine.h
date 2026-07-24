@@ -15,6 +15,7 @@
 #include "rtp_llm/cpp/cache/WarmUpResult.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
+#include "rtp_llm/cpp/normal_engine/accuracy/AccuracyChecker.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerBase.h"
 #include "rtp_llm/cpp/engine_base/system_prompt/SystemPrompt.h"
@@ -66,8 +67,9 @@ private:
     bool isMTPEagle() override;
     bool isEagle() override;
 
-    absl::Status runAccuracyCheckWithTemporaryCache(const EngineInitParams&            params,
-                                                    const std::optional<WarmUpResult>& warm_up_result);
+    absl::StatusOr<DecodeBackendGate>
+    runAccuracyCheckWithTemporaryCache(const EngineInitParams&            params,
+                                       const std::optional<WarmUpResult>& warm_up_result);
 
 private:
     autil::ThreadPtr                              loop_thread_;

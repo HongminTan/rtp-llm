@@ -75,14 +75,10 @@ void CudaGraphRunner::captureDecode() {
         // would produce wrong output shape (bs * hidden vs tokens * hidden).
         if (enable_dynamic_decode_backend_ && num_tokens_per_bs_ == 1 && py_select_method_
             && !py_select_method_.is_none()) {
-            try {
-                py_select_method_(graph_instances_[bs].mem_hold_.py_model_inputs_, true);
-            } catch (const std::exception& e) {
-                RTP_LLM_LOG_WARNING("dynamic decode backend selection failed for bs=%d: %s, "
-                                    "falling back to fixed priority",
-                                    bs,
-                                    e.what());
-            }
+            // A normal plan miss is returned explicitly by Python. Any escaped
+            // exception may represent a failed device probe or collective and
+            // must abort capture instead of continuing on an unknown GPU state.
+            py_select_method_(graph_instances_[bs].mem_hold_.py_model_inputs_, true);
         }
         graph_instances_[bs].mem_hold_.attn_pyobj_ =
             py_attn_pyobj_method_(graph_instances_[bs].mem_hold_.py_model_inputs_, true);

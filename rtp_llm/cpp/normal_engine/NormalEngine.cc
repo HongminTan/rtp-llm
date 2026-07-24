@@ -24,6 +24,7 @@
 
 #if USING_CUDA
 #include "c10/cuda/CUDACachingAllocator.h"
+#include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #endif
 
 #ifdef __linux__
@@ -46,6 +47,17 @@ void releaseHostMemoryCache() {
     RTP_LLM_LOG_DEBUG("malloc_trim not available on this platform");
 #endif
 }
+
+#if USING_CUDA
+bool worldStageSucceeded(bool local_ok, const ParallelismConfig& parallelism_config) {
+    if (parallelism_config.world_size <= 1) {
+        return local_ok;
+    }
+    auto flag = torch::tensor({local_ok ? 1 : 0}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    flag      = execAllReduce({flag, ReduceOp::Min, false, ParallelMode::DP_AND_TP}).buffer;
+    return flag.item<int32_t>() != 0;
+}
+#endif
 
 }  // anonymous namespace
 
@@ -87,6 +99,7 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
 
     std::optional<WarmUpResult> warm_up_result = std::nullopt;
 #if USING_CUDA
+    DecodeBackendGate decode_backend_gate = DecodeBackendGate::notRequested();
     if (runtime_config.warm_up && (!model_config_.mm_model_config.is_multimodal)
         && !ffn_disaggregate_config.enable_ffn_disaggregate) {
         // warm up
@@ -105,9 +118,16 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
         RTP_LLM_LOG_INFO("skip warm up.");
     }
 
-    if (auto accuracy_status = runAccuracyCheckWithTemporaryCache(params, warm_up_result); !accuracy_status.ok()) {
+    auto gate_or = runAccuracyCheckWithTemporaryCache(params, warm_up_result);
+    if (!gate_or.ok()) {
+        if (dynamic_decode_detail::shouldDeferCapture(
+                /*warm_up=*/false, params.hw_kernel_config, params.sp_config.type)) {
+            RTP_LLM_FAIL("dynamic decode precision gate failed: %s", gate_or.status().ToString().c_str());
+        }
         RTP_LLM_LOG_WARNING("accuracy check did not complete, continuing startup: %s",
-                            accuracy_status.ToString().c_str());
+                            gate_or.status().ToString().c_str());
+    } else {
+        decode_backend_gate = std::move(gate_or).value();
     }
 #else
     RTP_LLM_LOG_INFO("skip warm up and accuracy check on non-CUDA platform.");
@@ -126,6 +146,33 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
 
     if (dynamic_decode_detail::shouldDeferCapture(
             /*warm_up=*/false, params.hw_kernel_config, params.sp_config.type)) {
+#if USING_CUDA
+        if (params.py_model.is_none()) {
+            // C++ unit tests use MockModel with no Python object and only verify
+            // deferred capture lifecycle. Production Python-model engines must
+            // always take the explicit gate injection path below.
+            RTP_LLM_LOG_WARNING("dynamic decode gate injection skipped for C++ test model");
+        } else {
+            auto* normal_executor = dynamic_cast<NormalExecutor*>(executor_.get());
+            RTP_LLM_CHECK_WITH_INFO(normal_executor, "dynamic decode gate requires NormalExecutor");
+            auto* py_model = dynamic_cast<PyWrappedModel*>(normal_executor->getModel());
+            RTP_LLM_CHECK_WITH_INFO(py_model, "dynamic decode gate requires PyWrappedModel");
+            py_model->setDecodeBackendGate(decode_backend_gate.statusString(),
+                                           decode_backend_gate.passed,
+                                           decode_backend_gate.verified,
+                                           decode_backend_gate.reason,
+                                           decode_backend_gate.registry_fingerprint,
+                                           decode_backend_gate.manifest_fingerprint);
+            RTP_LLM_LOG_INFO("dynamic_decode_gate_transfer_complete status=%s passed=%zu verified=%zu reason=%s "
+                             "tp_rank=%ld dp_rank=%ld",
+                             decode_backend_gate.statusString(),
+                             decode_backend_gate.passed.size(),
+                             decode_backend_gate.verified.size(),
+                             decode_backend_gate.reason.c_str(),
+                             (long)parallelism_config.tp_rank,
+                             (long)parallelism_config.dp_rank);
+        }
+#endif
         executor_->triggerInitCapture();
     }
 
@@ -594,17 +641,45 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
     }
 }
 
-absl::Status NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&            params,
-                                                              const std::optional<WarmUpResult>& warm_up_result) {
-    if (!runtime_config.enable_accuracy_check) {
-        return absl::OkStatus();
+absl::StatusOr<DecodeBackendGate>
+NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&            params,
+                                                 const std::optional<WarmUpResult>& warm_up_result) {
+#if !USING_CUDA
+    (void)params;
+    (void)warm_up_result;
+    return DecodeBackendGate::notRequested("unsupported_platform");
+#else
+    const bool dynamic_gate_required = dynamic_decode_detail::shouldDeferCapture(
+        /*warm_up=*/false, params.hw_kernel_config, params.sp_config.type);
+    if (!runtime_config.enable_accuracy_check && !dynamic_gate_required) {
+        return DecodeBackendGate::notRequested();
+    }
+    if (params.py_model.is_none()) {
+        return DecodeBackendGate::unavailable("python_model_unavailable_test_mode");
     }
     if (propose_params_ || model_config_.mm_model_config.is_multimodal
         || ffn_disaggregate_config.enable_ffn_disaggregate || model_config_.attn_config.use_mla
         || parallelism_config.prefill_cp_config.is_enabled()
-        || parallelism_config.prefill_cp_config.is_prefill_enabled()) {
-        RTP_LLM_LOG_WARNING("skip accuracy check: unsupported model/config");
-        return absl::OkStatus();
+        || parallelism_config.prefill_cp_config.is_prefill_enabled() || parallelism_config.pp_size != 1) {
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE reason=unsupported_model_or_config");
+        return DecodeBackendGate::unavailable("unsupported_model_or_config");
+    }
+
+    const auto accuracy_scenarios = AccuracyChecker::scenariosForMoeConfig(params.moe_config);
+    if (accuracy_scenarios.empty()) {
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE "
+                            "reason=deepep_low_latency_token_budget_too_small budget=%d",
+                            params.moe_config.ll_num_max_token);
+        return DecodeBackendGate::unavailable("deepep_low_latency_token_budget_too_small");
+    }
+    const size_t max_accuracy_forward_tokens =
+        params.moe_config.use_deepep_moe && params.moe_config.use_deepep_low_latency ?
+            static_cast<size_t>(params.moe_config.ll_num_max_token) :
+            0;
+    if (params.moe_config.use_deepep_moe && params.moe_config.use_deepep_low_latency) {
+        RTP_LLM_LOG_INFO("accuracy check: DeepEP low-latency token budget=%d selected_scenarios=%zu",
+                         params.moe_config.ll_num_max_token,
+                         accuracy_scenarios.size());
     }
 
     auto old_cache_manager = resource_context_.cache_manager;
@@ -614,7 +689,7 @@ absl::Status NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitPa
     // hook executor with tmp kv_cache_manager
     KVCacheConfig tmp_kv_cache_config = kv_cache_config;
     tmp_kv_cache_config.test_block_num =
-        static_cast<int>(AccuracyChecker::computeTemporaryBlockNum(model_config_, kv_cache_config));
+        static_cast<int>(AccuracyChecker::computeTemporaryBlockNum(model_config_, kv_cache_config, accuracy_scenarios));
     tmp_kv_cache_config.reuse_cache                = false;
     tmp_kv_cache_config.enable_memory_cache        = false;
     tmp_kv_cache_config.enable_remote_cache        = false;
@@ -623,28 +698,90 @@ absl::Status NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitPa
         model_config_, parallelism_config, runtime_config, tmp_kv_cache_config, warm_up_result);
     if (config.groupNums() != 1) {
         RTP_LLM_LOG_WARNING("skip accuracy check: requires a single kv-cache group (got %d)", config.groupNums());
-        return absl::OkStatus();
+        return DecodeBackendGate::unavailable("multiple_kv_cache_groups");
     }
-    auto tmp_cache_manager =
-        make_shared<KVCacheManager>(config, false, nullptr, tmp_kv_cache_config, parallelism_config, runtime_config);
-    if (!tmp_cache_manager->init()) {
-        RTP_LLM_LOG_WARNING("skip accuracy check: temporary kv cache init failed (insufficient memory?)");
-        return absl::OkStatus();
+    std::shared_ptr<KVCacheManager> tmp_cache_manager;
+    bool                            local_pinned_preflight_ok = true;
+    try {
+        if (parallelism_config.world_size > 1) {
+            // KVCacheManager::allocateAndSync allocates this host tensor before
+            // its first WORLD collective. Preflight the same allocation and
+            // converge failures before any rank enters that constructor.
+            auto pinned_probe = torch::empty({parallelism_config.world_size}, torch::kInt32).pin_memory();
+            pinned_probe.zero_();
+        }
+    } catch (const std::exception& e) {
+        local_pinned_preflight_ok = false;
+        RTP_LLM_LOG_ERROR("accuracy check: temporary kv cache pinned preflight failed locally: %s", e.what());
+    } catch (...) {
+        local_pinned_preflight_ok = false;
+        RTP_LLM_LOG_ERROR("accuracy check: temporary kv cache pinned preflight failed locally: unknown");
+    }
+    cudaSyncAndCheck();
+    if (!worldStageSucceeded(local_pinned_preflight_ok, parallelism_config)) {
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE "
+                            "reason=temporary_kv_cache_pinned_preflight_failed");
+        return DecodeBackendGate::unavailable("temporary_kv_cache_pinned_preflight_failed");
+    }
+
+    bool local_cache_ok = true;
+    try {
+        tmp_cache_manager = make_shared<KVCacheManager>(
+            config, false, nullptr, tmp_kv_cache_config, parallelism_config, runtime_config);
+        local_cache_ok = tmp_cache_manager->init();
+    } catch (const std::exception& e) {
+        local_cache_ok = false;
+        RTP_LLM_LOG_ERROR("accuracy check: temporary kv cache init failed locally: %s", e.what());
+    } catch (...) {
+        local_cache_ok = false;
+        RTP_LLM_LOG_ERROR("accuracy check: temporary kv cache init failed locally: unknown");
+    }
+    // Ordinary per-rank setup failures must converge before any rank enters the
+    // recorder's WORLD collectives. A poisoned CUDA/NCCL context remains fatal:
+    // cudaSyncAndCheck/execAllReduce will throw and the worker supervisor stops the group.
+    cudaSyncAndCheck();
+    if (!worldStageSucceeded(local_cache_ok, parallelism_config)) {
+        tmp_cache_manager.reset();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE reason=temporary_kv_cache_init_failed");
+        return DecodeBackendGate::unavailable("temporary_kv_cache_init_failed");
     }
     RTP_LLM_LOG_INFO("accuracy check: temporary kv cache created with %d blocks", config.block_num);
-    absl::Status check_status;
-    try {
-        resource_context_.cache_manager = tmp_cache_manager;
-        resource_context_.role_type     = pd_sep_config.role_type;
-        kv_cache_group_num_             = config.groupNums();
-        initExecutor(params, propose_params_);
+    absl::StatusOr<DecodeBackendGate> check_result = absl::InternalError("accuracy check did not run");
 
-        AccuracyChecker checker(model_config_, runtime_config, parallelism_config);
-        check_status = checker.runAll(executor_.get(), resource_context_);
+    resource_context_.cache_manager = tmp_cache_manager;
+    resource_context_.role_type     = pd_sep_config.role_type;
+    kv_cache_group_num_             = config.groupNums();
+    bool local_executor_ok          = true;
+    try {
+        executor_.reset(new NormalExecutor(params,
+                                           tmp_cache_manager,
+                                           /*warm_up=*/false,
+                                           /*is_propose=*/false,
+                                           /*propose_model_index=*/0,
+                                           mla_ops_type_,
+                                           /*accuracy_check_executor=*/true));
     } catch (const std::exception& e) {
-        check_status = absl::InternalError(std::string("accuracy check threw: ") + e.what());
+        local_executor_ok = false;
+        RTP_LLM_LOG_ERROR("accuracy check: temporary executor init failed locally: %s", e.what());
     } catch (...) {
-        check_status = absl::InternalError("accuracy check threw: unknown");
+        local_executor_ok = false;
+        RTP_LLM_LOG_ERROR("accuracy check: temporary executor init failed locally: unknown");
+    }
+
+    cudaSyncAndCheck();
+    if (!worldStageSucceeded(local_executor_ok, parallelism_config)) {
+        check_result = absl::InternalError("temporary accuracy executor init failed on at least one rank");
+    } else {
+        try {
+            AccuracyChecker checker(model_config_, runtime_config, parallelism_config);
+            check_result =
+                checker.runAll(executor_.get(), resource_context_, accuracy_scenarios, max_accuracy_forward_tokens);
+        } catch (const std::exception& e) {
+            check_result = absl::InternalError(std::string("accuracy check threw: ") + e.what());
+        } catch (...) {
+            check_result = absl::InternalError("accuracy check threw: unknown");
+        }
     }
 
     // restore executor
@@ -655,9 +792,10 @@ absl::Status NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitPa
 
     // release memory
     tmp_cache_manager.reset();
-    cudaDeviceSynchronize();
+    cudaSyncAndCheck();
     c10::cuda::CUDACachingAllocator::emptyCache();
-    return check_status;
+    return check_result;
+#endif
 }
 
 }  // namespace rtp_llm

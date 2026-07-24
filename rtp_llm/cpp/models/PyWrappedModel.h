@@ -40,6 +40,18 @@ inline bool shouldDeferCapture(bool warm_up, const HWKernelConfig& hw_kernel_con
     return !warm_up && enabledForGraph(hw_kernel_config, /*is_prefill_cuda_graph_mode=*/false, sp_type);
 }
 
+inline HWKernelConfig
+executorHWKernelConfig(const HWKernelConfig& hw_kernel_config, bool warm_up, bool accuracy_check_executor) {
+    auto result = hw_kernel_config;
+    if (warm_up || accuracy_check_executor) {
+        // Disposable warm-up/checker executors share the Python model with the
+        // serving executor. Keep them on fixed eager capture so they cannot
+        // consume and freeze the serving precision gate before it is injected.
+        result.enable_dynamic_decode_backend = false;
+    }
+    return result;
+}
+
 }  // namespace dynamic_decode_detail
 
 class PyWrappedModel: public ModelBase {
@@ -66,6 +78,12 @@ public:
     void setAccuracyRecording(bool v) {
         accuracy_recording_ = v;
     }
+    void setDecodeBackendGate(const std::string&              status,
+                              const std::vector<std::string>& passed,
+                              const std::vector<std::string>& verified,
+                              const std::string&              reason,
+                              int64_t                         registry_fingerprint,
+                              int64_t                         manifest_fingerprint);
 
 private:
     std::optional<PyCacheStoreInputs> prepareWriteCacheParams(const GptModelInputs& inputs);

@@ -16,6 +16,7 @@ from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate import (
     GOLDEN,
     AttentionForwardRecord,
     AttentionLayerRecord,
+    _build_decode_gate_strict,
     _normalize_kv_dtype,
     build_decode_gate,
     gate_to_mask,
@@ -44,22 +45,20 @@ def _seed():
 
 
 def _layer(layer_idx, output, kv_len):
+    return AttentionLayerRecord(
+        layer_idx=layer_idx,
+        output=output,
+    )
+
+
+def _fwd(impl, layer_outputs, kv_len, scenario_base, phase="decode_0"):
+    lrs = {li: _layer(li, out, kv_len) for li, out in layer_outputs.items()}
     if isinstance(kv_len, torch.Tensor):
         sequence_lengths = kv_len.to(dtype=torch.int32)
     elif isinstance(kv_len, (list, tuple)):
         sequence_lengths = torch.tensor(kv_len, dtype=torch.int32)
     else:
         sequence_lengths = torch.tensor([kv_len], dtype=torch.int32)
-    return AttentionLayerRecord(
-        layer_idx=layer_idx,
-        output=output,
-        sequence_lengths=sequence_lengths,
-        is_prefill=False,
-    )
-
-
-def _fwd(impl, layer_outputs, kv_len, scenario_base, phase="decode_0"):
-    lrs = {li: _layer(li, out, kv_len) for li, out in layer_outputs.items()}
     return AttentionForwardRecord(
         impl_name=impl,
         phase=phase,
@@ -68,6 +67,12 @@ def _fwd(impl, layer_outputs, kv_len, scenario_base, phase="decode_0"):
         kv_head_num=KVH,
         head_dim=D,
         dtype=torch.bfloat16,
+        is_prefill=False,
+        sequence_lengths=sequence_lengths,
+        input_lengths=torch.ones_like(sequence_lengths),
+        prefix_lengths=torch.empty(0, dtype=torch.int32),
+        cu_seqlens=torch.zeros(sequence_lengths.numel() + 1, dtype=torch.int32),
+        active_sequence_ids=tuple(range(sequence_lengths.numel())),
     )
 
 
@@ -121,6 +126,20 @@ def _records_one_scenario(golden_layers, kv_len, scenario, cand_map):
     return {scenario: bucket}
 
 
+def _manifest(records, qualifying_by_scenario=None):
+    qualifying_by_scenario = qualifying_by_scenario or {}
+    manifest = {}
+    for scenario, bucket in records.items():
+        candidates = tuple(name for name in bucket if name != GOLDEN)
+        for golden in bucket[GOLDEN]:
+            manifest[(scenario, golden.phase)] = {
+                "active_sequence_ids": golden.active_sequence_ids,
+                "expected_candidates": candidates,
+                "gate_qualifying": qualifying_by_scenario.get(scenario, True),
+            }
+    return manifest
+
+
 def test_clean_candidate_passes():
     _seed()
     gl = _golden_layers()
@@ -139,6 +158,25 @@ def test_identical_candidate_passes():
     recs = _records_one_scenario(gl, 512, "p0_c512_d1", {"XQAImpl": cand})
     res = build_decode_gate(recs, "BASE")
     assert res.passed == frozenset({"XQAImpl"})
+
+
+def test_decode_fork_input_length_may_differ_from_golden():
+    _seed()
+    gl = _golden_layers()
+    golden = _fwd(GOLDEN, gl, 514, "scenario", phase="decode_0")
+    candidate = _fwd(
+        "XQAImpl",
+        {layer_idx: output.clone() for layer_idx, output in gl.items()},
+        514,
+        "scenario",
+        phase="decode_0",
+    )
+    golden.input_lengths = torch.tensor([512], dtype=torch.int32)
+    candidate.input_lengths = torch.tensor([514], dtype=torch.int32)
+    records = {"scenario": {GOLDEN: [golden], "XQAImpl": [candidate]}}
+    result = build_decode_gate(records, "BASE")
+    assert result.verified == frozenset({"XQAImpl"})
+    assert result.passed == frozenset({"XQAImpl"})
 
 
 def test_scale_error_fails():
@@ -270,7 +308,7 @@ def test_missing_decode_step_in_candidate_fails():
     }
     res = build_decode_gate(recs, "BASE")
     assert res.passed == frozenset()
-    assert "X" in res.verified
+    assert "X" not in res.verified
     missing = [v for v in res.failures()["X"] if v.phase == "decode_1"]
     assert missing
     assert all("missing decode phase" in v.fail_reason for v in missing)
@@ -341,6 +379,150 @@ def test_missing_layer_in_candidate_fails():
     assert res.passed == frozenset()
     reasons = [v.fail_reason for v in res.failures()["X"] if v.layer_idx == 3]
     assert reasons and "missing layer" in reasons[0]
+    assert "X" not in res.verified
+
+
+def test_extra_layer_and_layer_idx_mismatch_are_not_verified():
+    _seed()
+    gl = _golden_layers()
+    cand = _clean_candidate(gl, 512, "p0_c512_d1", "X")
+    cand.layer_records[NLAYERS] = _layer(
+        NLAYERS, cand.layer_records[0].output.clone(), 512
+    )
+    assert (
+        "X"
+        not in build_decode_gate(
+            _records_one_scenario(gl, 512, "p0_c512_d1", {"X": cand}), "BASE"
+        ).verified
+    )
+
+    cand = _clean_candidate(gl, 512, "p0_c512_d1", "X")
+    cand.layer_records[2].layer_idx = 99
+    assert (
+        "X"
+        not in build_decode_gate(
+            _records_one_scenario(gl, 512, "p0_c512_d1", {"X": cand}), "BASE"
+        ).verified
+    )
+
+
+def test_shape_dtype_and_nonfinite_mismatch_fail_closed():
+    _seed()
+    gl = _golden_layers()
+    mutations = [
+        lambda t: t[:, :-1],
+        lambda t: t.float(),
+        lambda t: t.clone().fill_(float("nan")),
+        lambda t: t.clone().fill_(float("inf")),
+    ]
+    for mutate in mutations:
+        cand = _clean_candidate(gl, 512, "p0_c512_d1", "X")
+        cand.layer_records[1].output = mutate(cand.layer_records[1].output)
+        res = build_decode_gate(
+            _records_one_scenario(gl, 512, "p0_c512_d1", {"X": cand}), "BASE"
+        )
+        assert res.passed == frozenset()
+        assert "X" not in res.verified
+
+
+def _assert_absolute_schema_rejected(records, reason):
+    result, error = _build_decode_gate_strict(records, "BASE")
+    assert result.passed == frozenset()
+    assert result.verified == frozenset()
+    assert error is not None and reason in error
+
+
+def test_identically_wrong_output_width_is_rejected():
+    _seed()
+    scenario = "p0_c512_d1"
+    gl = _golden_layers()
+    cand = _clean_candidate(gl, 512, scenario, "X")
+    records = _records_one_scenario(gl, 512, scenario, {"X": cand})
+    for impl in (GOLDEN, "X"):
+        for layer in records[scenario][impl][0].layer_records.values():
+            layer.output = layer.output[:, :-1]
+    _assert_absolute_schema_rejected(records, "output width differs from head metadata")
+
+
+def test_identically_wrong_output_row_count_is_rejected():
+    _seed()
+    scenario = "b2__s0_p512c0d1__s1_p256c0d1"
+    gl = _golden_layers(batch_size=2)
+    cand = _clean_candidate(gl, [513, 257], scenario, "X")
+    records = _records_one_scenario(gl, [513, 257], scenario, {"X": cand})
+    for impl in (GOLDEN, "X"):
+        for layer in records[scenario][impl][0].layer_records.values():
+            layer.output = layer.output[:1]
+    _assert_absolute_schema_rejected(
+        records, "output row count differs from active batch size"
+    )
+
+
+def test_zero_head_metadata_is_rejected():
+    _seed()
+    scenario = "p0_c512_d1"
+    for field_name in ("head_num", "kv_head_num", "head_dim"):
+        gl = _golden_layers()
+        cand = _clean_candidate(gl, 512, scenario, "X")
+        records = _records_one_scenario(gl, 512, scenario, {"X": cand})
+        for impl in (GOLDEN, "X"):
+            setattr(records[scenario][impl][0], field_name, 0)
+        _assert_absolute_schema_rejected(records, "head metadata must be positive")
+
+
+def test_decode_length_tensor_layout_is_strict():
+    _seed()
+    scenario = "b2__s0_p512c0d1__s1_p256c0d1"
+    malformed = {
+        "sequence_lengths": torch.tensor([513], dtype=torch.int32),
+        "input_lengths": torch.tensor([1], dtype=torch.int32),
+        "prefix_lengths": torch.tensor([0], dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, 1], dtype=torch.int32),
+    }
+    expected_reasons = {
+        "sequence_lengths": "sequence_lengths count differs",
+        "input_lengths": "input_lengths count differs",
+        "prefix_lengths": "prefix_lengths must be empty for decode",
+        "cu_seqlens": "cu_seqlens count differs",
+    }
+    for field_name, value in malformed.items():
+        gl = _golden_layers(batch_size=2)
+        cand = _clean_candidate(gl, [513, 257], scenario, "X")
+        records = _records_one_scenario(gl, [513, 257], scenario, {"X": cand})
+        for impl in (GOLDEN, "X"):
+            setattr(records[scenario][impl][0], field_name, value.clone())
+        _assert_absolute_schema_rejected(records, expected_reasons[field_name])
+
+
+def test_active_sequence_ids_mismatch_is_not_verified():
+    _seed()
+    gl = _golden_layers(batch_size=2)
+    cand = _clean_candidate(gl, [513, 257], "scenario", "X")
+    cand.active_sequence_ids = (1, 0)
+    res = build_decode_gate(
+        _records_one_scenario(gl, [513, 257], "scenario", {"X": cand}), "BASE"
+    )
+    assert res.passed == frozenset()
+    assert "X" not in res.verified
+
+
+def test_duplicate_candidate_phase_and_decode_gap_are_not_verified():
+    _seed()
+    gl = _golden_layers()
+    cand = _clean_candidate(gl, 512, "scenario", "X")
+    recs = _records_one_scenario(gl, 512, "scenario", {"X": cand})
+    recs["scenario"]["X"].append(cand)
+    assert "X" not in build_decode_gate(recs, "BASE").verified
+
+    recs = {
+        "scenario": {
+            GOLDEN: [_fwd(GOLDEN, gl, 512, "scenario", phase="decode_1")],
+            "X": [_fwd("X", gl, 512, "scenario", phase="decode_1")],
+        }
+    }
+    res = build_decode_gate(recs, "BASE")
+    assert res.passed == frozenset()
+    assert res.verified == frozenset()
 
 
 def test_fp8_dtype_selects_loose_threshold():
@@ -355,6 +537,139 @@ def test_fp8_dtype_selects_loose_threshold():
 
     assert build_decode_gate(fresh_recs(), "BASE").passed == frozenset()
     assert build_decode_gate(fresh_recs(), "FP8").passed == frozenset({"X"})
+
+
+def test_failed_verdict_reports_absolute_scale_diagnostics():
+    _seed()
+    gl = _golden_layers()
+    bad = {li: _scale(g, 2.0) for li, g in gl.items()}
+    records = _records_one_scenario(
+        gl, 512, "p0_c512_d1", {"X": _fwd("X", bad, 512, "p0_c512_d1")}
+    )
+
+    failures = build_decode_gate(records, "FP8").failures()["X"]
+    assert failures
+    for field in (
+        "rms_abs=",
+        "ref_rms=",
+        "snr=",
+        "regime=",
+        "pass_abs=",
+    ):
+        assert all(field in verdict.fail_reason for verdict in failures)
+
+
+def test_fp8_allows_one_bounded_qualifying_soft_outlier():
+    _seed()
+    scenario = "qualifying"
+    gl = _golden_layers()
+    layers = {li: output.clone() for li, output in gl.items()}
+    layers[0] = _scale(gl[0], 1.23)
+    records = _records_one_scenario(
+        gl, 512, scenario, {"X": _fwd("X", layers, 512, scenario)}
+    )
+
+    result, error = _build_decode_gate_strict(
+        records, "FP8", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.verified == frozenset({"X"})
+    assert result.passed == frozenset({"X"})
+    outliers = result.failures()["X"]
+    assert len(outliers) == 1
+    assert outliers[0].gate_qualifying
+    assert outliers[0].soft_outlier
+    assert 0.20 < outliers[0].nrmse <= 0.30
+
+
+def test_fp8_rejects_second_soft_outlier_and_single_hard_failure():
+    _seed()
+    scenario = "qualifying"
+    gl = _golden_layers()
+    two_soft = {li: output.clone() for li, output in gl.items()}
+    two_soft[0] = _scale(gl[0], 1.23)
+    two_soft[1] = _scale(gl[1], 1.23)
+    records = _records_one_scenario(
+        gl, 512, scenario, {"X": _fwd("X", two_soft, 512, scenario)}
+    )
+    result, error = _build_decode_gate_strict(
+        records, "FP8", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.passed == frozenset()
+    assert sum(verdict.soft_outlier for verdict in result.failures()["X"]) == 2
+
+    hard = {li: output.clone() for li, output in gl.items()}
+    hard[0] = _scale(gl[0], 1.40)
+    records = _records_one_scenario(
+        gl, 512, scenario, {"X": _fwd("X", hard, 512, scenario)}
+    )
+    result, error = _build_decode_gate_strict(
+        records, "FP8", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.passed == frozenset()
+    hard_failure = result.failures()["X"][0]
+    assert hard_failure.nrmse > 0.30
+    assert not hard_failure.soft_outlier
+
+    for corrupt in (
+        lambda output: torch.zeros_like(output),
+        lambda output: -output,
+        _page_corrupt,
+        lambda output: output.clone().fill_(float("nan")),
+        lambda output: output.clone().fill_(float("inf")),
+    ):
+        corrupted = {li: output.clone() for li, output in gl.items()}
+        corrupted[0] = corrupt(gl[0])
+        records = _records_one_scenario(
+            gl,
+            512,
+            scenario,
+            {"X": _fwd("X", corrupted, 512, scenario)},
+        )
+        result, error = _build_decode_gate_strict(
+            records, "FP8", manifest=_manifest(records)
+        )
+        assert error is None
+        assert result.passed == frozenset()
+        assert not result.failures()["X"][0].soft_outlier
+
+
+def test_nonqualifying_failure_is_diagnostic_only():
+    _seed()
+    qualifying_scenario = "qualifying"
+    diagnostic_scenario = "diagnostic"
+    gl_good = _golden_layers()
+    gl_bad = _golden_layers()
+    good = _fwd(
+        "X",
+        {li: output.clone() for li, output in gl_good.items()},
+        512,
+        qualifying_scenario,
+    )
+    bad = _fwd(
+        "X",
+        {li: _scale(output, 1.40) for li, output in gl_bad.items()},
+        1024,
+        diagnostic_scenario,
+    )
+    records = {}
+    records.update(
+        _records_one_scenario(gl_good, 512, qualifying_scenario, {"X": good})
+    )
+    records.update(_records_one_scenario(gl_bad, 1024, diagnostic_scenario, {"X": bad}))
+    result, error = _build_decode_gate_strict(
+        records,
+        "FP8",
+        manifest=_manifest(records, {diagnostic_scenario: False}),
+    )
+    assert error is None
+    assert result.verified == frozenset({"X"})
+    assert result.passed == frozenset({"X"})
+    diagnostics = result.failures()["X"]
+    assert diagnostics
+    assert all(not verdict.gate_qualifying for verdict in diagnostics)
 
 
 def test_multiple_candidates_partition():

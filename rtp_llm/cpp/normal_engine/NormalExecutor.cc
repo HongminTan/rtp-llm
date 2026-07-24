@@ -28,7 +28,8 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
                                bool                                   warm_up,
                                bool                                   is_propose,
                                int                                    propose_model_index,
-                               MlaOpsType                             mla_ops_type):
+                               MlaOpsType                             mla_ops_type,
+                               bool                                   accuracy_check_executor):
     Executor(),
     cache_manager_(cache_manager),
     warm_up_(warm_up),
@@ -82,6 +83,12 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
                                                        cache_manager->cacheConfig().kernel_seq_size_per_block :
                                                        params.model_config_.attn_config.kernel_tokens_per_block;
 
+    auto model_hw_kernel_config =
+        dynamic_decode_detail::executorHWKernelConfig(params.hw_kernel_config, warm_up_, accuracy_check_executor);
+    if ((warm_up_ || accuracy_check_executor) && params.hw_kernel_config.enable_dynamic_decode_backend) {
+        RTP_LLM_LOG_INFO("non-serving executor uses fixed backend eager CUDA graph capture");
+    }
+
     GptModelInitParams model_init_params(
         {params.gpt_weights,
          genModelDescription(params.model_config_, params.parallelism_config, params.eplb_config, params.moe_config),
@@ -91,7 +98,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
              std::nullopt,
          params.model_id,
          params.parallelism_config,
-         params.hw_kernel_config,
+         model_hw_kernel_config,
          params.profiling_debug_logging_config,
          params.runtime_config,
          params.concurrency_config,
@@ -111,7 +118,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
     if (!params.py_model.is_none()) {
         RTP_LLM_LOG_INFO("init executor with python model");
         const bool defer_capture =
-            dynamic_decode_detail::shouldDeferCapture(warm_up_, params.hw_kernel_config, params.sp_config.type);
+            dynamic_decode_detail::shouldDeferCapture(warm_up_, model_hw_kernel_config, params.sp_config.type);
         model_.reset(new PyWrappedModel(model_init_params,
                                         params.py_model,
                                         /*is_prefill_cuda_graph_mode=*/false,

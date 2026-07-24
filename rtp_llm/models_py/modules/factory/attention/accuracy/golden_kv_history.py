@@ -86,6 +86,15 @@ class GoldenKVHistoryView:
     def get_prefix(self, batch_idx: int, layer_idx: int) -> HistoryValue:
         return self._history._get(self._sequence_id(batch_idx), layer_idx)
 
+    def append_prefill(
+        self,
+        batch_idx: int,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        self._history._append(self._sequence_id(batch_idx), layer_idx, k, v)
+
     def get_decode_history(self, batch_idx: int, layer_idx: int) -> HistoryValue:
         return self._history._get(self._sequence_id(batch_idx), layer_idx)
 
