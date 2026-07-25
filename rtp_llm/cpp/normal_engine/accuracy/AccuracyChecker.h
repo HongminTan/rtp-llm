@@ -5,7 +5,6 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -36,41 +35,11 @@ struct AccuracyScenario {
     uint64_t                 prompt_seed     = 0;
 };
 
-enum class DecodeBackendGateStatus {
-    NOT_REQUESTED,
-    READY,
-    UNAVAILABLE,
-};
-
-struct DecodeBackendGate {
-    DecodeBackendGateStatus  status = DecodeBackendGateStatus::NOT_REQUESTED;
-    std::string              reason;
-    int64_t                  protocol_version     = 0;
-    int64_t                  registry_fingerprint = 0;
-    int64_t                  manifest_fingerprint = 0;
-    std::vector<std::string> applicable;
-    std::vector<std::string> verified;
-    std::vector<std::string> passed;
-
-    static DecodeBackendGate notRequested(std::string reason = "not_requested") {
-        return {DecodeBackendGateStatus::NOT_REQUESTED, std::move(reason)};
-    }
-
-    static DecodeBackendGate unavailable(std::string reason) {
-        return {DecodeBackendGateStatus::UNAVAILABLE, std::move(reason)};
-    }
-
-    const char* statusString() const {
-        switch (status) {
-            case DecodeBackendGateStatus::NOT_REQUESTED:
-                return "NOT_REQUESTED";
-            case DecodeBackendGateStatus::READY:
-                return "READY";
-            case DecodeBackendGateStatus::UNAVAILABLE:
-                return "UNAVAILABLE";
-        }
-        return "UNAVAILABLE";
-    }
+// Globally aggregated per-domain allowlists. decode_passed is always produced;
+// prefill_passed is set only when the prefill gate finalize was requested.
+struct AttentionGateResult {
+    std::vector<std::string>                decode_passed;
+    std::optional<std::vector<std::string>> prefill_passed;
 };
 
 class AccuracyChecker {
@@ -86,14 +55,12 @@ public:
     static torch::Tensor
     makeDeterministicPrompt(size_t len, int64_t token_size, uint64_t prompt_seed, size_t sequence_id);
 
-    static bool
-    acceptsWorldBackend(int32_t passed_sum, int32_t verified_sum, int32_t soft_outlier_sum, int32_t world_size);
-
     // Entry point for accuracy checks
-    absl::StatusOr<DecodeBackendGate> runAll(Executor*                            executor,
-                                             ResourceContext&                     resource_context,
-                                             const std::vector<AccuracyScenario>& scenarios = defaultScenarios(),
-                                             size_t                               max_forward_tokens = 0);
+    absl::StatusOr<AttentionGateResult> runAll(Executor*                            executor,
+                                               ResourceContext&                     resource_context,
+                                               const std::vector<AccuracyScenario>& scenarios = defaultScenarios(),
+                                               size_t                               max_forward_tokens    = 0,
+                                               bool                                 finalize_prefill_gate = false);
 
     // Sizes the temporary KV pool for peak block usage across all scenarios, plus a safety margin
     // The scenarios must match those passed to runAll()
@@ -115,11 +82,10 @@ private:
                                         std::vector<GenerateStreamPtr>&   golden_streams,
                                         std::vector<StreamReleaseGuard>&  golden_guards);
 
-    bool         worldAll(bool local_flag);
-    absl::Status abortIfFailed(bool step_flag, const std::string& where);
-    absl::Status validateWorldMetadata(const std::vector<int64_t>& local_metadata, const std::string& where);
+    bool                                 worldAll(bool local_flag);
+    absl::Status                         abortIfFailed(bool step_flag, const std::string& where);
     absl::StatusOr<std::vector<int32_t>> sumWorldMask(const std::vector<int32_t>& local_mask, const std::string& where);
-    absl::StatusOr<DecodeBackendGate>    finalizeDecodeGate(const py::object& recorder);
+    absl::StatusOr<std::vector<std::string>> finalizeGate(const py::object& recorder, const std::string& domain);
     bool runCheck(const AccuracyScenario& scenario, const std::string& scenario_base_name);
     absl::StatusOr<std::vector<std::string>> listCandidates(const py::object& recorder, const std::string& phase);
     absl::Status                             forward(const py::object&                     recorder,

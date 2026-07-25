@@ -32,6 +32,10 @@ THRESHOLDS = {
 FP8_QUALITY_THRESHOLDS = {
     "cos_sim": 0.998,
     "nrmse": 0.20,
+    # Observational reference only, never gates: cross-precision mean ULP
+    # tracks the platform quantization scheme and is logged for drift
+    # monitoring.
+    "mean_ulp": 25.0,
 }
 
 # SNR gating: when signal is weak (small output norm), relative metrics are unreliable;
@@ -242,10 +246,36 @@ class PrecisionResult:
     fail_reason: str
 
 
+def _snr_gated_overall(
+    t1: bool,
+    t2: bool,
+    t3: bool,
+    diagnostics: dict,
+) -> bool:
+    """Combine the metric verdicts under the SNR regime of the layer.
+
+    cos (t1) is the only SNR-gated metric: at snr below cos_t/sqrt(1-cos_t^2)
+    the cosine of a perfect kernel cannot reach cos_t (cos ~ snr/sqrt(1+snr^2)),
+    so LOW_SNR layers substitute the calibrated absolute-error gate for cos.
+    nrmse (t2) stays hard in both regimes because it is the scale-invariant
+    fence: the absolute gate alone (max(abs_floor, rel_ratio*ref_rms)) passes
+    any pure scale error below rel_ratio, and nrmse<=t bounds snr>=1/t which
+    every real recorder artifact (H20 + SM100) clears with margin.  t3 is the
+    mean_ulp gate of the same-precision BF16 comparison; the cross-precision
+    FP8 path passes True because its mean ULP is observational only.
+    """
+    if diagnostics["snr_regime"] == "LOW_SNR":
+        return diagnostics["pass_abs"] and t2 and t3
+    return t1 and t2 and t3
+
+
 def evaluate_precision(a: torch.Tensor, b: torch.Tensor, kv_dtype_str: str) -> dict:
-    """BF16 cross-backend judgment: three tiers + SNR-gated cos.
+    """BF16 cross-backend judgment: nrmse/mean_ulp hard, cos SNR-gated.
 
     Used for the BASE (bf16 KV cache) gate case: candidate(bf16) vs golden(bf16).
+    For BF16 the SNR gating is provably behavior-neutral: nrmse<=0.010 forces
+    snr>=100, above the 0.9999-cos LOW_SNR boundary (~70.7), so no BF16 layer
+    can pass while sitting in the LOW_SNR regime.
     """
     cos = cosine_similarity_flat(a, b)
     nrmse = normalized_rmse(a, b)
@@ -257,7 +287,7 @@ def evaluate_precision(a: torch.Tensor, b: torch.Tensor, kv_dtype_str: str) -> d
     mulp_valid = not math.isnan(m_ulp)
 
     gate_cfg = SNR_GATE_CONFIG[f"cross_backend_{kv_dtype_str}"]
-    gate = snr_gated_judgment(
+    diagnostics = snr_gated_judgment(
         abs_m["rms_abs_err"],
         abs_m["ref_rms"],
         cos,
@@ -266,12 +296,21 @@ def evaluate_precision(a: torch.Tensor, b: torch.Tensor, kv_dtype_str: str) -> d
         gate_cfg["rel_ratio"],
     )
 
-    t1 = gate["pass_cos"]
+    cos_valid = not math.isnan(cos)
+    t1 = cos_valid and cos >= thresh["cos_sim"]
     t2 = nrmse_valid and nrmse <= thresh["nrmse"]
     t3 = mulp_valid and m_ulp <= thresh["mean_ulp"]
-    overall = gate["overall_pass"] and t2 and t3
+    low_snr = diagnostics["snr_regime"] == "LOW_SNR"
+    overall = _snr_gated_overall(t1, t2, t3, diagnostics)
 
-    reasons = list(gate["fail_reasons"])
+    reasons = []
+    if low_snr and not diagnostics["pass_abs"]:
+        reasons.append(
+            f"rms_abs_err={abs_m['rms_abs_err']:.6e}"
+            f">=abs_threshold({diagnostics['abs_threshold']:.6e}) in LOW_SNR"
+        )
+    if not low_snr and not t1:
+        reasons.append(f"cos_sim={cos:.6f}<{thresh['cos_sim']}")
     if not t2:
         reasons.append(f"nrmse={nrmse:.6f}>{thresh['nrmse']}")
     if not t3:
@@ -284,34 +323,46 @@ def evaluate_precision(a: torch.Tensor, b: torch.Tensor, kv_dtype_str: str) -> d
         "max_ulp": mx_ulp,
         "rms_abs_err": abs_m["rms_abs_err"],
         "ref_rms": abs_m["ref_rms"],
-        "snr": gate["snr"],
-        "snr_regime": gate["snr_regime"],
+        "snr": diagnostics["snr"],
+        "snr_regime": diagnostics["snr_regime"],
         "tier1_pass": t1,
         "tier2_pass": t2,
         "tier3_pass": t3,
-        "pass_abs": gate["pass_abs"],
+        "pass_abs": diagnostics["pass_abs"],
+        "cos_threshold": thresh["cos_sim"],
+        "nrmse_threshold": thresh["nrmse"],
+        "mean_ulp_threshold": thresh["mean_ulp"],
         "overall_pass": overall,
         "fail_reason": "; ".join(reasons) if reasons else "",
     }
 
 
 def evaluate_fp8_quality(a: torch.Tensor, b: torch.Tensor) -> dict:
-    """FP8 quality judgment: cos (SNR-gated) + nrmse only; mean_ulp NOT used.
+    """FP8 quality judgment: cos SNR-gated + nrmse hard; mean_ulp observational.
 
     Used for the FP8 gate case: candidate(reads FP8 cache) vs golden(ideal
     FP32→bf16).  The deviation bundles FP8 quantization loss + kernel error;
-    this is a coarse filter.  Same logic as bench's run_fp8_vs_bf16_baseline.
+    this is a coarse filter.  FP8 quantization noise puts real layers in the
+    5<=snr<15.8 window (nrmse gate lower bound vs 0.998-cos boundary); every
+    cos shortfall observed there in the SM100/H20 recorder artifacts carried
+    a clean absolute error, so LOW_SNR layers judge abs+nrmse instead of the
+    mathematically unreachable cos threshold.  mean_ulp is recorded against
+    its artifact bound but never gates cross-precision.
     """
     cos = cosine_similarity_flat(a, b)
     nrmse_val = normalized_rmse(a, b)
     m_ulp, mx_ulp = mean_relative_ulp(a, b)
     abs_m = absolute_error_metrics(a, b)
 
+    cos_valid = not math.isnan(cos)
     nrmse_valid = not math.isnan(nrmse_val)
+    mulp_valid = not math.isnan(m_ulp)
+    cos_pass = cos_valid and cos >= FP8_QUALITY_THRESHOLDS["cos_sim"]
     nrmse_pass = nrmse_valid and nrmse_val <= FP8_QUALITY_THRESHOLDS["nrmse"]
+    mulp_pass = mulp_valid and m_ulp <= FP8_QUALITY_THRESHOLDS["mean_ulp"]
 
     gate_cfg = SNR_GATE_CONFIG["fp8_quality"]
-    gate = snr_gated_judgment(
+    diagnostics = snr_gated_judgment(
         abs_m["rms_abs_err"],
         abs_m["ref_rms"],
         cos,
@@ -319,25 +370,36 @@ def evaluate_fp8_quality(a: torch.Tensor, b: torch.Tensor) -> dict:
         gate_cfg["abs_floor"],
         gate_cfg["rel_ratio"],
     )
-    overall = gate["overall_pass"] and nrmse_pass
+    low_snr = diagnostics["snr_regime"] == "LOW_SNR"
+    overall = _snr_gated_overall(cos_pass, nrmse_pass, True, diagnostics)
 
-    reasons = list(gate["fail_reasons"])
+    reasons = []
+    if low_snr and not diagnostics["pass_abs"]:
+        reasons.append(
+            f"rms_abs_err={abs_m['rms_abs_err']:.6e}"
+            f">=abs_threshold({diagnostics['abs_threshold']:.6e}) in LOW_SNR"
+        )
+    if not low_snr and not cos_pass:
+        reasons.append(f"cos_sim={cos:.6f}<{FP8_QUALITY_THRESHOLDS['cos_sim']}")
     if not nrmse_pass:
         reasons.append(f"nrmse={nrmse_val:.6f}>{FP8_QUALITY_THRESHOLDS['nrmse']}")
 
     return {
         "cos_sim": cos,
         "nrmse": nrmse_val,
-        "mean_ulp": m_ulp if not math.isnan(m_ulp) else 0.0,
+        "mean_ulp": m_ulp,
         "max_ulp": mx_ulp,
         "rms_abs_err": abs_m["rms_abs_err"],
         "ref_rms": abs_m["ref_rms"],
-        "snr": gate["snr"],
-        "snr_regime": gate["snr_regime"],
-        "tier1_pass": gate["pass_cos"],
+        "snr": diagnostics["snr"],
+        "snr_regime": diagnostics["snr_regime"],
+        "tier1_pass": cos_pass,
         "tier2_pass": nrmse_pass,
-        "tier3_pass": True,  # mean_ulp not used cross-precision
-        "pass_abs": gate["pass_abs"],
+        "tier3_pass": mulp_pass,
+        "pass_abs": diagnostics["pass_abs"],
+        "cos_threshold": FP8_QUALITY_THRESHOLDS["cos_sim"],
+        "nrmse_threshold": FP8_QUALITY_THRESHOLDS["nrmse"],
+        "mean_ulp_threshold": FP8_QUALITY_THRESHOLDS["mean_ulp"],
         "overall_pass": overall,
         "fail_reason": "; ".join(reasons) if reasons else "",
     }

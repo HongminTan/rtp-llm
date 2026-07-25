@@ -172,16 +172,6 @@ TEST_F(NormalEngineTest, testDeepEPLowLatencyAccuracyScenariosPreserveDecodeCove
     EXPECT_TRUE(AccuracyChecker::scenariosForMoeConfig(moe_config).empty());
 }
 
-TEST_F(NormalEngineTest, testDecodeGateSoftOutlierBudgetIsWorldScoped) {
-    EXPECT_TRUE(AccuracyChecker::acceptsWorldBackend(1, 1, 1, 1));
-    EXPECT_TRUE(AccuracyChecker::acceptsWorldBackend(2, 2, 1, 2));
-    EXPECT_FALSE(AccuracyChecker::acceptsWorldBackend(2, 2, 2, 2));
-    EXPECT_FALSE(AccuracyChecker::acceptsWorldBackend(1, 2, 1, 2));
-    EXPECT_FALSE(AccuracyChecker::acceptsWorldBackend(2, 1, 1, 2));
-    EXPECT_FALSE(AccuracyChecker::acceptsWorldBackend(2, 2, -1, 2));
-    EXPECT_FALSE(AccuracyChecker::acceptsWorldBackend(0, 0, 0, 0));
-}
-
 TEST_F(NormalEngineTest, testNonServingExecutorsKeepFixedEagerCaptureLifecycle) {
     HWKernelConfig hw_kernel_config;
     hw_kernel_config.enable_cuda_graph             = true;

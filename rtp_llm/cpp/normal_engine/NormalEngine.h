@@ -4,7 +4,9 @@
 #include <chrono>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <thread>
+#include <vector>
 #include "absl/status/status.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/engine_base/TorchProfiler.h"
@@ -67,7 +69,7 @@ private:
     bool isMTPEagle() override;
     bool isEagle() override;
 
-    absl::StatusOr<DecodeBackendGate>
+    absl::StatusOr<std::vector<std::string>>
     runAccuracyCheckWithTemporaryCache(const EngineInitParams&            params,
                                        const std::optional<WarmUpResult>& warm_up_result);
 

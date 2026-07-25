@@ -7,6 +7,7 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <pybind11/stl.h>
@@ -229,14 +230,6 @@ torch::Tensor AccuracyChecker::makeCheckPrompt(size_t len, uint64_t prompt_seed,
     return makeDeterministicPrompt(len, token_size, prompt_seed, sequence_id);
 }
 
-bool AccuracyChecker::acceptsWorldBackend(int32_t passed_sum,
-                                          int32_t verified_sum,
-                                          int32_t soft_outlier_sum,
-                                          int32_t world_size) {
-    return world_size > 0 && passed_sum == world_size && verified_sum == world_size && soft_outlier_sum >= 0
-           && soft_outlier_sum <= 1;
-}
-
 std::shared_ptr<GenerateInput> AccuracyChecker::wrapAccuracyInput(torch::Tensor input_ids, bool need_release) {
     auto input                   = std::make_shared<GenerateInput>();
     input->generate_config       = std::make_shared<GenerateConfig>();
@@ -384,38 +377,6 @@ absl::Status AccuracyChecker::abortIfFailed(bool step_flag, const std::string& w
         return absl::OkStatus();
     }
     return absl::InternalError("accuracy check aborted at " + where + " (some rank failed)");
-}
-
-absl::Status AccuracyChecker::validateWorldMetadata(const std::vector<int64_t>& local_metadata,
-                                                    const std::string&          where) {
-    if (parallelism_config_.world_size <= 1) {
-        return absl::OkStatus();
-    }
-    const int64_t world_size = parallelism_config_.world_size;
-    const int64_t world_rank = parallelism_config_.world_rank;
-    RTP_LLM_CHECK_WITH_INFO(world_rank >= 0 && world_rank < world_size,
-                            "accuracy check invalid world rank %ld for size %ld",
-                            (long)world_rank,
-                            (long)world_size);
-    auto  options  = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
-    auto  gathered = torch::zeros({world_size, static_cast<int64_t>(local_metadata.size())}, options);
-    auto* data     = gathered.data_ptr<int64_t>();
-    for (size_t i = 0; i < local_metadata.size(); ++i) {
-        data[world_rank * local_metadata.size() + i] = local_metadata[i];
-    }
-    execAllGather({{gathered}, ParallelMode::DP_AND_TP});
-    execSyncCommunication(false);
-    cudaSyncAndCheck();
-
-    auto accessor = gathered.accessor<int64_t, 2>();
-    for (int64_t rank = 0; rank < world_size; ++rank) {
-        for (size_t i = 0; i < local_metadata.size(); ++i) {
-            if (accessor[rank][i] != local_metadata[i]) {
-                return absl::FailedPreconditionError("accuracy check metadata mismatch at " + where);
-            }
-        }
-    }
-    return absl::OkStatus();
 }
 
 absl::StatusOr<std::vector<int32_t>> AccuracyChecker::sumWorldMask(const std::vector<int32_t>& local_mask,
@@ -589,22 +550,20 @@ absl::Status AccuracyChecker::bootstrapGoldenHistory(const py::object&          
 
 absl::StatusOr<std::vector<std::string>> AccuracyChecker::listCandidates(const py::object&  recorder,
                                                                          const std::string& phase) {
-    constexpr int64_t        kCandidateProtocolVersion = 2;
     std::vector<std::string> registry;
     std::vector<int32_t>     local_mask;
-    int64_t                  protocol_version     = 0;
-    int64_t                  registry_fingerprint = 0;
-    bool                     snapshot_ok          = true;
+    bool                     snapshot_ok = true;
     try {
         py::gil_scoped_acquire gil;
         py::dict               snapshot = recorder.attr("candidate_snapshot")(phase).cast<py::dict>();
-        protocol_version                = snapshot["protocol_version"].cast<int64_t>();
         registry                        = snapshot["registry"].cast<std::vector<std::string>>();
-        registry_fingerprint            = snapshot["registry_fingerprint"].cast<int64_t>();
         local_mask                      = snapshot["viable_mask"].cast<std::vector<int32_t>>();
-        snapshot_ok = protocol_version == kCandidateProtocolVersion && local_mask.size() == registry.size()
-                      && std::all_of(
-                          local_mask.begin(), local_mask.end(), [](int32_t value) { return value == 0 || value == 1; });
+        snapshot_ok =
+            !registry.empty() && local_mask.size() == registry.size()
+            && std::all_of(registry.begin(), registry.end(), [](const std::string& name) { return !name.empty(); })
+            && std::unordered_set<std::string>(registry.begin(), registry.end()).size() == registry.size()
+            && std::all_of(
+                local_mask.begin(), local_mask.end(), [](int32_t value) { return value == 0 || value == 1; });
     } catch (const std::exception& e) {
         RTP_LLM_LOG_ERROR("accuracy check candidate_snapshot(%s) failed: %s", phase.c_str(), e.what());
         snapshot_ok = false;
@@ -617,12 +576,7 @@ absl::StatusOr<std::vector<std::string>> AccuracyChecker::listCandidates(const p
     // with a poisoned device; the process supervisor must stop the worker group.
     cudaSyncAndCheck();
     if (!worldAll(snapshot_ok)) {
-        return absl::FailedPreconditionError("decode gate candidate snapshot invalid at " + phase);
-    }
-    auto metadata_status = validateWorldMetadata(
-        {protocol_version, static_cast<int64_t>(registry.size()), registry_fingerprint}, "candidate " + phase);
-    if (!metadata_status.ok()) {
-        return absl::FailedPreconditionError("decode gate candidate metadata mismatch at " + phase);
+        return absl::FailedPreconditionError("attention gate candidate snapshot invalid at " + phase);
     }
 
     auto sums_or = sumWorldMask(local_mask, "candidate " + phase);
@@ -1043,161 +997,86 @@ size_t AccuracyChecker::computeTemporaryBlockNum(const ModelConfig&             
     return required_blocks + 1;  // + reserved block 0
 }
 
-absl::StatusOr<DecodeBackendGate> AccuracyChecker::finalizeDecodeGate(const py::object& recorder) {
-    constexpr int64_t        kGateProtocolVersion = 2;
-    std::string              local_status;
-    std::string              local_reason;
-    int64_t                  protocol_version     = 0;
-    int64_t                  registry_fingerprint = 0;
-    int64_t                  manifest_fingerprint = 0;
+absl::StatusOr<std::vector<std::string>> AccuracyChecker::finalizeGate(const py::object&  recorder,
+                                                                       const std::string& domain) {
+    const std::string        finalize_method = "finalize_" + domain + "_gate";
     std::vector<std::string> registry;
     std::vector<int32_t>     applicable_mask;
-    std::vector<int32_t>     verified_mask;
     std::vector<int32_t>     passed_mask;
-    std::vector<int32_t>     soft_outlier_counts;
     bool                     finalize_ok = true;
     try {
         py::gil_scoped_acquire gil;
         py::dict               local_gate =
-            recorder.attr("finalize_decode_gate")(model_config_.attn_config.kv_cache_dtype).cast<py::dict>();
-        local_status         = local_gate["status"].cast<std::string>();
-        local_reason         = local_gate["reason"].cast<std::string>();
-        protocol_version     = local_gate["protocol_version"].cast<int64_t>();
-        registry             = local_gate["registry"].cast<std::vector<std::string>>();
-        registry_fingerprint = local_gate["registry_fingerprint"].cast<int64_t>();
-        manifest_fingerprint = local_gate["manifest_fingerprint"].cast<int64_t>();
-        applicable_mask      = local_gate["applicable_mask"].cast<std::vector<int32_t>>();
-        verified_mask        = local_gate["verified_mask"].cast<std::vector<int32_t>>();
-        passed_mask          = local_gate["passed_mask"].cast<std::vector<int32_t>>();
-        soft_outlier_counts  = local_gate["soft_outlier_counts"].cast<std::vector<int32_t>>();
-        finalize_ok          = protocol_version == kGateProtocolVersion && applicable_mask.size() == registry.size()
-                      && verified_mask.size() == registry.size() && passed_mask.size() == registry.size()
-                      && soft_outlier_counts.size() == registry.size()
-                      && (local_status == "READY" || local_status == "UNAVAILABLE");
+            recorder.attr(finalize_method.c_str())(model_config_.attn_config.kv_cache_dtype).cast<py::dict>();
+        finalize_ok     = local_gate["valid"].cast<bool>();
+        registry        = local_gate["registry"].cast<std::vector<std::string>>();
+        applicable_mask = local_gate["applicable_mask"].cast<std::vector<int32_t>>();
+        passed_mask     = local_gate["passed_mask"].cast<std::vector<int32_t>>();
+        finalize_ok =
+            finalize_ok && !registry.empty() && applicable_mask.size() == registry.size()
+            && passed_mask.size() == registry.size()
+            && std::all_of(registry.begin(), registry.end(), [](const std::string& name) { return !name.empty(); })
+            && std::unordered_set<std::string>(registry.begin(), registry.end()).size() == registry.size();
         for (size_t i = 0; finalize_ok && i < registry.size(); ++i) {
-            const bool masks_are_binary = (applicable_mask[i] == 0 || applicable_mask[i] == 1)
-                                          && (verified_mask[i] == 0 || verified_mask[i] == 1)
-                                          && (passed_mask[i] == 0 || passed_mask[i] == 1);
-            finalize_ok = masks_are_binary && soft_outlier_counts[i] >= 0 && passed_mask[i] <= verified_mask[i]
-                          && verified_mask[i] <= applicable_mask[i];
+            const bool masks_are_binary =
+                (applicable_mask[i] == 0 || applicable_mask[i] == 1) && (passed_mask[i] == 0 || passed_mask[i] == 1);
+            finalize_ok = masks_are_binary && passed_mask[i] <= applicable_mask[i];
         }
     } catch (const std::exception& e) {
-        RTP_LLM_LOG_ERROR("accuracy check finalize_decode_gate failed: %s", e.what());
+        RTP_LLM_LOG_ERROR("accuracy check %s failed: %s", finalize_method.c_str(), e.what());
         finalize_ok = false;
     } catch (...) {
-        RTP_LLM_LOG_ERROR("accuracy check finalize_decode_gate failed: unknown");
+        RTP_LLM_LOG_ERROR("accuracy check %s failed: unknown", finalize_method.c_str());
         finalize_ok = false;
     }
 
     cudaSyncAndCheck();
     if (!worldAll(finalize_ok)) {
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=invalid_local_gate_schema");
-        return DecodeBackendGate::unavailable("invalid_local_gate_schema");
-    }
-
-    auto registry_status = validateWorldMetadata(
-        {protocol_version, static_cast<int64_t>(registry.size()), registry_fingerprint}, "decode gate registry");
-    if (!registry_status.ok()) {
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=registry_mismatch");
-        auto gate                 = DecodeBackendGate::unavailable("registry_mismatch");
-        gate.protocol_version     = protocol_version;
-        gate.registry_fingerprint = registry_fingerprint;
-        gate.manifest_fingerprint = manifest_fingerprint;
-        return gate;
-    }
-
-    if (!worldAll(local_status == "READY")) {
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=rank_local_gate_unavailable "
-                            "local_reason=%s",
-                            local_reason.c_str());
-        auto gate                 = DecodeBackendGate::unavailable("rank_local_gate_unavailable");
-        gate.protocol_version     = protocol_version;
-        gate.registry_fingerprint = registry_fingerprint;
-        gate.manifest_fingerprint = manifest_fingerprint;
-        return gate;
-    }
-
-    auto manifest_status = validateWorldMetadata({manifest_fingerprint}, "decode gate manifest");
-    if (!manifest_status.ok()) {
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=manifest_mismatch");
-        auto gate                 = DecodeBackendGate::unavailable("manifest_mismatch");
-        gate.protocol_version     = protocol_version;
-        gate.registry_fingerprint = registry_fingerprint;
-        gate.manifest_fingerprint = manifest_fingerprint;
-        return gate;
+        RTP_LLM_LOG_ERROR("dynamic_%s_gate_failed reason=invalid_local_gate_result", domain.c_str());
+        return absl::FailedPreconditionError(domain + " precision gate local result is invalid on at least one rank");
     }
 
     std::vector<int32_t> stacked;
-    stacked.reserve(registry.size() * 4);
+    stacked.reserve(registry.size() * 2);
     stacked.insert(stacked.end(), applicable_mask.begin(), applicable_mask.end());
-    stacked.insert(stacked.end(), verified_mask.begin(), verified_mask.end());
     stacked.insert(stacked.end(), passed_mask.begin(), passed_mask.end());
-    stacked.insert(stacked.end(), soft_outlier_counts.begin(), soft_outlier_counts.end());
-    auto sums_or = sumWorldMask(stacked, "decode gate masks");
+    auto sums_or = sumWorldMask(stacked, domain + " gate masks");
     RETURN_IF_STATUS_OR_ERROR(sums_or);
     auto sums = std::move(sums_or).value();
 
-    DecodeBackendGate gate;
-    gate.status                 = DecodeBackendGateStatus::READY;
-    gate.protocol_version       = protocol_version;
-    gate.registry_fingerprint   = registry_fingerprint;
-    gate.manifest_fingerprint   = manifest_fingerprint;
-    const int32_t world_size    = static_cast<int32_t>(parallelism_config_.world_size);
-    const size_t  registry_size = registry.size();
+    std::vector<std::string> passed;
+    const int32_t            world_size    = static_cast<int32_t>(parallelism_config_.world_size);
+    const size_t             registry_size = registry.size();
     for (size_t i = 0; i < registry_size; ++i) {
-        const int32_t applicable_sum   = sums[i];
-        const int32_t verified_sum     = sums[registry_size + i];
-        const int32_t passed_sum       = sums[2 * registry_size + i];
-        const int32_t soft_outlier_sum = sums[3 * registry_size + i];
-        if (applicable_sum == world_size) {
-            gate.applicable.push_back(registry[i]);
+        const int32_t applicable_sum = sums[i];
+        const int32_t passed_sum     = sums[registry_size + i];
+        if (applicable_sum == world_size && passed_sum == world_size) {
+            passed.push_back(registry[i]);
         }
-        if (verified_sum == world_size) {
-            gate.verified.push_back(registry[i]);
-        }
-        if (acceptsWorldBackend(passed_sum, verified_sum, soft_outlier_sum, world_size)) {
-            gate.passed.push_back(registry[i]);
-        }
-        if (passed_sum == world_size && verified_sum == world_size && soft_outlier_sum > 1) {
-            RTP_LLM_LOG_WARNING("dynamic_decode_gate_soft_outlier_budget_exceeded backend=%s count=%d limit=1",
-                                registry[i].c_str(),
-                                soft_outlier_sum);
-        }
-        if ((applicable_sum > 0 && applicable_sum < world_size) || (verified_sum > 0 && verified_sum < world_size)
-            || (passed_sum > 0 && passed_sum < world_size)) {
-            RTP_LLM_LOG_WARNING("dynamic_decode_gate_asymmetric backend=%s applicable=%d verified=%d passed=%d "
-                                "world=%d",
+        if ((applicable_sum > 0 && applicable_sum < world_size) || (passed_sum > 0 && passed_sum < world_size)) {
+            RTP_LLM_LOG_WARNING("dynamic_%s_gate_asymmetric backend=%s applicable=%d passed=%d world=%d",
+                                domain.c_str(),
                                 registry[i].c_str(),
                                 applicable_sum,
-                                verified_sum,
                                 passed_sum,
                                 world_size);
         }
     }
-    if (gate.applicable.empty()) {
-        gate.reason = "no_applicable_backend";
-    } else if (gate.verified.empty()) {
-        gate.reason = "no_backend_verified";
-    } else if (gate.passed.empty()) {
-        gate.reason = "no_backend_passed";
-    } else {
-        gate.reason = "complete";
+    if (passed.empty()) {
+        RTP_LLM_LOG_ERROR(
+            "dynamic_%s_gate_failed reason=no_backend_passed registry_size=%zu", domain.c_str(), registry_size);
+        return absl::FailedPreconditionError(domain + " precision gate has no globally passed backend");
     }
-    RTP_LLM_LOG_INFO("dynamic_decode_gate_merged status=READY applicable=%zu verified=%zu passed=%zu "
-                     "reason=%s registry_fp=%ld manifest_fp=%ld",
-                     gate.applicable.size(),
-                     gate.verified.size(),
-                     gate.passed.size(),
-                     gate.reason.c_str(),
-                     (long)gate.registry_fingerprint,
-                     (long)gate.manifest_fingerprint);
-    return gate;
+    RTP_LLM_LOG_INFO(
+        "dynamic_%s_gate_passed passed=%zu registry_size=%zu", domain.c_str(), passed.size(), registry_size);
+    return passed;
 }
 
-absl::StatusOr<DecodeBackendGate> AccuracyChecker::runAll(Executor*                            executor,
-                                                          ResourceContext&                     resource_context,
-                                                          const std::vector<AccuracyScenario>& scenarios,
-                                                          size_t                               max_forward_tokens) {
+absl::StatusOr<AttentionGateResult> AccuracyChecker::runAll(Executor*                            executor,
+                                                            ResourceContext&                     resource_context,
+                                                            const std::vector<AccuracyScenario>& scenarios,
+                                                            size_t                               max_forward_tokens,
+                                                            bool finalize_prefill_gate) {
     executor_           = executor;
     resource_context_   = &resource_context;
     max_forward_tokens_ = max_forward_tokens;
@@ -1222,10 +1101,8 @@ absl::StatusOr<DecodeBackendGate> AccuracyChecker::runAll(Executor*             
         for (const auto& scenario : scenarios) {
             auto scenario_status = runScenario(session.recorder_, scenario);
             if (absl::IsFailedPrecondition(scenario_status)) {
-                RTP_LLM_LOG_WARNING("dynamic_decode_gate_merged status=UNAVAILABLE reason=candidate_schema_invalid "
-                                    "detail=%s",
-                                    scenario_status.ToString().c_str());
-                return DecodeBackendGate::unavailable("candidate_schema_invalid");
+                RTP_LLM_LOG_ERROR("dynamic_decode_gate_failed reason=candidate_schema_invalid detail=%s",
+                                  scenario_status.ToString().c_str());
             }
             RETURN_IF_STATUS_ERROR(scenario_status);
         }
@@ -1237,7 +1114,18 @@ absl::StatusOr<DecodeBackendGate> AccuracyChecker::runAll(Executor*             
     const int64_t record_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - record_begin_us;
     RTP_LLM_LOG_INFO("accuracy check: recording completed in %.3f seconds", record_time_us / 1000000.0);
 
-    return finalizeDecodeGate(session.recorder_);
+    // The recorder stays valid across both domains; every rank finalizes the
+    // domains in the same order so the WORLD collectives stay aligned.
+    AttentionGateResult gate_result;
+    auto                decode_or = finalizeGate(session.recorder_, "decode");
+    RETURN_IF_STATUS_OR_ERROR(decode_or);
+    gate_result.decode_passed = std::move(decode_or).value();
+    if (finalize_prefill_gate) {
+        auto prefill_or = finalizeGate(session.recorder_, "prefill");
+        RETURN_IF_STATUS_OR_ERROR(prefill_or);
+        gate_result.prefill_passed = std::move(prefill_or).value();
+    }
+    return gate_result;
 }
 
 }  // namespace rtp_llm

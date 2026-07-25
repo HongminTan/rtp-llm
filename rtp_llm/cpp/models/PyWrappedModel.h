@@ -5,6 +5,7 @@
 #include "rtp_llm/models_py/bindings/core/torch_utils/TypeConvert.h"
 #include <optional>
 #include <string>
+#include <vector>
 #include <mutex>
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
@@ -78,12 +79,8 @@ public:
     void setAccuracyRecording(bool v) {
         accuracy_recording_ = v;
     }
-    void setDecodeBackendGate(const std::string&              status,
-                              const std::vector<std::string>& passed,
-                              const std::vector<std::string>& verified,
-                              const std::string&              reason,
-                              int64_t                         registry_fingerprint,
-                              int64_t                         manifest_fingerprint);
+    void setAttentionBackendGate(const std::optional<std::vector<std::string>>& decode_passed,
+                                 const std::optional<std::vector<std::string>>& prefill_passed);
 
 private:
     std::optional<PyCacheStoreInputs> prepareWriteCacheParams(const GptModelInputs& inputs);

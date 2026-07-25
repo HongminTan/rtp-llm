@@ -1,12 +1,13 @@
-"""Strict decode-backend precision gate over canonical attention records.
+"""Strict attention-backend precision gates over canonical attention records.
 
+Both the decode domain (phase decode_N over DECODE_MHA_IMPS) and the prefill
+domain (phase plain/prefix over PREFILL_MHA_IMPS) share one strict builder.
 This module is intentionally collective-free. The recorder builds a local
 result and C++ performs the fixed-shape WORLD protocol.
 """
 
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
@@ -18,19 +19,17 @@ from rtp_llm.models_py.modules.factory.attention.accuracy.attention_record impor
     AttentionLayerRecord,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch.precision_metrics import (
+    FP8_QUALITY_THRESHOLDS,
+    THRESHOLDS,
     evaluate_fp8_quality,
     evaluate_precision,
 )
 
 GOLDEN = "golden"
 DECODE = "decode"
+PREFILL = "prefill"
+PREFILL_PHASES = ("plain", "prefix")
 _DECODE_PHASE = re.compile(r"^decode_([0-9]+)$")
-
-# The original 0.20 threshold is a per-sample quality target. Across the full
-# qualifying manifest, tolerate one bounded tail sample while keeping a hard
-# P99-derived ceiling and every non-NRMSE safety gate strict.
-_FP8_NRMSE_HARD_LIMIT = 0.30
-_FP8_MAX_SOFT_OUTLIERS = 1
 
 # records: scenario_base -> impl_name -> [AttentionForwardRecord]
 Records = Dict[str, Dict[str, List[AttentionForwardRecord]]]
@@ -49,9 +48,11 @@ class LayerVerdict:
     mean_ulp: float
     snr: float
     snr_regime: str
+    cos_threshold: float
+    nrmse_threshold: float
+    mean_ulp_threshold: float
     fail_reason: str
     gate_qualifying: bool = True
-    soft_outlier: bool = False
 
 
 @dataclass
@@ -91,6 +92,11 @@ def _normalize_kv_dtype(kv_cache_dtype) -> str:
     raise ValueError(f"decode gate: unrecognized kv_cache_dtype={kv_cache_dtype!r}")
 
 
+def precision_thresholds(kv_cache_dtype) -> Mapping[str, float]:
+    kv_dtype = _normalize_kv_dtype(kv_cache_dtype)
+    return FP8_QUALITY_THRESHOLDS if kv_dtype == "FP8" else THRESHOLDS["BF16"]
+
+
 def _phase_index(phase: str) -> Optional[int]:
     match = _DECODE_PHASE.fullmatch(phase)
     return int(match.group(1)) if match else None
@@ -98,6 +104,12 @@ def _phase_index(phase: str) -> Optional[int]:
 
 def _is_decode_phase(phase: str) -> bool:
     return _phase_index(phase) is not None
+
+
+def _phase_in_domain(phase: str, domain: str) -> bool:
+    if domain == DECODE:
+        return _is_decode_phase(phase)
+    return phase in PREFILL_PHASES
 
 
 def _decode_phase_sort_key(phase: str):
@@ -142,6 +154,15 @@ def _infer_kv_len(record: AttentionForwardRecord) -> int:
     lengths = record.sequence_lengths
     if lengths is not None and lengths.numel() > 0:
         return int(lengths.flatten().max().item())
+    # Prefill records carry an empty sequence_lengths; derive the KV extent
+    # from per-sequence input (+prefix) lengths for failure diagnostics.
+    inputs = record.input_lengths
+    if inputs is not None and inputs.numel() > 0:
+        totals = inputs.flatten().to(torch.int64)
+        prefixes = record.prefix_lengths
+        if prefixes is not None and prefixes.numel() == totals.numel():
+            totals = totals + prefixes.flatten().to(torch.int64)
+        return int(totals.max().item())
     return 0
 
 
@@ -166,6 +187,9 @@ def _failure_verdict(
         mean_ulp=float("nan"),
         snr=float("nan"),
         snr_regime="N/A",
+        cos_threshold=float("nan"),
+        nrmse_threshold=float("nan"),
+        mean_ulp_threshold=float("nan"),
         fail_reason=reason,
         gate_qualifying=gate_qualifying,
     )
@@ -196,28 +220,71 @@ def _forward_record_structure_reason(
         return f"{role} active_sequence_ids is empty"
     if len(set(active_ids)) != len(active_ids):
         return f"{role} active_sequence_ids contains duplicates"
-    if record.is_prefill:
-        return f"{role} decode record marked as prefill"
+    is_decode = _is_decode_phase(record.phase)
+    if is_decode:
+        if record.is_prefill:
+            return f"{role} decode record marked as prefill"
+    elif record.phase in PREFILL_PHASES:
+        if not record.is_prefill:
+            return f"{role} prefill record marked as decode"
+    else:
+        return f"{role} phase {record.phase!r} is outside the gate domains"
     if record.head_num <= 0 or record.kv_head_num <= 0 or record.head_dim <= 0:
         return f"{role} head metadata must be positive"
 
     batch_size = len(active_ids)
-    if record.sequence_lengths is None:
-        return f"{role} sequence_lengths is missing"
-    for field_name in ("sequence_lengths", "input_lengths"):
-        value = getattr(record, field_name)
-        if value is None:
-            return f"{role} {field_name} is missing"
-        if value.numel() != batch_size:
-            return f"{role} {field_name} count differs from active batch size"
-    if record.prefix_lengths is None:
-        return f"{role} prefix_lengths is missing"
-    if record.prefix_lengths.numel() != 0:
-        return f"{role} prefix_lengths must be empty for decode"
-    if record.cu_seqlens is None:
-        return f"{role} cu_seqlens is missing"
-    if record.cu_seqlens.numel() != batch_size + 1:
-        return f"{role} cu_seqlens count differs from active batch size"
+    if is_decode:
+        if record.sequence_lengths is None:
+            return f"{role} sequence_lengths is missing"
+        for field_name in ("sequence_lengths", "input_lengths"):
+            value = getattr(record, field_name)
+            if value is None:
+                return f"{role} {field_name} is missing"
+            if value.numel() != batch_size:
+                return f"{role} {field_name} count differs from active batch size"
+        if record.prefix_lengths is None:
+            return f"{role} prefix_lengths is missing"
+        if record.prefix_lengths.numel() != 0:
+            return f"{role} prefix_lengths must be empty for decode"
+        if record.cu_seqlens is None:
+            return f"{role} cu_seqlens is missing"
+        if record.cu_seqlens.numel() != batch_size + 1:
+            return f"{role} cu_seqlens count differs from active batch size"
+        expected_rows = batch_size
+        rows_desc = "active batch size"
+    else:
+        # Prefill layout contract (see PyWrappedModel::buildPyAttentionInputs):
+        # sequence_lengths is empty, input/prefix lengths are per-sequence, and
+        # cu_seqlens is the query-token prefix sum over the batch.
+        if record.sequence_lengths is not None and record.sequence_lengths.numel() != 0:
+            return f"{role} sequence_lengths must be empty for prefill"
+        if record.input_lengths is None:
+            return f"{role} input_lengths is missing"
+        if record.input_lengths.numel() != batch_size:
+            return f"{role} input_lengths count differs from active batch size"
+        input_lengths = record.input_lengths.flatten().to(torch.int64)
+        if bool((input_lengths <= 0).any().item()):
+            return f"{role} input_lengths must be positive for prefill"
+        if record.prefix_lengths is None:
+            return f"{role} prefix_lengths is missing"
+        if record.prefix_lengths.numel() != batch_size:
+            return f"{role} prefix_lengths count differs from active batch size"
+        prefix_lengths = record.prefix_lengths.flatten().to(torch.int64)
+        if record.phase == "plain" and bool((prefix_lengths != 0).any().item()):
+            return f"{role} prefix_lengths must be zero for plain prefill"
+        if record.phase == "prefix" and bool((prefix_lengths <= 0).any().item()):
+            return f"{role} prefix_lengths must be positive for prefix prefill"
+        if record.cu_seqlens is None:
+            return f"{role} cu_seqlens is missing"
+        if record.cu_seqlens.numel() != batch_size + 1:
+            return f"{role} cu_seqlens count differs from active batch size"
+        cu_seqlens = record.cu_seqlens.flatten().to(torch.int64)
+        if int(cu_seqlens[0].item()) != 0 or not bool(
+            torch.equal(cu_seqlens[1:] - cu_seqlens[:-1], input_lengths)
+        ):
+            return f"{role} cu_seqlens is not the prefix sum of input_lengths"
+        expected_rows = int(cu_seqlens[-1].item())
+        rows_desc = "total token count"
 
     expected = set(expected_layers)
     actual = set(record.layer_records)
@@ -234,8 +301,10 @@ def _forward_record_structure_reason(
             return f"{role} output missing at layer {layer_idx}"
         if layer.output.ndim != 2:
             return f"{role} output rank must be 2 at layer {layer_idx}"
-        if layer.output.shape[0] != batch_size:
-            return f"{role} output row count differs from active batch size at layer {layer_idx}"
+        if layer.output.shape[0] != expected_rows:
+            return (
+                f"{role} output row count differs from {rows_desc} at layer {layer_idx}"
+            )
         if layer.output.shape[1] != expected_width:
             return (
                 f"{role} output width differs from head metadata at layer {layer_idx}"
@@ -275,11 +344,12 @@ def _forward_pair_structure_reason(
         candidate.dtype,
     ):
         return "candidate forward metadata differs from golden"
-    for field_name in (
-        "sequence_lengths",
-        "prefix_lengths",
-        "cu_seqlens",
-    ):
+    compare_fields = ["sequence_lengths", "prefix_lengths", "cu_seqlens"]
+    if golden.phase in PREFILL_PHASES:
+        # Decode forks may legally carry a different input_lengths than golden
+        # (fork history vs prompt); prefill token layout must match exactly.
+        compare_fields.insert(1, "input_lengths")
+    for field_name in compare_fields:
         if not _same_optional_tensor(
             getattr(golden, field_name), getattr(candidate, field_name)
         ):
@@ -319,14 +389,6 @@ def judge_layer(
             f"pass_abs={metrics['pass_abs']}"
         )
         fail_reason = f"{fail_reason}; {diagnostics}" if fail_reason else diagnostics
-    soft_outlier = (
-        kv_dtype == "FP8"
-        and not metrics["overall_pass"]
-        and metrics["pass_abs"]
-        and metrics["tier1_pass"]
-        and math.isfinite(metrics["nrmse"])
-        and metrics["nrmse"] <= _FP8_NRMSE_HARD_LIMIT
-    )
     return LayerVerdict(
         impl=cand.impl_name,
         scenario=scenario,
@@ -339,9 +401,11 @@ def judge_layer(
         mean_ulp=metrics["mean_ulp"],
         snr=metrics["snr"],
         snr_regime=metrics["snr_regime"],
+        cos_threshold=metrics["cos_threshold"],
+        nrmse_threshold=metrics["nrmse_threshold"],
+        mean_ulp_threshold=metrics["mean_ulp_threshold"],
         fail_reason=fail_reason,
         gate_qualifying=gate_qualifying,
-        soft_outlier=soft_outlier,
     )
 
 
@@ -385,32 +449,31 @@ def _infer_manifest(
     return manifest, None
 
 
-def _build_decode_gate_strict(
+def _build_gate_strict(
     records: Records,
-    kv_cache_dtype,
-    manifest: Optional[Mapping[Tuple[str, str], object]] = None,
-    expected_layer_ids: Optional[Sequence[int]] = None,
+    kv_dtype: str,
+    manifest_view: Mapping[Tuple[str, str], _ManifestView],
+    expected_layer_ids: Optional[Sequence[int]],
+    domain: str,
 ) -> Tuple[GateResult, Optional[str]]:
-    kv_dtype = _normalize_kv_dtype(kv_cache_dtype)
-    if manifest is None:
-        normalized_manifest, error = _infer_manifest(records)
-        if error is not None:
-            return GateResult(frozenset(), {}, frozenset()), error
-        manifest_view = normalized_manifest or {}
-    else:
-        manifest_view = {key: _manifest_value(value) for key, value in manifest.items()}
+    for _scenario, phase in manifest_view:
+        if not _phase_in_domain(phase, domain):
+            return (
+                GateResult(frozenset(), {}, frozenset()),
+                f"manifest phase outside {domain} domain: {phase}",
+            )
 
     expected_keys = set(manifest_view)
     for scenario, bucket in records.items():
         for impl, recs in bucket.items():
             for record in recs:
-                if not _is_decode_phase(record.phase):
+                if not _phase_in_domain(record.phase, domain):
                     continue
                 key = (scenario, record.phase)
                 if key not in expected_keys:
                     return (
                         GateResult(frozenset(), {}, frozenset()),
-                        f"decode record outside manifest: {scenario}/{record.phase}/{impl}",
+                        f"{domain} record outside manifest: {scenario}/{record.phase}/{impl}",
                     )
                 expected_impls = manifest_view[key].expected_candidates
                 if impl != GOLDEN and impl not in expected_impls:
@@ -419,17 +482,18 @@ def _build_decode_gate_strict(
                         f"non-applicable candidate record: {scenario}/{record.phase}/{impl}",
                     )
 
-    for scenario in {scenario for scenario, _phase in expected_keys}:
-        indices = sorted(
-            _phase_index(phase)
-            for key_scenario, phase in expected_keys
-            if key_scenario == scenario
-        )
-        if indices != list(range(len(indices))):
-            return (
-                GateResult(frozenset(), {}, frozenset()),
-                f"manifest decode phases are not continuous in {scenario}",
+    if domain == DECODE:
+        for scenario in {scenario for scenario, _phase in expected_keys}:
+            indices = sorted(
+                _phase_index(phase)
+                for key_scenario, phase in expected_keys
+                if key_scenario == scenario
             )
+            if indices != list(range(len(indices))):
+                return (
+                    GateResult(frozenset(), {}, frozenset()),
+                    f"manifest decode phases are not continuous in {scenario}",
+                )
 
     golden_by_key: Dict[Tuple[str, str], AttentionForwardRecord] = {}
     for key, entry in manifest_view.items():
@@ -468,8 +532,7 @@ def _build_decode_gate_strict(
     detail: Dict[str, List[LayerVerdict]] = {}
     for impl, keys in sorted(applicable_keys.items()):
         complete = True
-        hard_failure = False
-        soft_outliers = 0
+        precision_failure = False
         qualifying_layers = 0
         for scenario, phase in sorted(keys):
             golden = golden_by_key[(scenario, phase)]
@@ -480,9 +543,9 @@ def _build_decode_gate_strict(
             if len(candidates) != 1:
                 complete = False
                 reason = (
-                    "candidate missing decode phase present in manifest"
+                    f"candidate missing {domain} phase present in manifest"
                     if not candidates
-                    else f"candidate duplicate decode phase count={len(candidates)}"
+                    else f"candidate duplicate {domain} phase count={len(candidates)}"
                 )
                 detail.setdefault(impl, []).append(
                     _failure_verdict(
@@ -534,13 +597,11 @@ def _build_decode_gate_strict(
                 detail.setdefault(impl, []).append(verdict)
                 if gate_qualifying:
                     qualifying_layers += 1
-                    if verdict.soft_outlier:
-                        soft_outliers += 1
-                    elif not verdict.overall_pass:
-                        hard_failure = True
+                    if not verdict.overall_pass:
+                        precision_failure = True
         if complete and qualifying_layers > 0:
             verified.add(impl)
-            if not hard_failure and soft_outliers <= _FP8_MAX_SOFT_OUTLIERS:
+            if not precision_failure:
                 passed.add(impl)
 
     return (
@@ -550,6 +611,39 @@ def _build_decode_gate_strict(
             verified=frozenset(verified),
         ),
         None,
+    )
+
+
+def _build_decode_gate_strict(
+    records: Records,
+    kv_cache_dtype,
+    manifest: Optional[Mapping[Tuple[str, str], object]] = None,
+    expected_layer_ids: Optional[Sequence[int]] = None,
+) -> Tuple[GateResult, Optional[str]]:
+    kv_dtype = _normalize_kv_dtype(kv_cache_dtype)
+    if manifest is None:
+        normalized_manifest, error = _infer_manifest(records)
+        if error is not None:
+            return GateResult(frozenset(), {}, frozenset()), error
+        manifest_view = normalized_manifest or {}
+    else:
+        manifest_view = {key: _manifest_value(value) for key, value in manifest.items()}
+    return _build_gate_strict(
+        records, kv_dtype, manifest_view, expected_layer_ids, DECODE
+    )
+
+
+def _build_prefill_gate_strict(
+    records: Records,
+    kv_cache_dtype,
+    manifest: Mapping[Tuple[str, str], object],
+    expected_layer_ids: Optional[Sequence[int]] = None,
+) -> Tuple[GateResult, Optional[str]]:
+    """Prefill gate over plain/prefix records; the manifest is never inferred."""
+    kv_dtype = _normalize_kv_dtype(kv_cache_dtype)
+    manifest_view = {key: _manifest_value(value) for key, value in manifest.items()}
+    return _build_gate_strict(
+        records, kv_dtype, manifest_view, expected_layer_ids, PREFILL
     )
 
 

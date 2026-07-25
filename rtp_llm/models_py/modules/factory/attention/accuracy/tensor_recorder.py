@@ -1,6 +1,5 @@
-import hashlib
-import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -26,15 +25,8 @@ from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplB
 from rtp_llm.ops import RopeStyle
 from rtp_llm.ops.compute_ops import PyModelInputs
 
-_PROTOCOL_VERSION = 2
 _DECODE_PHASE = re.compile(r"^decode_[0-9]+$")
-
-
-def _stable_fingerprint(value: object) -> int:
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-    ).encode("ascii")
-    return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big") & ((1 << 63) - 1)
+_PREFILL_PHASES = ("plain", "prefix")
 
 
 @dataclass
@@ -65,19 +57,24 @@ class TensorRecorder:
         self._patched = False
         self._golden_bootstrap = False
         self._state = "IDLE"
+        self._finalized_domains: set = set()
 
     @staticmethod
     def _registry_classes(phase: str):
         raw_registry = (
             DECODE_MHA_IMPS if _DECODE_PHASE.fullmatch(phase) else PREFILL_MHA_IMPS
         )
-        deduplicated = []
-        seen = set()
-        for impl_class in raw_registry:
-            if impl_class.__name__ not in seen:
-                deduplicated.append(impl_class)
-                seen.add(impl_class.__name__)
-        return deduplicated
+        classes = list(raw_registry)
+        names = [impl_class.__name__ for impl_class in classes]
+        if any(not name for name in names):
+            raise ValueError(
+                f"attention registry for {phase} contains an empty class name"
+            )
+        if len(names) != len(set(names)):
+            raise ValueError(
+                f"attention registry for {phase} contains duplicate class names"
+            )
+        return classes
 
     @classmethod
     def _registry(cls, phase: str) -> List[str]:
@@ -106,11 +103,7 @@ class TensorRecorder:
                 f"candidate snapshot contains implementations outside registry: {unknown}"
             )
         return {
-            "protocol_version": _PROTOCOL_VERSION,
             "registry": registry,
-            "registry_fingerprint": _stable_fingerprint(
-                {"protocol_version": _PROTOCOL_VERSION, "registry": registry}
-            ),
             "viable_mask": [1 if name in viable else 0 for name in registry],
         }
 
@@ -350,48 +343,59 @@ class TensorRecorder:
             self._patched = False
 
     def finalize_decode_gate(self, kv_cache_dtype) -> Dict[str, object]:
-        self._require_idle("finalize decode gate")
+        return self._finalize_gate("decode", kv_cache_dtype)
+
+    def finalize_prefill_gate(self, kv_cache_dtype) -> Dict[str, object]:
+        return self._finalize_gate("prefill", kv_cache_dtype)
+
+    def _finalize_gate(self, domain: str, kv_cache_dtype) -> Dict[str, object]:
+        if self._state == "CLOSED":
+            raise RuntimeError(
+                f"tensor recorder is closed; cannot finalize {domain} gate"
+            )
+        if self._state == "RUNNING":
+            raise RuntimeError(
+                f"tensor recorder is already running; cannot finalize {domain} gate"
+            )
+        if domain in self._finalized_domains:
+            raise RuntimeError(
+                f"tensor recorder is already finalized; cannot finalize {domain} gate"
+            )
         # Delayed to avoid accuracy.__init__'s eager TensorRecorder export forming
         # attention_record -> accuracy package -> tensor_recorder -> decode_gate.
         from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate import (
             _build_decode_gate_strict,
+            _build_prefill_gate_strict,
             _normalize_kv_dtype,
             gate_to_mask,
+            precision_thresholds,
         )
 
-        registry = self._registry("decode_0")
-        registry_fingerprint = _stable_fingerprint(
-            {"protocol_version": _PROTOCOL_VERSION, "registry": registry}
-        )
-        decode_manifest = {
-            key: entry
-            for key, entry in self._manifest.items()
-            if _DECODE_PHASE.fullmatch(key[1])
+        is_decode = domain == "decode"
+        registry = self._registry("decode_0" if is_decode else "plain")
+
+        def in_domain(phase: str) -> bool:
+            if is_decode:
+                return bool(_DECODE_PHASE.fullmatch(phase))
+            return phase in _PREFILL_PHASES
+
+        domain_manifest = {
+            key: entry for key, entry in self._manifest.items() if in_domain(key[1])
         }
-        manifest_payload = [
-            {
-                "scenario": scenario,
-                "phase": phase,
-                "active_sequence_ids": list(entry.active_sequence_ids),
-                "gate_qualifying": entry.gate_qualifying,
-                "expected_candidates": list(entry.expected_candidates or ()),
-            }
-            for (scenario, phase), entry in sorted(decode_manifest.items())
-        ]
-        manifest_fingerprint = _stable_fingerprint(manifest_payload)
         applicable = {
             name
-            for entry in decode_manifest.values()
+            for entry in domain_manifest.values()
+            if entry.gate_qualifying
             for name in (entry.expected_candidates or ())
         }
 
         unavailable_reason = None
-        if not decode_manifest:
-            unavailable_reason = "no_decode_manifest"
+        if not domain_manifest:
+            unavailable_reason = f"no_{domain}_manifest"
         elif any(
-            entry.expected_candidates is None for entry in decode_manifest.values()
+            entry.expected_candidates is None for entry in domain_manifest.values()
         ):
-            unavailable_reason = "decode_manifest_candidates_not_frozen"
+            unavailable_reason = f"{domain}_manifest_candidates_not_frozen"
         layer_num = int(getattr(self.model, "layer_num", 0))
         if layer_num <= 0:
             unavailable_reason = "invalid_model_layer_num"
@@ -405,66 +409,74 @@ class TensorRecorder:
         if unavailable_reason is None:
             # Structural validation is encoded as UNAVAILABLE by the strict
             # helper. Unexpected metric/device exceptions intentionally escape.
-            result, unavailable_reason = _build_decode_gate_strict(
+            builder = (
+                _build_decode_gate_strict if is_decode else _build_prefill_gate_strict
+            )
+            result, unavailable_reason = builder(
                 self.records,
                 normalized_kv_dtype,
-                manifest=decode_manifest,
+                manifest=domain_manifest,
                 expected_layer_ids=tuple(range(layer_num)),
             )
 
+        passed = result.passed if result is not None else frozenset()
+        thresholds = precision_thresholds(kv_cache_dtype)
+        rank = int(getattr(self.model.parallelism_config, "world_rank", 0))
+        for impl_name in registry:
+            verdicts = [] if result is None else result.detail.get(impl_name, [])
+            qualifying = [verdict for verdict in verdicts if verdict.gate_qualifying]
+            finite_cos = [
+                verdict.cos_sim
+                for verdict in qualifying
+                if math.isfinite(verdict.cos_sim)
+            ]
+            finite_nrmse = [
+                verdict.nrmse for verdict in qualifying if math.isfinite(verdict.nrmse)
+            ]
+            finite_ulp = [
+                verdict.mean_ulp
+                for verdict in qualifying
+                if math.isfinite(verdict.mean_ulp)
+            ]
+            failures = [
+                f"scenario={verdict.scenario},phase={verdict.phase},layer={verdict.layer_idx},rank={rank},"
+                f"cos={verdict.cos_sim},nrmse={verdict.nrmse},mean_ulp={verdict.mean_ulp},"
+                f"reason={verdict.fail_reason}"
+                for verdict in qualifying
+                if not verdict.overall_pass
+            ]
+            logging.info(
+                "dynamic_%s_gate_metrics backend=%s rank=%d applicable=%d passed=%d "
+                "min_cos=%s cos_threshold=%s max_nrmse=%s nrmse_threshold=%s "
+                "max_mean_ulp=%s mean_ulp_threshold=%s failures=%s",
+                domain,
+                impl_name,
+                rank,
+                int(impl_name in applicable),
+                int(impl_name in passed),
+                min(finite_cos) if finite_cos else float("nan"),
+                thresholds["cos_sim"],
+                max(finite_nrmse) if finite_nrmse else float("nan"),
+                thresholds["nrmse"],
+                max(finite_ulp) if finite_ulp else float("nan"),
+                thresholds["mean_ulp"],
+                failures,
+            )
         if unavailable_reason is not None:
-            status = "UNAVAILABLE"
-            reason = unavailable_reason
-            verified = frozenset()
-            passed = frozenset()
-        else:
-            status = "READY"
-            reason = "ok" if result.passed else "no_backend_passed"
-            verified = result.verified
-            passed = result.passed
-
-        soft_outlier_counts = {name: 0 for name in registry}
-        if result is not None:
-            for impl, verdicts in result.detail.items():
-                soft_outlier_counts[impl] = sum(
-                    verdict.gate_qualifying and verdict.soft_outlier
-                    for verdict in verdicts
-                )
-
-        failure_summary = {}
-        if result is not None:
-            failure_summary = {
-                impl: sorted(
-                    {
-                        f"{verdict.scenario}/{verdict.phase}/layer_{verdict.layer_idx}:"
-                        f"{verdict.fail_reason}"
-                        for verdict in verdicts
-                    }
-                )
-                for impl, verdicts in result.failures().items()
-            }
+            logging.error(
+                "dynamic_%s_gate_invalid rank=%d reason=%s",
+                domain,
+                rank,
+                unavailable_reason,
+            )
 
         payload = {
-            "status": status,
-            "reason": reason,
-            "protocol_version": _PROTOCOL_VERSION,
+            "valid": unavailable_reason is None,
             "registry": registry,
-            "registry_fingerprint": registry_fingerprint,
-            "manifest_fingerprint": manifest_fingerprint,
             "applicable_mask": gate_to_mask(frozenset(applicable), registry),
-            "verified_mask": gate_to_mask(verified, registry),
             "passed_mask": gate_to_mask(passed, registry),
-            "soft_outlier_counts": [soft_outlier_counts[name] for name in registry],
         }
-        logging.info(
-            "dynamic_decode_gate_local status=%s applicable=%s verified=%s passed=%s reason=%s failures=%s",
-            status,
-            sorted(applicable),
-            sorted(verified),
-            sorted(passed),
-            reason,
-            failure_summary,
-        )
+        self._finalized_domains.add(domain)
         self._state = "FINALIZED"
         return payload
 

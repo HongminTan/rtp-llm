@@ -21,11 +21,6 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.benchmark_workspace i
     benchmark_workspace_scope,
 )
 from rtp_llm.models_py.modules.factory.attention.dispatch import backend_bench
-from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate import (
-    GateResult,
-    gate_to_mask,
-    mask_to_gate,
-)
 from rtp_llm.models_py.modules.factory.attention.dispatch.selector import (
     STABLE_CLUSTER_MARGIN,
     STABLE_THRESHOLD,
@@ -33,10 +28,12 @@ from rtp_llm.models_py.modules.factory.attention.dispatch.selector import (
     kv_grid,
     select_stable,
 )
+from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
 
 logger = logging.getLogger(__name__)
 
 _FATAL_PROBE_EXIT_CODE = 70
+BackendClass = type[FMHAImplBase]
 
 
 class DynamicDecodeFatalError(RuntimeError):
@@ -136,11 +133,15 @@ def _read_selector_config() -> tuple[float, float]:
     )
 
 
-def _decode_registry() -> List[str]:
-    """All-rank ordered registry class names (position is identity); DECODE_MHA_IMPS is already registered per device at import time."""
+def _decode_registry_classes() -> List[BackendClass]:
     from rtp_llm.models_py.modules.factory.attention.attn_factory import DECODE_MHA_IMPS
 
-    return [c.__name__ for c in DECODE_MHA_IMPS]
+    return list(DECODE_MHA_IMPS)
+
+
+def _decode_registry() -> List[str]:
+    """All-rank ordered names used only for the registry-index wire protocol."""
+    return [impl_cls.__name__ for impl_cls in _decode_registry_classes()]
 
 
 def _tp_geometry(parallelism_config):
@@ -153,39 +154,13 @@ def _tp_geometry(parallelism_config):
     return tp_size, (tp_rank == 0), dp_rank * tp_size
 
 
-def reduce_gate_across_tp(local: GateResult, parallelism_config) -> frozenset:
-    """Pre-landed TP gate merge helper; not called by production selection yet."""
-    registry = _decode_registry()
-    tp_size, _, _ = _tp_geometry(parallelism_config)
-    passed_mask = torch.tensor(
-        gate_to_mask(local.passed, registry), dtype=torch.int32, device="cuda"
-    )
-    verified_mask = torch.tensor(
-        gate_to_mask(local.verified, registry), dtype=torch.int32, device="cuda"
-    )
-    if tp_size > 1:
-        from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
-
-        all_reduce(passed_mask, group=Group.TP)
-        all_reduce(verified_mask, group=Group.TP)
-    merged, asymmetric = mask_to_gate(
-        passed_mask.tolist(), verified_mask.tolist(), registry, tp_size
-    )
-    if asymmetric:
-        logger.warning(
-            "[gate] asymmetric verification (some ranks lack golden/record), excluded: %s",
-            asymmetric,
-        )
-    return merged
-
-
 def _eligible(
     attn_configs,
     attn_inputs,
     parallelism_config,
     fmha_config,
-    gate_passed: frozenset,
-) -> List[str]:
+    gate_passed: frozenset[BackendClass],
+) -> List[BackendClass]:
     from rtp_llm.models_py.modules.factory.attention.attn_factory import (
         DECODE_MHA_IMPS,
         _is_fmha_impl_disabled,
@@ -194,7 +169,7 @@ def _eligible(
     if not isinstance(gate_passed, frozenset):
         raise TypeError("gate_passed must be an explicit frozenset")
 
-    names: List[str] = []
+    classes: List[BackendClass] = []
     # Registry contract: a decode implementation must be registered for dynamic
     # probing only after its CUDA Graph decode path, lack of TP collectives,
     # numerical behavior, and benchmark resource lifetime have been validated.
@@ -209,7 +184,7 @@ def _eligible(
                 # ...), mirroring the fixed-priority get_fmha_impl path.
                 if _is_fmha_impl_disabled(name, fmha_config):
                     continue
-                if name not in gate_passed:
+                if impl not in gate_passed:
                     continue
                 probe_started = True
                 if not impl.support(attn_configs, attn_inputs):
@@ -222,28 +197,28 @@ def _eligible(
                     # so every later exception is past the safe fallback boundary.
                     raise _FatalProbeError(probe_backend) from e
                 raise
-            names.append(name)
-    return names
+            classes.append(impl)
+    return classes
 
 
 def run_backend_selection(
     model,
     inputs,
     *,
-    gate_passed: frozenset,
+    gate_passed: frozenset[BackendClass],
     selector: Optional[Selector] = None,
     warmup: int = 10,
     iters: int = 50,
     l2_fill_mode: str = "store",
-) -> Optional[str]:
-    """Select the decode backend for a single capture bs, returning the winner class name (None = left empty, capture falls back to fixed priority).
+) -> Optional[BackendClass]:
+    """Select one decode class for a capture bs; None keeps fixed priority.
 
     Only rank0 does the real-machine benchmark + selection; the winner registry
     index is broadcast to Group.TP so every rank gets the same winner. The precision
     allowlist is mandatory so no caller can accidentally select by support alone.
     """
-    if not isinstance(gate_passed, frozenset):
-        raise TypeError("gate_passed must be an explicit frozenset")
+    if not isinstance(gate_passed, frozenset) or not gate_passed:
+        raise TypeError("gate_passed must be a non-empty frozenset of backend classes")
 
     parallelism_config = model.parallelism_config
     attn_configs = model.config.getAttentionConfigs(
@@ -255,7 +230,7 @@ def run_backend_selection(
         attn_configs.max_seq_len
     )
     grid = kv_grid(max_seq_len)
-    registry = _decode_registry()
+    registry = _decode_registry_classes()
     tp_size, is_tp_root, src = _tp_geometry(parallelism_config)
 
     try:
@@ -290,7 +265,7 @@ def run_backend_selection(
                 except Exception as e:
                     # The winner write is the final CUDA operation after a real
                     # probe. Do not enter a TP collective if it fails.
-                    raise _FatalProbeError(winner) from e
+                    raise _FatalProbeError(winner.__name__) from e
         except _SelectorConfigError as e:
             _terminate_config_worker(bs, e, parallelism_config)
             raise DynamicDecodeFatalError(
@@ -351,7 +326,7 @@ def run_backend_selection(
             "tp_rank=%d tp_size=%d dp_rank=%d",
             bs,
             idx,
-            chosen,
+            chosen.__name__,
             int(parallelism_config.tp_rank),
             tp_size,
             int(parallelism_config.dp_rank),
@@ -359,7 +334,11 @@ def run_backend_selection(
     logger.debug(
         "[dispatcher] bs=%d -> %s",
         bs,
-        chosen or "(left empty, fall back to fixed priority)",
+        (
+            chosen.__name__
+            if chosen is not None
+            else "(left empty, fall back to fixed priority)"
+        ),
     )
     return chosen
 
@@ -377,7 +356,7 @@ def _select_on_root(
     warmup,
     iters,
     l2_fill_mode,
-) -> Optional[str]:
+) -> Optional[BackendClass]:
     # Hybrid models are rejected by GptModelBase.select_decode_backend because
     # their multi-group cache layout is not supported by this benchmark.
     layer_kv_cache = model.kv_cache.get_layer_cache(0)
@@ -402,15 +381,14 @@ def _select_on_root(
         model.fmha_config,
         gate_passed,
     )
-    probe_backend = eligible[0] if eligible else "support-probe"
+    probe_backend = eligible[0].__name__ if eligible else "support-probe"
     try:
         matrix = {}
+        eligible_by_name = {impl_cls.__name__: impl_cls for impl_cls in eligible}
         last_probed_backend = None
-        for name in eligible:
+        for impl_cls in eligible:
+            name = impl_cls.__name__
             probe_backend = name
-            impl_cls = _impl_by_name(name)
-            if impl_cls is None:
-                continue
             # multi-kv-point: for each kv, set sequence_lengths on a clone and time real-machine capture+replay;
             # the per-kv latencies are collected into `matrix`, then select_stable (below) does two-level
             # deterministic selection to pick this bs bucket's backend.
@@ -461,7 +439,7 @@ def _select_on_root(
             )
 
         if choice is not None:
-            return choice
+            return eligible_by_name[choice]
         logger.warning(
             "[dispatcher] bs=%d selection returned None -> no dynamic plan", bs
         )
@@ -472,21 +450,15 @@ def _select_on_root(
         raise _FatalProbeError(probe_backend) from e
 
 
-def _impl_by_name(name: str):
-    from rtp_llm.models_py.modules.factory.attention.attn_factory import DECODE_MHA_IMPS
-
-    for c in DECODE_MHA_IMPS:
-        if c.__name__ == name:
-            return c
-    return None
-
-
-def instantiate_decode_impl(model, attn_inputs, name: str, is_cuda_graph: bool):
+def instantiate_decode_impl(
+    model, attn_inputs, impl_cls: BackendClass, is_cuda_graph: bool
+):
     """Instantiate an already-broadcast winner or terminate the worker."""
     parallelism_config = model.parallelism_config
     bs = int(attn_inputs.input_lengths.size(0))
+    name = getattr(impl_cls, "__name__", repr(impl_cls))
     try:
-        registry_idx = _decode_registry().index(name)
+        registry_idx = _decode_registry_classes().index(impl_cls)
     except Exception:  # noqa: BLE001 -- failure is reported by the stage below
         registry_idx = -1
 
@@ -503,11 +475,7 @@ def instantiate_decode_impl(model, attn_inputs, name: str, is_cuda_graph: bool):
             "fatal plan application termination returned unexpectedly"
         ) from error
 
-    try:
-        cls = _impl_by_name(name)
-    except Exception as error:  # noqa: BLE001
-        fail("class-lookup", error)
-    if cls is None:
+    if registry_idx < 0:
         fail("class-missing", LookupError(f"backend class {name!r} is not registered"))
 
     try:
@@ -531,14 +499,14 @@ def instantiate_decode_impl(model, attn_inputs, name: str, is_cuda_graph: bool):
         fail("input-configuration", error)
 
     try:
-        if not cls.support(attn_configs, attn_inputs):
+        if not impl_cls.support(attn_configs, attn_inputs):
             fail("support", RuntimeError(f"backend {name!r} support() returned false"))
     except DynamicDecodeFatalError:
         raise
     except Exception as error:  # noqa: BLE001
         fail("support", error)
     try:
-        if not cls.support_parallelism_config(parallelism_config):
+        if not impl_cls.support_parallelism_config(parallelism_config):
             fail(
                 "parallelism",
                 RuntimeError(
@@ -550,7 +518,7 @@ def instantiate_decode_impl(model, attn_inputs, name: str, is_cuda_graph: bool):
     except Exception as error:  # noqa: BLE001
         fail("parallelism", error)
     try:
-        inst = cls(attn_configs, attn_inputs, parallelism_config)
+        inst = impl_cls(attn_configs, attn_inputs, parallelism_config)
     except Exception as error:  # noqa: BLE001
         fail("constructor", error)
     if is_cuda_graph:

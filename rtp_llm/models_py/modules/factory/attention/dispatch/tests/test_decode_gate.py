@@ -17,6 +17,7 @@ from rtp_llm.models_py.modules.factory.attention.dispatch.decode_gate import (
     AttentionForwardRecord,
     AttentionLayerRecord,
     _build_decode_gate_strict,
+    _build_prefill_gate_strict,
     _normalize_kv_dtype,
     build_decode_gate,
     gate_to_mask,
@@ -105,6 +106,35 @@ def _head_collapse(t, head=3):
     rms = t.float().pow(2).mean().sqrt()
     out[0, head] = torch.randn(D) * rms * 3.0
     return out.reshape(1, HD).to(t.dtype)
+
+
+def _ulp_heavy_golden():
+    """1/8 large elements carry the signal; 7/8 tiny elements carry the ULP."""
+    t = torch.full((1, HD), 1e-3)
+    t[0, : HD // 8] = 1.0
+    return t.to(torch.bfloat16)
+
+
+def _ulp_spike(t, factor=1.4):
+    """Relative error on tiny elements only: mean_ulp blows past 25 while the
+    signal-weighted metrics (cos/nrmse) and the absolute error stay clean."""
+    out = t.clone().float()
+    tiny = out.abs() < 0.5
+    out[tiny] = out[tiny] * factor
+    return out.to(t.dtype)
+
+
+def _low_snr_golden_layers(magnitude=0.05):
+    """Uniform tiny-magnitude outputs (V cancellation shape from SM100 logs)."""
+    out = {}
+    for li in range(NLAYERS):
+        out[li] = (torch.sign(torch.randn(1, HD)) * magnitude).to(torch.bfloat16)
+    return out
+
+
+def _add_abs_noise(t, abs_rms):
+    f = t.float()
+    return (f + torch.randn_like(f) * abs_rms).to(t.dtype)
 
 
 def _clean_candidate(
@@ -549,6 +579,9 @@ def test_failed_verdict_reports_absolute_scale_diagnostics():
 
     failures = build_decode_gate(records, "FP8").failures()["X"]
     assert failures
+    # A 2x scale error lands in LOW_SNR (snr=1) where cos is exempted, yet the
+    # scale-invariant nrmse fence keeps it out of the allowlist.
+    assert all(v.nrmse > v.nrmse_threshold for v in failures)
     for field in (
         "rms_abs=",
         "ref_rms=",
@@ -559,12 +592,15 @@ def test_failed_verdict_reports_absolute_scale_diagnostics():
         assert all(field in verdict.fail_reason for verdict in failures)
 
 
-def test_fp8_allows_one_bounded_qualifying_soft_outlier():
+def test_fp8_ulp_anomaly_is_observational_not_gating():
+    """Cross-precision mean ULP tracks the platform quantization scheme, so it
+    is recorded on the verdict but never gates the FP8 judgment."""
     _seed()
     scenario = "qualifying"
     gl = _golden_layers()
+    gl[0] = _ulp_heavy_golden()
     layers = {li: output.clone() for li, output in gl.items()}
-    layers[0] = _scale(gl[0], 1.23)
+    layers[0] = _ulp_spike(gl[0])
     records = _records_one_scenario(
         gl, 512, scenario, {"X": _fwd("X", layers, 512, scenario)}
     )
@@ -575,20 +611,45 @@ def test_fp8_allows_one_bounded_qualifying_soft_outlier():
     assert error is None
     assert result.verified == frozenset({"X"})
     assert result.passed == frozenset({"X"})
-    outliers = result.failures()["X"]
-    assert len(outliers) == 1
-    assert outliers[0].gate_qualifying
-    assert outliers[0].soft_outlier
-    assert 0.20 < outliers[0].nrmse <= 0.30
+    anomaly = [v for v in result.detail["X"] if v.layer_idx == 0][0]
+    assert anomaly.overall_pass
+    assert anomaly.mean_ulp > anomaly.mean_ulp_threshold
 
 
-def test_fp8_rejects_second_soft_outlier_and_single_hard_failure():
+def test_base_rejects_single_metric_ulp_failure_without_soft_outlier_budget():
+    """Same-precision BF16 keeps mean_ulp as a hard per-element gate."""
+    _seed()
+    scenario = "qualifying"
+    gl = _golden_layers()
+    gl[0] = _ulp_heavy_golden()
+    layers = {li: output.clone() for li, output in gl.items()}
+    layers[0] = _ulp_spike(gl[0], factor=1.04)
+    records = _records_one_scenario(
+        gl, 512, scenario, {"X": _fwd("X", layers, 512, scenario)}
+    )
+
+    result, error = _build_decode_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.verified == frozenset({"X"})
+    assert result.passed == frozenset()
+    failures = result.failures()["X"]
+    assert len(failures) == 1
+    assert failures[0].gate_qualifying
+    assert failures[0].snr_regime == "HIGH_SNR"
+    assert failures[0].cos_sim >= failures[0].cos_threshold
+    assert failures[0].nrmse <= failures[0].nrmse_threshold
+    assert failures[0].mean_ulp > failures[0].mean_ulp_threshold
+
+
+def test_fp8_rejects_all_qualifying_metric_failures():
     _seed()
     scenario = "qualifying"
     gl = _golden_layers()
     two_soft = {li: output.clone() for li, output in gl.items()}
-    two_soft[0] = _scale(gl[0], 1.23)
-    two_soft[1] = _scale(gl[1], 1.23)
+    two_soft[0] = _scale(gl[0], 1.30)
+    two_soft[1] = _scale(gl[1], 1.30)
     records = _records_one_scenario(
         gl, 512, scenario, {"X": _fwd("X", two_soft, 512, scenario)}
     )
@@ -597,7 +658,7 @@ def test_fp8_rejects_second_soft_outlier_and_single_hard_failure():
     )
     assert error is None
     assert result.passed == frozenset()
-    assert sum(verdict.soft_outlier for verdict in result.failures()["X"]) == 2
+    assert len(result.failures()["X"]) == 2
 
     hard = {li: output.clone() for li, output in gl.items()}
     hard[0] = _scale(gl[0], 1.40)
@@ -610,8 +671,7 @@ def test_fp8_rejects_second_soft_outlier_and_single_hard_failure():
     assert error is None
     assert result.passed == frozenset()
     hard_failure = result.failures()["X"][0]
-    assert hard_failure.nrmse > 0.30
-    assert not hard_failure.soft_outlier
+    assert hard_failure.nrmse > hard_failure.nrmse_threshold
 
     for corrupt in (
         lambda output: torch.zeros_like(output),
@@ -633,7 +693,37 @@ def test_fp8_rejects_second_soft_outlier_and_single_hard_failure():
         )
         assert error is None
         assert result.passed == frozenset()
-        assert not result.failures()["X"][0].soft_outlier
+
+
+def test_fp8_low_snr_cos_shortfall_with_clean_abs_passes():
+    """SM100 replay shape: tiny-norm layers where cos<0.998 is
+    mathematically forced (cos ~ snr/sqrt(1+snr^2), snr~8) must pass when the
+    absolute error, nrmse and mean_ulp are all clean."""
+    _seed()
+    gl = _low_snr_golden_layers()
+    noisy = {li: _add_abs_noise(g, 0.006) for li, g in gl.items()}
+    records = _records_one_scenario(
+        gl, 512, "p0_c512_d1", {"X": _fwd("X", noisy, 512, "p0_c512_d1")}
+    )
+    res = build_decode_gate(records, "FP8")
+    assert res.passed == frozenset({"X"})
+    verdicts = res.detail["X"]
+    assert all(v.snr_regime == "LOW_SNR" for v in verdicts)
+    assert any(v.cos_sim < v.cos_threshold for v in verdicts)
+
+
+def test_fp8_low_snr_abs_error_above_floor_still_fails():
+    _seed()
+    gl = _low_snr_golden_layers()
+    blown = {li: _add_abs_noise(g, 0.9) for li, g in gl.items()}
+    records = _records_one_scenario(
+        gl, 512, "p0_c512_d1", {"X": _fwd("X", blown, 512, "p0_c512_d1")}
+    )
+    res = build_decode_gate(records, "FP8")
+    assert res.passed == frozenset()
+    failures = res.failures()["X"]
+    assert failures
+    assert all("in LOW_SNR" in v.fail_reason for v in failures)
 
 
 def test_nonqualifying_failure_is_diagnostic_only():
@@ -732,6 +822,242 @@ def test_detail_collected_for_all_layers_even_on_pass():
     assert len(res.detail["X"]) == NLAYERS
     assert all(v.overall_pass for v in res.detail["X"])
     assert res.failures() == {}
+
+
+# ─── Prefill gate: plain/prefix strict judgment on the shared builder ───
+
+
+def _prefill_fwd(impl, layer_outputs, scenario, phase, input_lengths, prefix_lengths):
+    input_lengths_t = torch.tensor(input_lengths, dtype=torch.int32)
+    prefix_lengths_t = torch.tensor(prefix_lengths, dtype=torch.int32)
+    cu_seqlens = torch.zeros(len(input_lengths) + 1, dtype=torch.int32)
+    cu_seqlens[1:] = input_lengths_t.cumsum(0)
+    lrs = {li: _layer(li, out, 0) for li, out in layer_outputs.items()}
+    return AttentionForwardRecord(
+        impl_name=impl,
+        phase=phase,
+        layer_records=lrs,
+        head_num=H,
+        kv_head_num=KVH,
+        head_dim=D,
+        dtype=torch.bfloat16,
+        is_prefill=True,
+        sequence_lengths=torch.empty(0, dtype=torch.int32),
+        input_lengths=input_lengths_t,
+        prefix_lengths=prefix_lengths_t,
+        cu_seqlens=cu_seqlens,
+        active_sequence_ids=tuple(range(len(input_lengths))),
+    )
+
+
+def _prefill_records(scenario, phases, impl="P", corrupt_phase=None):
+    """phases: {phase: (input_lengths, prefix_lengths)}; corrupt_phase scales the candidate."""
+    _seed()
+    bucket = {GOLDEN: [], impl: []}
+    goldens = {}
+    for phase, (input_lengths, prefix_lengths) in phases.items():
+        total_tokens = int(sum(input_lengths))
+        gl = _golden_layers(batch_size=total_tokens)
+        goldens[phase] = gl
+        bucket[GOLDEN].append(
+            _prefill_fwd(GOLDEN, gl, scenario, phase, input_lengths, prefix_lengths)
+        )
+        if corrupt_phase == phase:
+            outputs = {li: _scale(g, 1.05) for li, g in gl.items()}
+        else:
+            outputs = {li: _add_noise(g, 0.003) for li, g in gl.items()}
+        bucket[impl].append(
+            _prefill_fwd(impl, outputs, scenario, phase, input_lengths, prefix_lengths)
+        )
+    return {scenario: bucket}, goldens
+
+
+_PLAIN_PREFIX_PHASES = {
+    "plain": ([128, 64], [0, 0]),
+    "prefix": ([64, 32], [512, 256]),
+}
+
+
+def test_prefill_plain_and_prefix_all_pass():
+    records, _ = _prefill_records("scenario", _PLAIN_PREFIX_PHASES)
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.verified == frozenset({"P"})
+    assert result.passed == frozenset({"P"})
+    assert {v.phase for v in result.detail["P"]} == {"plain", "prefix"}
+
+
+def test_prefill_single_phase_failure_excludes_backend():
+    records, _ = _prefill_records(
+        "scenario", _PLAIN_PREFIX_PHASES, corrupt_phase="prefix"
+    )
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.verified == frozenset({"P"})
+    assert result.passed == frozenset()
+    assert {v.phase for v in result.failures()["P"]} == {"prefix"}
+
+
+def test_prefill_missing_applicable_phase_blocks_pass():
+    records, _ = _prefill_records("scenario", _PLAIN_PREFIX_PHASES)
+    records["scenario"]["P"] = [
+        record for record in records["scenario"]["P"] if record.phase == "plain"
+    ]
+    manifest = _manifest(records)
+    manifest[("scenario", "prefix")]["expected_candidates"] = ("P",)
+    result, error = _build_prefill_gate_strict(records, "BASE", manifest=manifest)
+    assert error is None
+    assert result.verified == frozenset()
+    assert result.passed == frozenset()
+    missing = [v for v in result.failures()["P"] if v.phase == "prefix"]
+    assert missing and "missing prefill phase" in missing[0].fail_reason
+
+
+def test_prefill_plain_only_scenario_passes():
+    records, _ = _prefill_records("scenario", {"plain": ([128, 64], [0, 0])})
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.passed == frozenset({"P"})
+
+
+def test_prefill_low_snr_scale_error_still_rejected_by_nrmse():
+    records, goldens = _prefill_records("scenario", {"plain": ([128], [0])})
+    layers = {li: g.clone() for li, g in goldens["plain"].items()}
+    layers[0] = _scale(goldens["plain"][0], 1.30)
+    records["scenario"]["P"] = [
+        _prefill_fwd("P", layers, "scenario", "plain", [128], [0])
+    ]
+    result, error = _build_prefill_gate_strict(
+        records, "FP8", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.passed == frozenset()
+    failure = result.failures()["P"][0]
+    assert failure.snr_regime == "LOW_SNR"
+    assert failure.nrmse > failure.nrmse_threshold
+    assert "cos_sim=" not in failure.fail_reason
+
+
+def test_prefill_gate_ignores_decode_records_and_vice_versa():
+    _seed()
+    records, _ = _prefill_records("scenario", {"plain": ([128], [0])})
+    gl_decode = _golden_layers()
+    records["scenario"][GOLDEN].append(
+        _fwd(GOLDEN, gl_decode, 512, "scenario", phase="decode_0")
+    )
+    records["scenario"]["D"] = [
+        _clean_candidate(gl_decode, 512, "scenario", "D", phase="decode_0")
+    ]
+    prefill_manifest = {
+        ("scenario", "plain"): {
+            "active_sequence_ids": (0,),
+            "expected_candidates": ("P",),
+            "gate_qualifying": True,
+        }
+    }
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=prefill_manifest
+    )
+    assert error is None
+    assert result.passed == frozenset({"P"})
+    assert "D" not in result.detail
+
+    decode_manifest = {
+        ("scenario", "decode_0"): {
+            "active_sequence_ids": (0,),
+            "expected_candidates": ("D",),
+            "gate_qualifying": True,
+        }
+    }
+    decode_result, decode_error = _build_decode_gate_strict(
+        records, "BASE", manifest=decode_manifest
+    )
+    assert decode_error is None
+    assert decode_result.passed == frozenset({"D"})
+    assert "P" not in decode_result.detail
+
+
+def test_prefill_nonqualifying_only_is_not_verified_or_passed():
+    records, _ = _prefill_records("diagnostic", {"plain": ([128], [0])})
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records, {"diagnostic": False})
+    )
+    assert error is None
+    assert result.verified == frozenset()
+    assert result.passed == frozenset()
+    assert all(not v.gate_qualifying for v in result.detail["P"])
+
+
+def test_prefill_manifest_rejects_decode_phase_key():
+    records, _ = _prefill_records("scenario", {"plain": ([128], [0])})
+    manifest = _manifest(records)
+    manifest[("scenario", "decode_0")] = {
+        "active_sequence_ids": (0,),
+        "expected_candidates": (),
+        "gate_qualifying": True,
+    }
+    result, error = _build_prefill_gate_strict(records, "BASE", manifest=manifest)
+    assert result.passed == frozenset()
+    assert error is not None and "outside prefill domain" in error
+
+
+def test_prefill_structure_contract_is_strict():
+    def fresh():
+        return _prefill_records("scenario", _PLAIN_PREFIX_PHASES)
+
+    # golden+candidate violations reject the whole schema
+    records, _ = fresh()
+    for impl in (GOLDEN, "P"):
+        for record in records["scenario"][impl]:
+            record.is_prefill = False
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert result.passed == frozenset()
+    assert error is not None and "marked as decode" in error
+
+    records, _ = fresh()
+    for impl in (GOLDEN, "P"):
+        for record in records["scenario"][impl]:
+            if record.phase == "prefix":
+                record.prefix_lengths = torch.zeros(2, dtype=torch.int32)
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert result.passed == frozenset()
+    assert error is not None and "prefix_lengths must be positive" in error
+
+    records, _ = fresh()
+    for impl in (GOLDEN, "P"):
+        for record in records["scenario"][impl]:
+            if record.phase == "plain":
+                record.cu_seqlens = record.cu_seqlens.flip(0)
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert result.passed == frozenset()
+    assert error is not None and "prefix sum of input_lengths" in error
+
+    # candidate-only violation stays local: not verified, golden intact
+    records, _ = fresh()
+    for record in records["scenario"]["P"]:
+        if record.phase == "plain":
+            for layer in record.layer_records.values():
+                layer.output = layer.output[:-1]
+    result, error = _build_prefill_gate_strict(
+        records, "BASE", manifest=_manifest(records)
+    )
+    assert error is None
+    assert result.verified == frozenset()
+    assert result.passed == frozenset()
+    reasons = [v.fail_reason for v in result.failures()["P"] if v.phase == "plain"]
+    assert reasons and "total token count" in reasons[0]
 
 
 # ─── CPU-only bitmask helpers for the pre-landed TP integration ───

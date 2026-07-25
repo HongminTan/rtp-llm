@@ -1,7 +1,6 @@
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Optional
 
 from torch import nn
@@ -14,7 +13,12 @@ from rtp_llm.models_py.model_desc.block_map import (
     select_attention_inputs_for_tag,
 )
 from rtp_llm.models_py.modules import AttnImplFactory
-from rtp_llm.models_py.modules.factory.attention.attn_factory import AttentionImpl
+from rtp_llm.models_py.modules.factory.attention.attn_factory import (
+    DECODE_MHA_IMPS,
+    PREFILL_MHA_IMPS,
+    AttentionImpl,
+)
+from rtp_llm.models_py.modules.factory.attention.fmha_impl_base import FMHAImplBase
 from rtp_llm.ops import DeviceResourceConfig
 from rtp_llm.ops.compute_ops import (
     KVCache,
@@ -24,35 +28,51 @@ from rtp_llm.ops.compute_ops import (
 )
 from rtp_llm.utils.model_weight import W
 
-
-class DecodeBackendGateStatus(str, Enum):
-    NOT_REQUESTED = "NOT_REQUESTED"
-    READY = "READY"
-    UNAVAILABLE = "UNAVAILABLE"
+BackendClass = type[FMHAImplBase]
 
 
 @dataclass(frozen=True)
-class DecodeBackendGateState:
-    status: DecodeBackendGateStatus
-    passed: frozenset[str]
-    verified: frozenset[str]
-    reason: str
-    registry_fingerprint: str
-    manifest_fingerprint: str
+class AttentionBackendGateContext:
+    decode_gate_passed: frozenset[BackendClass] | None = None
+    prefill_gate_passed: frozenset[BackendClass] | None = None
 
 
-def _backend_name_set(field: str, values: Any) -> frozenset[str]:
-    if isinstance(values, (str, bytes)):
-        raise TypeError(f"{field} must be a collection of backend names")
+def _resolve_optional_gate_classes(
+    domain: str,
+    names: Sequence[str] | None,
+    registry: Sequence[BackendClass],
+) -> frozenset[BackendClass] | None:
+    if names is None:
+        return None
+    if isinstance(names, (str, bytes)):
+        raise TypeError(f"{domain} gate names must be a sequence of backend names")
     try:
-        names = tuple(values)
+        passed_names = tuple(names)
     except TypeError as error:
-        raise TypeError(f"{field} must be a collection of backend names") from error
-    if any(not isinstance(name, str) or not name for name in names):
-        raise ValueError(f"{field} must contain non-empty backend names")
-    if len(names) != len(set(names)):
-        raise ValueError(f"{field} must not contain duplicate backend names")
-    return frozenset(names)
+        raise TypeError(
+            f"{domain} gate names must be a sequence of backend names"
+        ) from error
+    if not passed_names:
+        raise ValueError(f"{domain} gate names must be non-empty when enabled")
+    if any(not isinstance(name, str) or not name for name in passed_names):
+        raise ValueError(f"{domain} gate names must contain non-empty strings")
+    if len(passed_names) != len(set(passed_names)):
+        raise ValueError(f"{domain} gate names must not contain duplicates")
+
+    registry_by_name: dict[str, BackendClass] = {}
+    for impl_cls in registry:
+        impl_name = impl_cls.__name__
+        if not impl_name:
+            raise ValueError(f"{domain} registry contains an empty class name")
+        if impl_name in registry_by_name:
+            raise ValueError(
+                f"{domain} registry contains duplicate class name {impl_name!r}"
+            )
+        registry_by_name[impl_name] = impl_cls
+    unknown = [name for name in passed_names if name not in registry_by_name]
+    if unknown:
+        raise ValueError(f"{domain} gate contains unknown backend names: {unknown}")
+    return frozenset(registry_by_name[name] for name in passed_names)
 
 
 class GptModelBase(nn.Module):
@@ -88,127 +108,68 @@ class GptModelBase(nn.Module):
 
         ## Dynamic decode backend dispatch result. Key absence means selection has
         ## not completed, None means a completed fixed-priority plan miss, and a
-        ## class name is an already-broadcast winner.
-        self.backend_plan: dict[int, Optional[str]] = {}
+        ## class is an already-broadcast winner.
+        self.backend_plan: dict[int, Optional[BackendClass]] = {}
 
         ## Dedup for the "decode backend in use" log: capture bs -> last logged backend
         ## name, so prepare_fmha_impl emits one line per (bs, backend) at capture instead
         ## of once per replay step.
         self._logged_decode_backend: dict[int, str] = {}
 
-        # The temporary accuracy model transfers one immutable snapshot to the real
-        # model before CUDA Graph capture. NOT_REQUESTED is deliberately authoritative:
-        # dynamic selection cannot silently fall back to support-only eligibility when
-        # the snapshot was not injected.
-        self._decode_backend_gate = DecodeBackendGateState(
-            status=DecodeBackendGateStatus.NOT_REQUESTED,
-            passed=frozenset(),
-            verified=frozenset(),
-            reason="",
-            registry_fingerprint="",
-            manifest_fingerprint="",
-        )
-        self._decode_backend_gate_injected = False
-        self._decode_backend_gate_frozen = False
-        self._logged_decode_gate_fallback: set[tuple[int, str, str]] = set()
+        self._attention_backend_gate_context: AttentionBackendGateContext | None = None
 
-    def set_decode_backend_gate(
+    def set_attention_backend_gate(
         self,
-        status: str,
-        passed: Any,
-        verified: Any,
-        reason: str,
-        registry_fingerprint: Any,
-        manifest_fingerprint: Any,
+        *,
+        decode_passed_names: Sequence[str] | None,
+        prefill_passed_names: Sequence[str] | None,
     ) -> None:
-        """Inject the one authoritative decode gate snapshot before selection."""
-        if self._decode_backend_gate_frozen:
-            raise RuntimeError("decode backend gate is frozen after selector use")
-        if self._decode_backend_gate_injected:
-            raise RuntimeError("decode backend gate has already been injected")
-
-        try:
-            gate_status = (
-                status
-                if isinstance(status, DecodeBackendGateStatus)
-                else DecodeBackendGateStatus(str(status).upper())
+        """Install the immutable per-model gate allowlists exactly once."""
+        if self._attention_backend_gate_context is not None:
+            raise RuntimeError(
+                "attention backend gate context has already been installed"
             )
-        except ValueError as error:
-            raise ValueError(
-                f"unsupported decode backend gate status: {status}"
-            ) from error
-
-        passed_names = _backend_name_set("passed", passed)
-        verified_names = _backend_name_set("verified", verified)
-        if gate_status != DecodeBackendGateStatus.READY and passed_names:
-            raise ValueError(f"{gate_status.value} gate cannot pass a decode backend")
-        if not passed_names.issubset(verified_names):
-            raise ValueError("passed decode backends must be a subset of verified")
-
-        self._decode_backend_gate = DecodeBackendGateState(
-            status=gate_status,
-            passed=passed_names,
-            verified=verified_names,
-            reason=str(reason or ""),
-            registry_fingerprint=(
-                "" if registry_fingerprint is None else str(registry_fingerprint)
+        if decode_passed_names is None and prefill_passed_names is None:
+            raise ValueError("at least one attention backend gate must be enabled")
+        context = AttentionBackendGateContext(
+            decode_gate_passed=_resolve_optional_gate_classes(
+                "decode", decode_passed_names, DECODE_MHA_IMPS
             ),
-            manifest_fingerprint=(
-                "" if manifest_fingerprint is None else str(manifest_fingerprint)
+            prefill_gate_passed=_resolve_optional_gate_classes(
+                "prefill", prefill_passed_names, PREFILL_MHA_IMPS
             ),
         )
-        self._decode_backend_gate_injected = True
+        self._attention_backend_gate_context = context
         self.backend_plan.clear()
         self._logged_decode_backend.clear()
-        self._logged_decode_gate_fallback.clear()
         logging.info(
-            "dynamic_decode_gate_injected status=%s passed=%s verified=%s "
-            "reason=%s registry_fp=%s manifest_fp=%s tp_rank=%d dp_rank=%d",
-            gate_status.value,
-            ",".join(sorted(passed_names)) or "-",
-            ",".join(sorted(verified_names)) or "-",
-            self._decode_backend_gate.reason or "-",
-            self._decode_backend_gate.registry_fingerprint or "-",
-            self._decode_backend_gate.manifest_fingerprint or "-",
+            "attention_backend_gate_installed decode=%s prefill=%s tp_rank=%d dp_rank=%d",
+            sorted(cls.__name__ for cls in context.decode_gate_passed or ()),
+            sorted(cls.__name__ for cls in context.prefill_gate_passed or ()),
             int(getattr(self.parallelism_config, "tp_rank", 0)),
             int(getattr(self.parallelism_config, "dp_rank", 0)),
         )
 
-    def _freeze_decode_backend_gate(self) -> DecodeBackendGateState:
-        self._decode_backend_gate_frozen = True
-        return self._decode_backend_gate
+    def _get_gate_passed(self, domain: str) -> frozenset[BackendClass]:
+        context = self._attention_backend_gate_context
+        if context is None:
+            raise RuntimeError("attention backend gate context has not been installed")
+        passed = (
+            context.decode_gate_passed
+            if domain == "decode"
+            else context.prefill_gate_passed
+        )
+        if passed is None:
+            raise RuntimeError(f"{domain} attention backend gate is not enabled")
+        if not passed:
+            raise RuntimeError(f"{domain} attention backend gate is unexpectedly empty")
+        return passed
 
-    def _finish_decode_gate_miss(self, bs: int, gate: DecodeBackendGateState) -> None:
-        self.backend_plan[bs] = None
-        reason = (
-            "ready_empty"
-            if gate.status == DecodeBackendGateStatus.READY
-            else gate.status.value.lower()
-        )
-        if gate.reason:
-            detail = gate.reason
-        elif reason == "ready_empty":
-            detail = "empty_passed"
-        elif (
-            gate.status == DecodeBackendGateStatus.NOT_REQUESTED
-            and not self._decode_backend_gate_injected
-        ):
-            detail = "not_injected"
-        else:
-            detail = "-"
-        key = (bs, reason, detail)
-        if key in self._logged_decode_gate_fallback:
-            return
-        self._logged_decode_gate_fallback.add(key)
-        logging.warning(
-            "dynamic_decode_fallback_static reason=gate_%s gate_reason=%s bs=%d "
-            "tp_rank=%d dp_rank=%d",
-            reason,
-            detail,
-            bs,
-            int(getattr(self.parallelism_config, "tp_rank", 0)),
-            int(getattr(self.parallelism_config, "dp_rank", 0)),
-        )
+    def get_decode_gate_passed(self) -> frozenset[BackendClass]:
+        return self._get_gate_passed("decode")
+
+    def get_prefill_gate_passed(self) -> frozenset[BackendClass]:
+        return self._get_gate_passed("prefill")
 
     def initialize(self, init_resource: PyModelInitResources) -> bool:
         self.kv_cache = init_resource.kv_cache
@@ -248,19 +209,11 @@ class GptModelBase(nn.Module):
             self.py_hw_kernel_config, "enable_dynamic_decode_backend", False
         ):
             return
-        gate = self._freeze_decode_backend_gate()
+        gate_passed = self.get_decode_gate_passed()
         attention_inputs = get_attention_inputs_value(inputs)
         if isinstance(attention_inputs, Mapping):
-            if gate.status != DecodeBackendGateStatus.READY or not gate.passed:
-                primary_inputs = next(iter(attention_inputs.values()))
-                self._finish_decode_gate_miss(
-                    int(primary_inputs.input_lengths.size(0)), gate
-                )
             return
         bs = int(attention_inputs.input_lengths.size(0))
-        if gate.status != DecodeBackendGateStatus.READY or not gate.passed:
-            self._finish_decode_gate_miss(bs, gate)
-            return
         # CUDA-only feature: the selectable backends are FlashInfer-based decode impls
         # that only exist on CUDA. On ROCm/PPU/CPU the on-device bench would drive the
         # platform's paged-attention (e.g. aiter pa on ROCm) through the CUDA-graph
@@ -292,7 +245,7 @@ class GptModelBase(nn.Module):
         )
 
         winner = backend_selector.run_backend_selection(
-            self, inputs, gate_passed=gate.passed
+            self, inputs, gate_passed=gate_passed
         )
         self.backend_plan[bs] = winner
 
@@ -331,15 +284,16 @@ class GptModelBase(nn.Module):
         if is_cuda_graph and not attention_inputs.is_prefill:
             bs = int(attention_inputs.input_lengths.size(0))
             selection_complete = bs in self.backend_plan
-            name = self.backend_plan.get(bs)
-            if selection_complete and name is not None:
+            impl_cls = self.backend_plan.get(bs)
+            if selection_complete and impl_cls is not None:
                 from rtp_llm.models_py.modules.factory.attention.dispatch import (
                     backend_selector,
                 )
 
                 inst = backend_selector.instantiate_decode_impl(
-                    self, attention_inputs, name, is_cuda_graph
+                    self, attention_inputs, impl_cls, is_cuda_graph
                 )
+                name = impl_cls.__name__
                 if self._logged_decode_backend.get(bs) != name:
                     self._logged_decode_backend[bs] = name
                     logging.info(

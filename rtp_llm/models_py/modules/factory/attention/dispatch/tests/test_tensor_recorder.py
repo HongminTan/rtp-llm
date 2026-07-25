@@ -98,6 +98,27 @@ def _install_fake_wrapper(recorder, active_ids=(0, 1), value=1.0):
     )
 
 
+def _install_fake_prefill_wrapper(recorder, phase, active_ids=(0, 1), value=1.0):
+    prefix = (
+        torch.zeros(len(active_ids), dtype=torch.int32)
+        if phase == "plain"
+        else torch.full((len(active_ids),), 4, dtype=torch.int32)
+    )
+    recorder._wrapper = SimpleNamespace(
+        layer_records=_layers(value),
+        head_num=2,
+        kv_head_num=1,
+        head_dim=2,
+        dtype=torch.bfloat16,
+        is_prefill=True,
+        sequence_lengths=torch.empty(0, dtype=torch.int32),
+        input_lengths=torch.ones(len(active_ids), dtype=torch.int32),
+        prefix_lengths=prefix,
+        cu_seqlens=torch.arange(len(active_ids) + 1, dtype=torch.int32),
+        active_sequence_ids=tuple(active_ids),
+    )
+
+
 def _record(
     recorder,
     scenario,
@@ -115,6 +136,26 @@ def _record(
         gate_qualifying=gate_qualifying,
     )
     _install_fake_wrapper(recorder, active_ids, value)
+    recorder.stop_run(f"{scenario}::{impl}::{phase}")
+
+
+def _record_prefill(
+    recorder,
+    scenario,
+    impl,
+    phase,
+    active_ids=(0, 1),
+    value=1.0,
+    gate_qualifying=True,
+):
+    recorder.start_run(
+        scenario,
+        impl,
+        phase,
+        active_ids,
+        gate_qualifying=gate_qualifying,
+    )
+    _install_fake_prefill_wrapper(recorder, phase, active_ids, value)
     recorder.stop_run(f"{scenario}::{impl}::{phase}")
 
 
@@ -329,9 +370,7 @@ def test_candidate_snapshot_and_manifest_finalize_have_no_collective():
     recorder = TensorRecorder(_Model(), record_qkv=False)
     _record(recorder, "scenario", "golden", "decode_0")
     snapshot = recorder.candidate_snapshot("decode_0")
-    assert snapshot["protocol_version"] == 2
     assert len(snapshot["registry"]) == len(snapshot["viable_mask"])
-    assert isinstance(snapshot["registry_fingerprint"], int)
     candidate = snapshot["registry"][0]
     recorder._candidates["decode_0"] = [candidate]
     snapshot = recorder.candidate_snapshot("decode_0")
@@ -340,17 +379,14 @@ def test_candidate_snapshot_and_manifest_finalize_have_no_collective():
     _record(recorder, "scenario", candidate, "decode_0")
 
     result = recorder.finalize_decode_gate("BASE")
-    assert result["status"] == "READY"
+    assert result["valid"]
     assert result["applicable_mask"][0] == 1
-    assert result["verified_mask"][0] == 1
     assert result["passed_mask"][0] == 1
-    assert result["soft_outlier_counts"][0] == 0
-    assert isinstance(result["manifest_fingerprint"], int)
     with unittest.TestCase().assertRaisesRegex(RuntimeError, "already finalized"):
         recorder.finalize_decode_gate("BASE")
 
 
-def test_manifest_gate_qualifying_is_frozen_and_fingerprinted():
+def test_manifest_gate_qualifying_is_frozen_and_controls_applicability():
     recorder = TensorRecorder(_Model(), record_qkv=False)
     _record(
         recorder,
@@ -377,35 +413,37 @@ def test_manifest_gate_qualifying_is_frozen_and_fingerprinted():
         gate_qualifying=False,
     )
     assert not recorder._manifest[("diagnostic", "decode_0")].gate_qualifying
-    diagnostic_fingerprint = recorder.finalize_decode_gate("BASE")[
-        "manifest_fingerprint"
-    ]
+    diagnostic = recorder.finalize_decode_gate("BASE")
+    assert diagnostic["valid"]
+    assert diagnostic["applicable_mask"][0] == 0
+    assert diagnostic["passed_mask"][0] == 0
 
     qualifying = TensorRecorder(_Model(), record_qkv=False)
     _record(qualifying, "diagnostic", "golden", "decode_0")
     candidate = qualifying.candidate_snapshot("decode_0")["registry"][0]
     qualifying.set_expected_candidates("decode_0", [candidate])
     _record(qualifying, "diagnostic", candidate, "decode_0")
-    qualifying_fingerprint = qualifying.finalize_decode_gate("BASE")[
-        "manifest_fingerprint"
-    ]
-    assert diagnostic_fingerprint != qualifying_fingerprint
+    qualifying_result = qualifying.finalize_decode_gate("BASE")
+    assert qualifying_result["valid"]
+    assert qualifying_result["applicable_mask"][0] == 1
+    assert qualifying_result["passed_mask"][0] == 1
 
 
-def test_finalize_reports_registry_aligned_soft_outlier_count():
+def test_finalize_rejects_single_fp8_threshold_failure():
     recorder = TensorRecorder(_Model(), record_qkv=False)
     _record(recorder, "scenario", "golden", "decode_0")
     candidate = recorder.candidate_snapshot("decode_0")["registry"][0]
     recorder.set_expected_candidates("decode_0", [candidate])
     recorder.start_run("scenario", candidate, "decode_0", [0, 1])
     _install_fake_wrapper(recorder)
-    recorder._wrapper.layer_records[0].output.mul_(1.23)
+    # 1.30x scale: nrmse 0.259 trips the hard 0.20 fence (cos is SNR-gated and
+    # mean_ulp sits below the artifact-backed 25.0 threshold at this scale).
+    recorder._wrapper.layer_records[0].output.mul_(1.30)
     recorder.stop_run(f"scenario::{candidate}::decode_0")
 
     result = recorder.finalize_decode_gate("FP8")
-    assert result["status"] == "READY"
-    assert result["passed_mask"][0] == 1
-    assert result["soft_outlier_counts"][0] == 1
+    assert result["valid"]
+    assert result["passed_mask"][0] == 0
 
 
 def test_candidate_missing_is_ready_but_not_verified_or_passed():
@@ -414,10 +452,64 @@ def test_candidate_missing_is_ready_but_not_verified_or_passed():
     candidate = recorder.candidate_snapshot("decode_0")["registry"][0]
     recorder.set_expected_candidates("decode_0", [candidate])
     result = recorder.finalize_decode_gate("BASE")
-    assert result["status"] == "READY"
+    assert result["valid"]
     assert result["applicable_mask"][0] == 1
-    assert result["verified_mask"][0] == 0
     assert result["passed_mask"][0] == 0
+
+
+def test_finalize_prefill_gate_uses_prefill_registry_and_records():
+    recorder = TensorRecorder(_Model(), record_qkv=False)
+    _record_prefill(recorder, "scenario", "golden", "plain")
+    snapshot = recorder.candidate_snapshot("plain")
+    from rtp_llm.models_py.modules.factory.attention.attn_factory import (
+        PREFILL_MHA_IMPS,
+    )
+
+    assert snapshot["registry"] == [cls.__name__ for cls in PREFILL_MHA_IMPS]
+    candidate = snapshot["registry"][0]
+    recorder.set_expected_candidates("plain", [candidate])
+    _record_prefill(recorder, "scenario", candidate, "plain")
+    _record_prefill(recorder, "scenario", "golden", "prefix")
+    recorder.set_expected_candidates("prefix", [candidate])
+    _record_prefill(recorder, "scenario", candidate, "prefix")
+
+    result = recorder.finalize_prefill_gate("BASE")
+    assert result["valid"]
+    assert result["registry"] == snapshot["registry"]
+    assert result["applicable_mask"][0] == 1
+    assert result["passed_mask"][0] == 1
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "already finalized"):
+        recorder.finalize_prefill_gate("BASE")
+
+
+def test_each_domain_finalizes_once_on_the_same_recorder():
+    recorder = TensorRecorder(_Model(), record_qkv=False)
+    _record(recorder, "scenario", "golden", "decode_0")
+    decode_candidate = recorder.candidate_snapshot("decode_0")["registry"][0]
+    recorder.set_expected_candidates("decode_0", [decode_candidate])
+    _record(recorder, "scenario", decode_candidate, "decode_0")
+    _record_prefill(recorder, "scenario", "golden", "plain")
+    prefill_candidate = recorder.candidate_snapshot("plain")["registry"][0]
+    recorder.set_expected_candidates("plain", [prefill_candidate])
+    _record_prefill(recorder, "scenario", prefill_candidate, "plain")
+
+    decode_result = recorder.finalize_decode_gate("BASE")
+    prefill_result = recorder.finalize_prefill_gate("BASE")
+    assert decode_result["valid"] and prefill_result["valid"]
+    assert decode_result["passed_mask"][0] == 1
+    assert prefill_result["passed_mask"][0] == 1
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "already finalized"):
+        recorder.finalize_decode_gate("BASE")
+    with unittest.TestCase().assertRaisesRegex(RuntimeError, "already finalized"):
+        recorder.start_run("scenario", "golden", "decode_1", [0, 1])
+
+
+def test_finalize_prefill_gate_without_prefill_manifest_is_invalid():
+    recorder = TensorRecorder(_Model(), record_qkv=False)
+    _record(recorder, "scenario", "golden", "decode_0")
+    recorder.set_expected_candidates("decode_0", [])
+    result = recorder.finalize_prefill_gate("BASE")
+    assert not result["valid"]
 
 
 def test_invalid_golden_or_nonapplicable_record_is_unavailable():
@@ -428,8 +520,7 @@ def test_invalid_golden_or_nonapplicable_record_is_unavailable():
     recorder.stop_run("scenario::golden::decode_0")
     recorder.set_expected_candidates("decode_0", [])
     result = recorder.finalize_decode_gate("BASE")
-    assert result["status"] == "UNAVAILABLE"
-    assert "golden" in result["reason"]
+    assert not result["valid"]
 
     recorder = TensorRecorder(_Model(), record_qkv=False)
     _record(recorder, "scenario", "golden", "decode_0")
@@ -453,8 +544,7 @@ def test_invalid_golden_or_nonapplicable_record_is_unavailable():
         )
     ]
     result = recorder.finalize_decode_gate("BASE")
-    assert result["status"] == "UNAVAILABLE"
-    assert "non-applicable" in result["reason"]
+    assert not result["valid"]
 
 
 class TensorRecorderTest(unittest.TestCase):

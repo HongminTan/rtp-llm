@@ -71,16 +71,16 @@ void PyWrappedModel::triggerInitCapture() {
 #endif
 }
 
-void PyWrappedModel::setDecodeBackendGate(const std::string&              status,
-                                          const std::vector<std::string>& passed,
-                                          const std::vector<std::string>& verified,
-                                          const std::string&              reason,
-                                          int64_t                         registry_fingerprint,
-                                          int64_t                         manifest_fingerprint) {
-    RTP_LLM_CHECK_WITH_INFO(!capture_done_, "decode backend gate must be injected before CUDA graph capture");
+void PyWrappedModel::setAttentionBackendGate(const std::optional<std::vector<std::string>>& decode_passed,
+                                             const std::optional<std::vector<std::string>>& prefill_passed) {
+    RTP_LLM_CHECK_WITH_INFO(!capture_done_, "attention backend gate must be injected before CUDA graph capture");
+    RTP_LLM_CHECK_WITH_INFO(decode_passed.has_value() || prefill_passed.has_value(),
+                            "at least one attention backend gate must be enabled");
     py::gil_scoped_acquire gil;
-    py_model_.attr("set_decode_backend_gate")(
-        status, passed, verified, reason, registry_fingerprint, manifest_fingerprint);
+    py::object             decode_names  = decode_passed.has_value() ? py::cast(*decode_passed) : py::none();
+    py::object             prefill_names = prefill_passed.has_value() ? py::cast(*prefill_passed) : py::none();
+    py_model_.attr("set_attention_backend_gate")(py::arg("decode_passed_names")  = decode_names,
+                                                 py::arg("prefill_passed_names") = prefill_names);
 }
 
 void PyWrappedModel::releaseBuffers() {

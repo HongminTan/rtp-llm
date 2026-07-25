@@ -99,7 +99,7 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
 
     std::optional<WarmUpResult> warm_up_result = std::nullopt;
 #if USING_CUDA
-    DecodeBackendGate decode_backend_gate = DecodeBackendGate::notRequested();
+    std::optional<std::vector<std::string>> decode_gate_passed;
     if (runtime_config.warm_up && (!model_config_.mm_model_config.is_multimodal)
         && !ffn_disaggregate_config.enable_ffn_disaggregate) {
         // warm up
@@ -118,16 +118,19 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
         RTP_LLM_LOG_INFO("skip warm up.");
     }
 
-    auto gate_or = runAccuracyCheckWithTemporaryCache(params, warm_up_result);
-    if (!gate_or.ok()) {
-        if (dynamic_decode_detail::shouldDeferCapture(
-                /*warm_up=*/false, params.hw_kernel_config, params.sp_config.type)) {
-            RTP_LLM_FAIL("dynamic decode precision gate failed: %s", gate_or.status().ToString().c_str());
+    const bool decode_gate_required = dynamic_decode_detail::shouldDeferCapture(
+        /*warm_up=*/false, params.hw_kernel_config, params.sp_config.type);
+    if (runtime_config.enable_accuracy_check || (decode_gate_required && !params.py_model.is_none())) {
+        auto gate_or = runAccuracyCheckWithTemporaryCache(params, warm_up_result);
+        if (!gate_or.ok()) {
+            if (decode_gate_required) {
+                RTP_LLM_FAIL("dynamic decode precision gate failed: %s", gate_or.status().ToString().c_str());
+            }
+            RTP_LLM_LOG_WARNING("accuracy check did not complete, continuing startup: %s",
+                                gate_or.status().ToString().c_str());
+        } else if (decode_gate_required) {
+            decode_gate_passed = std::move(gate_or).value();
         }
-        RTP_LLM_LOG_WARNING("accuracy check did not complete, continuing startup: %s",
-                            gate_or.status().ToString().c_str());
-    } else {
-        decode_backend_gate = std::move(gate_or).value();
     }
 #else
     RTP_LLM_LOG_INFO("skip warm up and accuracy check on non-CUDA platform.");
@@ -157,18 +160,11 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
             RTP_LLM_CHECK_WITH_INFO(normal_executor, "dynamic decode gate requires NormalExecutor");
             auto* py_model = dynamic_cast<PyWrappedModel*>(normal_executor->getModel());
             RTP_LLM_CHECK_WITH_INFO(py_model, "dynamic decode gate requires PyWrappedModel");
-            py_model->setDecodeBackendGate(decode_backend_gate.statusString(),
-                                           decode_backend_gate.passed,
-                                           decode_backend_gate.verified,
-                                           decode_backend_gate.reason,
-                                           decode_backend_gate.registry_fingerprint,
-                                           decode_backend_gate.manifest_fingerprint);
-            RTP_LLM_LOG_INFO("dynamic_decode_gate_transfer_complete status=%s passed=%zu verified=%zu reason=%s "
-                             "tp_rank=%ld dp_rank=%ld",
-                             decode_backend_gate.statusString(),
-                             decode_backend_gate.passed.size(),
-                             decode_backend_gate.verified.size(),
-                             decode_backend_gate.reason.c_str(),
+            RTP_LLM_CHECK_WITH_INFO(decode_gate_passed.has_value() && !decode_gate_passed->empty(),
+                                    "dynamic decode gate result must be present and non-empty before injection");
+            py_model->setAttentionBackendGate(decode_gate_passed, std::nullopt);
+            RTP_LLM_LOG_INFO("dynamic_decode_gate_transfer_complete passed=%zu tp_rank=%ld dp_rank=%ld",
+                             decode_gate_passed->size(),
                              (long)parallelism_config.tp_rank,
                              (long)parallelism_config.dp_rank);
         }
@@ -641,36 +637,35 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
     }
 }
 
-absl::StatusOr<DecodeBackendGate>
+absl::StatusOr<std::vector<std::string>>
 NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&            params,
                                                  const std::optional<WarmUpResult>& warm_up_result) {
 #if !USING_CUDA
     (void)params;
     (void)warm_up_result;
-    return DecodeBackendGate::notRequested("unsupported_platform");
+    return absl::UnimplementedError("attention precision gate requires CUDA");
 #else
     const bool dynamic_gate_required = dynamic_decode_detail::shouldDeferCapture(
         /*warm_up=*/false, params.hw_kernel_config, params.sp_config.type);
     if (!runtime_config.enable_accuracy_check && !dynamic_gate_required) {
-        return DecodeBackendGate::notRequested();
+        return absl::FailedPreconditionError("accuracy check and dynamic decode gate are both disabled");
     }
     if (params.py_model.is_none()) {
-        return DecodeBackendGate::unavailable("python_model_unavailable_test_mode");
+        return absl::FailedPreconditionError("accuracy check requires a Python model");
     }
     if (propose_params_ || model_config_.mm_model_config.is_multimodal
         || ffn_disaggregate_config.enable_ffn_disaggregate || model_config_.attn_config.use_mla
         || parallelism_config.prefill_cp_config.is_enabled()
         || parallelism_config.prefill_cp_config.is_prefill_enabled() || parallelism_config.pp_size != 1) {
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE reason=unsupported_model_or_config");
-        return DecodeBackendGate::unavailable("unsupported_model_or_config");
+        RTP_LLM_LOG_ERROR("dynamic_decode_gate_failed reason=unsupported_model_or_config");
+        return absl::FailedPreconditionError("dynamic decode gate does not support this model or parallel config");
     }
 
     const auto accuracy_scenarios = AccuracyChecker::scenariosForMoeConfig(params.moe_config);
     if (accuracy_scenarios.empty()) {
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE "
-                            "reason=deepep_low_latency_token_budget_too_small budget=%d",
-                            params.moe_config.ll_num_max_token);
-        return DecodeBackendGate::unavailable("deepep_low_latency_token_budget_too_small");
+        RTP_LLM_LOG_ERROR("dynamic_decode_gate_failed reason=deepep_low_latency_token_budget_too_small budget=%d",
+                          params.moe_config.ll_num_max_token);
+        return absl::FailedPreconditionError("DeepEP low-latency token budget is too small for the decode gate");
     }
     const size_t max_accuracy_forward_tokens =
         params.moe_config.use_deepep_moe && params.moe_config.use_deepep_low_latency ?
@@ -697,8 +692,8 @@ NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&        
     auto config                                    = CacheConfigCreator::createConfig(
         model_config_, parallelism_config, runtime_config, tmp_kv_cache_config, warm_up_result);
     if (config.groupNums() != 1) {
-        RTP_LLM_LOG_WARNING("skip accuracy check: requires a single kv-cache group (got %d)", config.groupNums());
-        return DecodeBackendGate::unavailable("multiple_kv_cache_groups");
+        RTP_LLM_LOG_ERROR("dynamic_decode_gate_failed reason=multiple_kv_cache_groups groups=%d", config.groupNums());
+        return absl::FailedPreconditionError("decode precision gate requires one KV-cache group");
     }
     std::shared_ptr<KVCacheManager> tmp_cache_manager;
     bool                            local_pinned_preflight_ok = true;
@@ -719,9 +714,8 @@ NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&        
     }
     cudaSyncAndCheck();
     if (!worldStageSucceeded(local_pinned_preflight_ok, parallelism_config)) {
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE "
-                            "reason=temporary_kv_cache_pinned_preflight_failed");
-        return DecodeBackendGate::unavailable("temporary_kv_cache_pinned_preflight_failed");
+        RTP_LLM_LOG_ERROR("dynamic_decode_gate_failed reason=temporary_kv_cache_pinned_preflight_failed");
+        return absl::InternalError("temporary KV-cache pinned preflight failed on at least one rank");
     }
 
     bool local_cache_ok = true;
@@ -743,11 +737,11 @@ NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&        
     if (!worldStageSucceeded(local_cache_ok, parallelism_config)) {
         tmp_cache_manager.reset();
         c10::cuda::CUDACachingAllocator::emptyCache();
-        RTP_LLM_LOG_WARNING("dynamic_decode_gate_local status=UNAVAILABLE reason=temporary_kv_cache_init_failed");
-        return DecodeBackendGate::unavailable("temporary_kv_cache_init_failed");
+        RTP_LLM_LOG_ERROR("dynamic_decode_gate_failed reason=temporary_kv_cache_init_failed");
+        return absl::InternalError("temporary KV-cache initialization failed on at least one rank");
     }
     RTP_LLM_LOG_INFO("accuracy check: temporary kv cache created with %d blocks", config.block_num);
-    absl::StatusOr<DecodeBackendGate> check_result = absl::InternalError("accuracy check did not run");
+    absl::StatusOr<AttentionGateResult> check_result = absl::InternalError("accuracy check did not run");
 
     resource_context_.cache_manager = tmp_cache_manager;
     resource_context_.role_type     = pd_sep_config.role_type;
@@ -794,7 +788,12 @@ NormalEngine::runAccuracyCheckWithTemporaryCache(const EngineInitParams&        
     tmp_cache_manager.reset();
     cudaSyncAndCheck();
     c10::cuda::CUDACachingAllocator::emptyCache();
-    return check_result;
+    if (!check_result.ok()) {
+        return check_result.status();
+    }
+    // The prefill gate is finalized only once dynamic prefill selection gets a
+    // production switch; this entry point still consumes the decode domain only.
+    return std::move(check_result)->decode_passed;
 #endif
 }
 

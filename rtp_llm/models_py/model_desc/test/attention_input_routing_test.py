@@ -7,11 +7,7 @@ from torch import nn
 
 from rtp_llm.device.device_type import DeviceType
 from rtp_llm.models_py.model_desc.block_map import get_group_tags_for_layers
-from rtp_llm.models_py.model_desc.module_base import (
-    DecodeBackendGateState,
-    DecodeBackendGateStatus,
-    GptModelBase,
-)
+from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.models_py.model_desc.qwen3_next import (
     Qwen3NextMetadata,
     _maybe_write_cp_cache_store,
@@ -40,22 +36,32 @@ class RoutingModel(GptModelBase):
         return self.fmha_group_tags
 
 
+class DecodeImplA:
+    pass
+
+
+class DecodeImplB:
+    pass
+
+
+class PrefillImplA:
+    pass
+
+
+class PrefillImplB:
+    pass
+
+
+class WinnerImpl:
+    pass
+
+
 def _dynamic_routing_model():
     model = RoutingModel(None)
     model.py_hw_kernel_config = SimpleNamespace(enable_dynamic_decode_backend=True)
     model.backend_plan = {}
     model._logged_decode_backend = {}
-    model._decode_backend_gate = DecodeBackendGateState(
-        status=DecodeBackendGateStatus.NOT_REQUESTED,
-        passed=frozenset(),
-        verified=frozenset(),
-        reason="",
-        registry_fingerprint="",
-        manifest_fingerprint="",
-    )
-    model._decode_backend_gate_injected = False
-    model._decode_backend_gate_frozen = False
-    model._logged_decode_gate_fallback = set()
+    model._attention_backend_gate_context = None
     model.device_type = DeviceType.Cuda
     model.kv_cache = object()
     model.fmha_config = object()
@@ -71,6 +77,17 @@ def _dynamic_routing_model():
         getAttentionConfigs=lambda _tp: SimpleNamespace(use_mla=False),
     )
     return model
+
+
+def _install_decode_gate(model, *impl_classes):
+    with patch(
+        "rtp_llm.models_py.model_desc.module_base.DECODE_MHA_IMPS",
+        list(impl_classes),
+    ):
+        model.set_attention_backend_gate(
+            decode_passed_names=[impl_cls.__name__ for impl_cls in impl_classes],
+            prefill_passed_names=None,
+        )
 
 
 def _decode_inputs(bs=2, *, is_prefill=False):
@@ -262,7 +279,7 @@ class AttentionInputRoutingTest(unittest.TestCase):
         model = _dynamic_routing_model()
         attention_inputs = _decode_inputs()
         winner_impl = object()
-        model.backend_plan[2] = "WinnerImpl"
+        model.backend_plan[2] = WinnerImpl
         with (
             patch(
                 "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
@@ -299,7 +316,7 @@ class AttentionInputRoutingTest(unittest.TestCase):
 
         model = _dynamic_routing_model()
         attention_inputs = _decode_inputs()
-        model.backend_plan[2] = "WinnerImpl"
+        model.backend_plan[2] = WinnerImpl
         with (
             patch(
                 "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
@@ -320,7 +337,7 @@ class AttentionInputRoutingTest(unittest.TestCase):
         factory.assert_not_called()
         self.assertEqual(model._logged_decode_backend, {})
 
-    def test_not_requested_gate_writes_explicit_miss_without_selector(self):
+    def test_decode_selection_before_gate_installation_is_wiring_error(self):
         model = _dynamic_routing_model()
         attention_inputs = _decode_inputs()
         from rtp_llm.models_py.modules.factory.attention.dispatch import (
@@ -333,47 +350,71 @@ class AttentionInputRoutingTest(unittest.TestCase):
                 return_value=attention_inputs,
             ),
             patch.object(backend_selector, "run_backend_selection") as selector,
-            patch(
-                "rtp_llm.models_py.model_desc.module_base.logging.warning"
-            ) as warning,
         ):
-            model.select_decode_backend(object())
-            model.select_decode_backend(object())
+            with self.assertRaisesRegex(RuntimeError, "has not been installed"):
+                model.select_decode_backend(object())
 
-        self.assertEqual(model.backend_plan, {2: None})
+        self.assertEqual(model.backend_plan, {})
         selector.assert_not_called()
-        warning.assert_called_once()
-        self.assertTrue(model._decode_backend_gate_frozen)
-        with self.assertRaisesRegex(RuntimeError, "frozen after selector use"):
-            model.set_decode_backend_gate(
-                "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
+
+    def test_enabled_gate_rejects_empty_allowlist(self):
+        model = _dynamic_routing_model()
+        with self.assertRaisesRegex(ValueError, "must be non-empty"):
+            model.set_attention_backend_gate(
+                decode_passed_names=[], prefill_passed_names=None
             )
 
-    def test_unavailable_and_ready_empty_gates_do_not_call_selector(self):
-        from rtp_llm.models_py.modules.factory.attention.dispatch import (
-            backend_selector,
+    def test_prefill_gate_context_resolves_classes_once(self):
+        model = _dynamic_routing_model()
+        with (
+            patch(
+                "rtp_llm.models_py.model_desc.module_base.DECODE_MHA_IMPS",
+                [DecodeImplA, DecodeImplB],
+            ),
+            patch(
+                "rtp_llm.models_py.model_desc.module_base.PREFILL_MHA_IMPS",
+                [PrefillImplA, PrefillImplB],
+            ),
+        ):
+            model.set_attention_backend_gate(
+                decode_passed_names=["DecodeImplA"],
+                prefill_passed_names=["PrefillImplB", "PrefillImplA"],
+            )
+
+        self.assertEqual(model.get_decode_gate_passed(), frozenset({DecodeImplA}))
+        self.assertEqual(
+            model.get_prefill_gate_passed(),
+            frozenset({PrefillImplA, PrefillImplB}),
         )
 
-        for status, verified, reason in (
-            ("UNAVAILABLE", [], "manifest_mismatch"),
-            ("READY", ["XQADecodeImpl"], "precision_failed"),
-        ):
-            with self.subTest(status=status):
-                model = _dynamic_routing_model()
-                model.set_decode_backend_gate(
-                    status, [], verified, reason, "registry", "manifest"
-                )
-                with (
-                    patch(
-                        "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
-                        return_value=_decode_inputs(),
-                    ),
-                    patch.object(backend_selector, "run_backend_selection") as selector,
-                ):
-                    model.select_decode_backend(object())
+    def test_prefill_getter_requires_enabled_domain_and_installation(self):
+        model = _dynamic_routing_model()
+        with self.assertRaisesRegex(RuntimeError, "has not been installed"):
+            model.get_prefill_gate_passed()
 
-                self.assertEqual(model.backend_plan, {2: None})
-                selector.assert_not_called()
+        _install_decode_gate(model, DecodeImplA)
+        with self.assertRaisesRegex(RuntimeError, "not enabled"):
+            model.get_prefill_gate_passed()
+        self.assertEqual(model.get_decode_gate_passed(), frozenset({DecodeImplA}))
+
+    def test_prefill_gate_rejects_duplicate_and_unknown_names(self):
+        with patch(
+            "rtp_llm.models_py.model_desc.module_base.PREFILL_MHA_IMPS",
+            [PrefillImplA, PrefillImplB],
+        ):
+            model = _dynamic_routing_model()
+            with self.assertRaisesRegex(ValueError, "duplicates"):
+                model.set_attention_backend_gate(
+                    decode_passed_names=None,
+                    prefill_passed_names=["PrefillImplA", "PrefillImplA"],
+                )
+            self.assertIsNone(model._attention_backend_gate_context)
+            with self.assertRaisesRegex(ValueError, "unknown backend names"):
+                model.set_attention_backend_gate(
+                    decode_passed_names=None,
+                    prefill_passed_names=["NoSuchPrefillImpl"],
+                )
+            self.assertIsNone(model._attention_backend_gate_context)
 
     def test_ready_gate_filters_selector_and_records_normal_plan_miss(self):
         from rtp_llm.models_py.modules.factory.attention.dispatch import (
@@ -381,14 +422,7 @@ class AttentionInputRoutingTest(unittest.TestCase):
         )
 
         model = _dynamic_routing_model()
-        model.set_decode_backend_gate(
-            "READY",
-            ["XQADecodeImpl"],
-            ["XQAImpl", "XQADecodeImpl"],
-            "",
-            123,
-            456,
-        )
+        _install_decode_gate(model, DecodeImplB)
         with (
             patch(
                 "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
@@ -401,25 +435,22 @@ class AttentionInputRoutingTest(unittest.TestCase):
             model.select_decode_backend(object())
 
         selector.assert_called_once_with(
-            model, ANY, gate_passed=frozenset({"XQADecodeImpl"})
+            model, ANY, gate_passed=frozenset({DecodeImplB})
         )
         self.assertEqual(model.backend_plan, {2: None})
 
     def test_gate_setter_clears_plans_and_rejects_updates_after_selection(self):
         model = _dynamic_routing_model()
-        model.backend_plan[2] = "OldImpl"
+        model.backend_plan[2] = DecodeImplA
         model._logged_decode_backend[2] = "OldImpl"
-        model._logged_decode_gate_fallback.add((2, "old", "old"))
 
-        model.set_decode_backend_gate(
-            "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
-        )
+        _install_decode_gate(model, DecodeImplA)
         self.assertEqual(model.backend_plan, {})
         self.assertEqual(model._logged_decode_backend, {})
-        self.assertEqual(model._logged_decode_gate_fallback, set())
-        with self.assertRaisesRegex(RuntimeError, "already been injected"):
-            model.set_decode_backend_gate(
-                "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
+        with self.assertRaisesRegex(RuntimeError, "already been installed"):
+            model.set_attention_backend_gate(
+                decode_passed_names=[DecodeImplA.__name__],
+                prefill_passed_names=None,
             )
 
         with patch(
@@ -434,10 +465,6 @@ class AttentionInputRoutingTest(unittest.TestCase):
                 backend_selector, "run_backend_selection", return_value=None
             ):
                 model.select_decode_backend(object())
-        with self.assertRaisesRegex(RuntimeError, "frozen after selector use"):
-            model.set_decode_backend_gate(
-                "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
-            )
 
     def test_unexpected_selector_exception_propagates_without_plan(self):
         from rtp_llm.models_py.modules.factory.attention.dispatch import (
@@ -445,9 +472,7 @@ class AttentionInputRoutingTest(unittest.TestCase):
         )
 
         model = _dynamic_routing_model()
-        model.set_decode_backend_gate(
-            "READY", ["XQAImpl"], ["XQAImpl"], "", "registry", "manifest"
-        )
+        _install_decode_gate(model, DecodeImplA)
         with (
             patch(
                 "rtp_llm.models_py.model_desc.module_base.get_attention_inputs_value",
@@ -474,7 +499,7 @@ class AttentionInputRoutingTest(unittest.TestCase):
         ):
             model.select_decode_backend(object())
         self.assertEqual(model.backend_plan, {})
-        self.assertFalse(model._decode_backend_gate_frozen)
+        self.assertIsNone(model._attention_backend_gate_context)
 
         model.py_hw_kernel_config.enable_dynamic_decode_backend = True
         with (

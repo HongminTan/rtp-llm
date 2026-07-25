@@ -93,55 +93,53 @@ _NAMES = ["PyFlashinferDecodeImpl", "XQADecodeImpl"]
 
 # _eligible respects fmha_config
 def test_eligible_excludes_flashinfer_when_disabled():
-    with _patch_impls(_NAMES):
+    with _patch_impls(_NAMES) as impls:
         eligible = backend_selector._eligible(
             None,
             None,
             None,
             _fmha_config(disable_flashinfer_native=True),
-            frozenset(_NAMES),
+            frozenset(impls),
         )
-    assert "PyFlashinferDecodeImpl" not in eligible
-    assert "XQADecodeImpl" in eligible
+    assert [impl.__name__ for impl in eligible] == ["XQADecodeImpl"]
 
 
 def test_eligible_excludes_xqa_when_disabled():
-    with _patch_impls(_NAMES):
+    with _patch_impls(_NAMES) as impls:
         eligible = backend_selector._eligible(
             None,
             None,
             None,
             _fmha_config(enable_xqa=False),
-            frozenset(_NAMES),
+            frozenset(impls),
         )
-    assert "XQADecodeImpl" not in eligible
-    assert "PyFlashinferDecodeImpl" in eligible
+    assert [impl.__name__ for impl in eligible] == ["PyFlashinferDecodeImpl"]
 
 
 def test_eligible_keeps_all_when_nothing_disabled():
-    with _patch_impls(_NAMES):
+    with _patch_impls(_NAMES) as impls:
         eligible = backend_selector._eligible(
-            None, None, None, _fmha_config(), frozenset(_NAMES)
+            None, None, None, _fmha_config(), frozenset(impls)
         )
-    assert set(eligible) == set(_NAMES)
+    assert eligible == impls
 
 
 def test_eligible_none_fmha_config_keeps_all():
-    with _patch_impls(_NAMES):
-        eligible = backend_selector._eligible(None, None, None, None, frozenset(_NAMES))
-    assert set(eligible) == set(_NAMES)
+    with _patch_impls(_NAMES) as impls:
+        eligible = backend_selector._eligible(None, None, None, None, frozenset(impls))
+    assert eligible == impls
 
 
 def test_eligible_intersects_precision_gate():
-    with _patch_impls(_NAMES):
+    with _patch_impls(_NAMES) as impls:
         eligible = backend_selector._eligible(
             None,
             None,
             None,
             _fmha_config(),
-            frozenset({"XQADecodeImpl"}),
+            frozenset({impls[1]}),
         )
-    assert eligible == ["XQADecodeImpl"]
+    assert eligible == [impls[1]]
 
 
 def test_eligible_empty_precision_gate_excludes_all():
@@ -159,10 +157,13 @@ def test_run_backend_selection_requires_explicit_precision_gate():
 
     with (
         mock.patch.object(backend_selector.torch, "full") as allocate_control,
-        unittest.TestCase().assertRaisesRegex(TypeError, "explicit frozenset"),
+        unittest.TestCase().assertRaisesRegex(TypeError, "non-empty frozenset"),
     ):
         backend_selector.run_backend_selection(model, inputs, gate_passed=None)
     allocate_control.assert_not_called()
+
+    with unittest.TestCase().assertRaisesRegex(TypeError, "non-empty frozenset"):
+        backend_selector.run_backend_selection(model, inputs, gate_passed=frozenset())
 
 
 def test_eligible_support_false_is_normal_and_does_not_construct():
@@ -178,7 +179,7 @@ def test_eligible_support_false_is_normal_and_does_not_construct():
             None,
             None,
             _fmha_config(),
-            frozenset({unsupported.__name__}),
+            frozenset({unsupported}),
         )
 
     assert eligible == []
@@ -195,10 +196,10 @@ def test_eligible_does_not_construct_only_to_check_cuda_graph_support():
             None,
             None,
             _fmha_config(),
-            frozenset({candidate.__name__}),
+            frozenset({candidate}),
         )
 
-    assert eligible == ["PyFlashinferDecodeImpl"]
+    assert eligible == [candidate]
     assert candidate.construction_count == 0
     assert candidate.graph_support_check_count == 0
 
@@ -288,7 +289,6 @@ def _assert_fatal_probe(
     bench_result=None,
     synchronize_side_effect=None,
     support_probe=False,
-    impl_lookup_side_effect=None,
     code=None,
 ):
     model, inputs, _, _ = _selection_fixture(tp_size=2)
@@ -304,8 +304,8 @@ def _assert_fatal_probe(
         stack.enter_context(
             mock.patch.object(
                 backend_selector,
-                "_decode_registry",
-                return_value=[impl_cls.__name__],
+                "_decode_registry_classes",
+                return_value=[impl_cls],
             )
         )
         stack.enter_context(
@@ -355,15 +355,7 @@ def _assert_fatal_probe(
                 mock.patch.object(
                     backend_selector,
                     "_eligible",
-                    return_value=[impl_cls.__name__],
-                )
-            )
-            stack.enter_context(
-                mock.patch.object(
-                    backend_selector,
-                    "_impl_by_name",
-                    return_value=impl_cls,
-                    side_effect=impl_lookup_side_effect,
+                    return_value=[impl_cls],
                 )
             )
 
@@ -371,7 +363,7 @@ def _assert_fatal_probe(
             backend_selector.run_backend_selection(
                 model,
                 inputs,
-                gate_passed=frozenset({impl_cls.__name__}),
+                gate_passed=frozenset({impl_cls}),
                 warmup=0,
                 iters=1,
             )
@@ -437,14 +429,6 @@ def test_post_benchmark_synchronize_exception_is_fatal():
     )
 
 
-def test_post_support_impl_lookup_exception_is_fatal():
-    impl_cls = _make_fake_impl("FailingLookupImpl")
-    _assert_fatal_probe(
-        impl_cls,
-        impl_lookup_side_effect=RuntimeError("implementation lookup failed"),
-    )
-
-
 def test_post_probe_winner_code_write_exception_is_fatal():
     impl_cls = _make_fake_impl("FailingWinnerWriteImpl")
     _assert_fatal_probe(
@@ -463,6 +447,7 @@ def _assert_selection_control_failure(
     code=None,
 ):
     model, inputs, _, _ = _selection_fixture(tp_size=2, tp_rank=tp_rank)
+    candidate = _make_fake_impl("XQADecodeImpl")
     collective_module = types.ModuleType("collective_torch")
     collective_module.Group = types.SimpleNamespace(TP=object())
     collective_module.broadcast = mock.Mock(side_effect=broadcast_side_effect)
@@ -471,7 +456,7 @@ def _assert_selection_control_failure(
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             mock.patch.object(
-                backend_selector, "_decode_registry", return_value=["XQADecodeImpl"]
+                backend_selector, "_decode_registry_classes", return_value=[candidate]
             )
         )
         stack.enter_context(
@@ -507,7 +492,7 @@ def _assert_selection_control_failure(
 
         try:
             backend_selector.run_backend_selection(
-                model, inputs, gate_passed=frozenset()
+                model, inputs, gate_passed=frozenset({candidate})
             )
         except RuntimeError as error:
             assert str(error) == "fatal probe termination returned unexpectedly"
@@ -557,6 +542,7 @@ def test_control_tensor_readback_failure_is_fatal():
 
 def test_non_root_logs_received_plan_after_tp_broadcast():
     model, inputs, _, _ = _selection_fixture(tp_size=2, tp_rank=1)
+    candidate = _make_fake_impl("XQADecodeImpl")
     code = _FakeCode()
     collective_module = types.ModuleType("collective_torch")
     collective_module.Group = types.SimpleNamespace(TP=object())
@@ -570,7 +556,7 @@ def test_non_root_logs_received_plan_after_tp_broadcast():
     with contextlib.ExitStack() as stack:
         stack.enter_context(
             mock.patch.object(
-                backend_selector, "_decode_registry", return_value=["XQADecodeImpl"]
+                backend_selector, "_decode_registry_classes", return_value=[candidate]
             )
         )
         stack.enter_context(
@@ -589,10 +575,10 @@ def test_non_root_logs_received_plan_after_tp_broadcast():
             )
         )
         choice = backend_selector.run_backend_selection(
-            model, inputs, gate_passed=frozenset()
+            model, inputs, gate_passed=frozenset({candidate})
         )
 
-    assert choice == "XQADecodeImpl"
+    assert choice is candidate
     collective_module.broadcast.assert_called_once()
     info.assert_called_once_with(
         "dynamic_decode_plan_received bs=%d registry_idx=%d backend=%s "
@@ -619,7 +605,7 @@ def _select_on_root_for_test(
         attn_configs,
         attn_inputs,
         parallelism_config,
-        frozenset(),
+        frozenset({_make_fake_impl("GateImpl")}),
         [8],
         selector,
         1,
@@ -658,10 +644,6 @@ def test_measured_baseline_uses_registry_priority_without_extra_construction():
     model, attn_configs, attn_inputs, parallelism_config = _root_selection_fixture()
     high_priority = _make_fake_impl("HighPriorityImpl")
     low_priority = _make_fake_impl("LowPriorityImpl")
-    implementations = {
-        high_priority.__name__: high_priority,
-        low_priority.__name__: low_priority,
-    }
     fixed_priority = mock.Mock()
     bench = mock.Mock(return_value=[10.0])
 
@@ -670,7 +652,7 @@ def test_measured_baseline_uses_registry_priority_without_extra_construction():
             mock.patch.object(
                 backend_selector,
                 "_eligible",
-                return_value=[low_priority.__name__, high_priority.__name__],
+                return_value=[low_priority, high_priority],
             )
         )
         stack.enter_context(
@@ -678,13 +660,6 @@ def test_measured_baseline_uses_registry_priority_without_extra_construction():
                 backend_selector,
                 "_decode_registry",
                 return_value=[high_priority.__name__, low_priority.__name__],
-            )
-        )
-        stack.enter_context(
-            mock.patch.object(
-                backend_selector,
-                "_impl_by_name",
-                side_effect=implementations.get,
             )
         )
         stack.enter_context(
@@ -704,7 +679,7 @@ def test_measured_baseline_uses_registry_priority_without_extra_construction():
             model, attn_configs, attn_inputs, parallelism_config
         )
 
-    assert choice == high_priority.__name__
+    assert choice is high_priority
     assert bench.call_count == 2
     assert all(
         call.kwargs["attention_layer_count"] == 32 for call in bench.call_args_list
@@ -727,13 +702,10 @@ def test_production_selector_receives_validated_values_without_clamping():
             },
             clear=True,
         ),
-        mock.patch.object(
-            backend_selector, "_eligible", return_value=[candidate.__name__]
-        ),
+        mock.patch.object(backend_selector, "_eligible", return_value=[candidate]),
         mock.patch.object(
             backend_selector, "_decode_registry", return_value=[candidate.__name__]
         ),
-        mock.patch.object(backend_selector, "_impl_by_name", return_value=candidate),
         mock.patch.object(
             backend_selector.backend_bench,
             "bench_backend_grid",
@@ -746,7 +718,7 @@ def test_production_selector_receives_validated_values_without_clamping():
             model, attn_configs, attn_inputs, parallelism_config
         )
 
-    assert choice == candidate.__name__
+    assert choice is candidate
     stable.assert_called_once_with(
         {candidate.__name__: [4.0]},
         [candidate.__name__],
@@ -788,6 +760,7 @@ def test_selector_config_rejects_each_invalid_explicit_value():
 
 def test_invalid_production_selector_config_fails_before_probe():
     model, inputs, _, _ = _selection_fixture(dp_rank=3)
+    candidate = _make_fake_impl("ConfigImpl")
     fatal = mock.Mock()
     eligible = mock.Mock()
     bench = mock.Mock()
@@ -798,7 +771,9 @@ def test_invalid_production_selector_config_fails_before_probe():
         mock.patch.dict(
             os.environ, {"DYN_DECODE_THRESHOLD": "not-a-number"}, clear=True
         ),
-        mock.patch.object(backend_selector, "_decode_registry", return_value=[]),
+        mock.patch.object(
+            backend_selector, "_decode_registry_classes", return_value=[candidate]
+        ),
         mock.patch.object(backend_selector, "kv_grid", return_value=[8]),
         mock.patch.object(backend_selector.torch, "full", return_value=_FakeCode()),
         mock.patch.object(backend_selector, "_eligible", eligible),
@@ -812,7 +787,7 @@ def test_invalid_production_selector_config_fails_before_probe():
             "fatal configuration termination returned unexpectedly",
         ):
             backend_selector.run_backend_selection(
-                model, inputs, gate_passed=frozenset()
+                model, inputs, gate_passed=frozenset({candidate})
             )
 
     fatal.assert_called_once()
@@ -899,10 +874,7 @@ def test_custom_selector_does_not_read_production_environment():
     custom_selector = mock.Mock(return_value=candidate.__name__)
     with (
         mock.patch.dict(os.environ, {"DYN_DECODE_THRESHOLD": "invalid"}, clear=True),
-        mock.patch.object(
-            backend_selector, "_eligible", return_value=[candidate.__name__]
-        ),
-        mock.patch.object(backend_selector, "_impl_by_name", return_value=candidate),
+        mock.patch.object(backend_selector, "_eligible", return_value=[candidate]),
         mock.patch.object(
             backend_selector.backend_bench,
             "bench_backend_grid",
@@ -918,7 +890,7 @@ def test_custom_selector_does_not_read_production_environment():
             selector=custom_selector,
         )
 
-    assert choice == candidate.__name__
+    assert choice is candidate
     custom_selector.assert_called_once_with({candidate.__name__: [3.0]})
 
 
@@ -933,11 +905,14 @@ def _assert_plan_application_failure(
     expected_stage, *, impl=None, disabled=False, tp_size=1, tp_rank=0
 ):
     name = "PlannedImpl"
+    planned_impl = impl or _make_fake_impl(name)
+    registry = [] if impl is None else [impl]
     model, inputs = _plan_application_fixture(tp_size, tp_rank)
     fatal = mock.Mock()
     with (
-        mock.patch.object(backend_selector, "_decode_registry", return_value=[name]),
-        mock.patch.object(backend_selector, "_impl_by_name", return_value=impl),
+        mock.patch.object(
+            backend_selector, "_decode_registry_classes", return_value=registry
+        ),
         mock.patch(f"{_ATTN_FACTORY}._is_fmha_impl_disabled", return_value=disabled),
         mock.patch.object(
             backend_selector, "_terminate_plan_application_worker", fatal
@@ -947,11 +922,11 @@ def _assert_plan_application_failure(
             backend_selector.DynamicDecodeFatalError,
             "fatal plan application termination returned unexpectedly",
         ):
-            backend_selector.instantiate_decode_impl(model, inputs, name, True)
+            backend_selector.instantiate_decode_impl(model, inputs, planned_impl, True)
 
     fatal.assert_called_once()
     args = fatal.call_args.args
-    assert args[0:3] == (1, name, 0)
+    assert args[0:3] == (1, name, -1 if impl is None else 0)
     assert args[3] is model.parallelism_config
     assert args[4] == expected_stage
     assert isinstance(args[5], BaseException)
@@ -987,6 +962,7 @@ def test_winner_application_failure_semantics_cover_single_and_non_root_tp():
 
 def test_invalid_nonnegative_broadcast_index_is_fatal_but_minus_one_is_miss():
     model, inputs, _, _ = _selection_fixture(tp_size=2, tp_rank=1)
+    candidate = _make_fake_impl("OnlyImpl")
     collective_module = types.ModuleType("collective_torch")
     collective_module.Group = types.SimpleNamespace(TP=object())
 
@@ -1001,7 +977,7 @@ def test_invalid_nonnegative_broadcast_index_is_fatal_but_minus_one_is_miss():
         fatal = mock.Mock()
         with (
             mock.patch.object(
-                backend_selector, "_decode_registry", return_value=["OnlyImpl"]
+                backend_selector, "_decode_registry_classes", return_value=[candidate]
             ),
             mock.patch.object(backend_selector, "kv_grid", return_value=[8]),
             mock.patch.object(backend_selector.torch, "full", return_value=code),
@@ -1020,12 +996,12 @@ def test_invalid_nonnegative_broadcast_index_is_fatal_but_minus_one_is_miss():
                     backend_selector.DynamicDecodeFatalError
                 ):
                     backend_selector.run_backend_selection(
-                        model, inputs, gate_passed=frozenset()
+                        model, inputs, gate_passed=frozenset({candidate})
                     )
             else:
                 assert (
                     backend_selector.run_backend_selection(
-                        model, inputs, gate_passed=frozenset()
+                        model, inputs, gate_passed=frozenset({candidate})
                     )
                     is None
                 )
@@ -1055,11 +1031,11 @@ def test_instantiate_decode_impl_instantiates_when_enabled():
             get_attn_tp_size=lambda: 1,
         ),
     )
-    with _patch_impls(_NAMES):
+    with _patch_impls(_NAMES) as impls:
         inst = backend_selector.instantiate_decode_impl(
             model,
             types.SimpleNamespace(input_lengths=_FakeInputLengths()),
-            "PyFlashinferDecodeImpl",
+            impls[0],
             True,
         )
     assert inst is not None

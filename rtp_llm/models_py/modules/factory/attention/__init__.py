@@ -127,8 +127,12 @@ else:
         PyFlashinferPrefillImpl,
     )
 
-    PREFILL_MHA_IMPS.append(PyFlashinferPrefillImpl)
-    PREFILL_MHA_IMPS.append(PyFlashinferPagedPrefillImpl)
+    if device_type != DeviceType.Cuda:
+        # CUDA already registered the PyFlashinfer prefill pair at its
+        # fixed-priority slot above; a second append would duplicate the
+        # registry position the precision gates key their masks on.
+        PREFILL_MHA_IMPS.append(PyFlashinferPrefillImpl)
+        PREFILL_MHA_IMPS.append(PyFlashinferPagedPrefillImpl)
     DECODE_MHA_IMPS.append(PyFlashinferDecodeImpl)
 
     from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_cp_flashinfer import (
