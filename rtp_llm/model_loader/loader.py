@@ -415,6 +415,7 @@ class ModelLoader:
             device,
             True,
             stacked_key_config=stacked_key_config,
+            local_copyout_filter=tensor_to_weight_map.__contains__,
         )
 
         _inline_count = 0
