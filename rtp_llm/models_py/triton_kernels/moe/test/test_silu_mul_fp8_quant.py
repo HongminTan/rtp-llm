@@ -279,5 +279,65 @@ class SiluMulFp8QuantF32ScaleMaskedTest(unittest.TestCase):
         self._check_valid_rows(q, s, gate_up, 10.0)
 
 
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class PerTokenGroupQuantF32ScaleMaskedTest(unittest.TestCase):
+    """Correctness of the Triton masked quant for the DeepEP-LL layout.
+
+    The framework wrapper's row-major branch ignores masked_m (its
+    MaskedLayoutScheduler only exists in the column-major/UE8M0/fused-silu
+    instantiation), so the SM90 LL path uses this dedicated kernel: only
+    rows below each expert's count are quantized, valid rows must match the
+    plain 2D result.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            per_token_group_quant_f32_scale_masked,
+        )
+
+        cls._fused = staticmethod(per_token_group_quant_f32_scale_masked)
+
+    def _ref_rows(self, x_2d, eps=1e-10, group_size=128):
+        import torch as T
+        M, D = x_2d.shape
+        yg = x_2d.float().view(M, D // group_size, group_size)
+        absmax = yg.abs().amax(dim=-1).clamp_min(eps)
+        scale = absmax / 448.0
+        ref_q = (yg / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        return ref_q.view(M, D), scale
+
+    def test_masked_partial_counts(self):
+        torch.manual_seed(777)
+        E, M, D = 8, 256, 4096
+        x = torch.randn(E, M, D, device="cuda", dtype=torch.bfloat16)
+        counts = torch.randint(0, M + 1, (E,), device="cuda", dtype=torch.int32)
+        counts[0] = 0
+        counts[1] = M
+        q, s = self._fused(x, group_size=128, masked_m=counts)
+        self.assertEqual(q.shape, (E, M, D))
+        self.assertEqual(s.shape, (E, M, D // 128))
+        for e in range(E):
+            c = int(counts[e])
+            if c == 0:
+                continue
+            rq, rs = self._ref_rows(x[e, :c])
+            gq = q[e, :c].to(torch.float32)
+            self.assertLess((gq - rq.to(torch.float32)).abs().max().item(), 1e-1)
+            self.assertTrue(torch.allclose(s[e, :c], rs, rtol=1e-3, atol=1e-9))
+
+    def test_masked_full_equals_unmasked_path(self):
+        torch.manual_seed(778)
+        E, M, D = 4, 256, 1024
+        x = torch.randn(E, M, D, device="cuda", dtype=torch.bfloat16)
+        counts = torch.full((E,), M, device="cuda", dtype=torch.int32)
+        q_m, s_m = self._fused(x, group_size=128, masked_m=counts)
+        q_p, s_p = self._fused(x.view(E * M, D), group_size=128)
+        self.assertTrue(torch.equal(q_m.view(E * M, D).to(torch.float32), q_p.to(torch.float32)))
+        self.assertTrue(torch.equal(s_m.view(E * M, D // 128), s_p))
+
+
 if __name__ == "__main__":
     unittest.main()

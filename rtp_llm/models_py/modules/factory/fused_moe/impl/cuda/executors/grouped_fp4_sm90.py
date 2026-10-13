@@ -28,6 +28,7 @@ EP > 1 dispatch is MegaMoE's job on SM100; on SM90 this executor requires
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict
 
@@ -52,6 +53,7 @@ from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
 )
 from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
     silu_mul_fp8_quant_f32_scale,
+    per_token_group_quant_f32_scale_masked,
 )
 from rtp_llm.models_py.utils.math import align, ceil_div
 
@@ -787,20 +789,27 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         E, M_tot, D_r = recv_x.shape
         assert E == e_local and D_r == D
 
-        # Masked activation quant for the SwiGLU stage only: rows past each
-        # expert's count are garbage the masked GEMM never reads, and at
-        # decode shapes the valid fraction is tiny (N*K*world valid rows of
-        # E*M_tot), so the unmasked activation+quant burned ~1000x redundant
-        # work at bs=1. (The input-side masked quant via the v2 kernel path
-        # stays unmasked: not validated in-server yet.)
+        # Masked activation quant: only the rows each expert actually
+        # received (recv_count). The capacity buffer's padded rows are
+        # garbage the masked GEMM never reads, and at decode shapes the
+        # valid fraction is tiny (N*K*world valid rows of E*M_tot), so the
+        # unmasked quant burned ~1000x redundant work at bs=1 (measured
+        # 2.7 ms/step in the PD decode trace). The v2 masked path was
+        # initially blamed for corrupted output, but that was the wrapper's
+        # 2D stride(-1) bug (fixed); validated since by the full-model PD
+        # golden.
+        recv_x_c = recv_x if recv_x.is_contiguous() else recv_x.contiguous()
         recv_count_i32 = recv_count.to(torch.int32)
-        a_fp8, a_scale = sgl_per_token_group_quant_fp8(
-            recv_x.reshape(E * M_tot, D).contiguous(),
+        # Triton masked quant: the framework sgl wrapper's row-major branch
+        # silently ignores masked_m (its MaskedLayoutScheduler only exists in
+        # the column-major/UE8M0/fused-silu instantiation), so it quantized
+        # the full capacity buffer; this kernel honors the mask and emits
+        # the identical [E, M, G] FP32-scale layout.
+        a_fp8, a_scale = per_token_group_quant_f32_scale_masked(
+            recv_x_c,
             group_size=FP8_BLOCK,
-            eps=1e-4,
-            column_major_scales=False,
-            scale_tma_aligned=False,
-            scale_ue8m0=False,
+            eps=1e-10,
+            masked_m=recv_count_i32,
         )
         expected_m = max(1, min(M_tot, (N * K * world) // max(e_local, 1)))
 

@@ -557,3 +557,133 @@ def silu_mul_fp8_quant_packed_from_parts(
     )
 
     return output_q, output_scale_packed
+
+
+@triton.jit(do_not_specialize=["M_total", "rows_per_expert"])
+def _per_token_group_quant_f32_scale_masked_kernel(
+    input_ptr,  # [E, M, D] BF16 — flat rows; M_total = E*M
+    output_q_ptr,  # [E, M, D] FP8 e4m3fn
+    output_scale_ptr,  # [E, M, D // GROUP_SIZE] FP32 row-major
+    M_total,
+    rows_per_expert,
+    masked_m_ptr,  # [E] int32 valid row counts
+    eps,
+    input_stride_m,
+    output_q_stride_m,
+    output_scale_stride_m,
+    output_scale_stride_g,
+    D: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    pid_g = tl.program_id(0).to(tl.int64)  # which group column
+    pid_m = tl.program_id(1).to(tl.int64)  # which BLOCK_M row tile (global rows)
+    m_offset = pid_m * BLOCK_M
+
+    if m_offset >= M_total:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_n = tl.arange(0, GROUP_SIZE)
+    if HAS_MASK:
+        expert = m_offset // rows_per_expert
+        row_bound = expert * rows_per_expert + tl.load(masked_m_ptr + expert).to(
+            tl.int64
+        )
+    else:
+        row_bound = M_total
+    row_mask = (m_offset + offs_m) < row_bound
+
+    n_offset = pid_g * GROUP_SIZE
+
+    x_ptrs = input_ptr + (m_offset + offs_m[:, None]) * input_stride_m + n_offset + offs_n[None, :]
+    x = tl.load(x_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+
+    # Per-(row, group) absmax -> plain FP8 scale (row-major, matching the
+    # unmasked v2 NaiveScheduler output the SM90 masked GEMMs consume).
+    absmax = tl.max(tl.abs(x), axis=1)
+    scale = tl.maximum(absmax / fp8_max, eps)
+
+    y_q = tl.clamp(x / scale[:, None], fp8_min, fp8_max)
+    q_ptrs = output_q_ptr + (m_offset + offs_m[:, None]) * output_q_stride_m + n_offset + offs_n[None, :]
+    tl.store(q_ptrs, y_q.to(output_q_ptr.dtype.element_ty), mask=row_mask[:, None])
+
+    scale_ptrs = (
+        output_scale_ptr
+        + (m_offset + offs_m) * output_scale_stride_m
+        + pid_g * output_scale_stride_g
+    )
+    tl.store(scale_ptrs, scale, mask=row_mask)
+
+
+def per_token_group_quant_f32_scale_masked(
+    x: torch.Tensor,
+    group_size: int = 128,
+    eps: float = 1e-10,
+    masked_m: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token-group FP8 quant with FP32 row-major scales over the DeepEP-LL
+    grouped-capacity layout.
+
+    The framework ``sgl_per_token_group_quant_fp8`` only honors ``masked_m``
+    on the column-major/UE8M0/fused-silu instantiation (its row-major
+    NaiveScheduler branch silently ignores the mask and quantizes the whole
+    capacity buffer — at decode the valid fraction is <1%). This Triton
+    counterpart quantizes only the rows below each expert's ``masked_m``
+    count and emits the exact ``[E, M, G]`` layout the SM90 masked grouped
+    GEMMs consume.
+    """
+    assert x.is_contiguous(), "x must be contiguous"
+    assert x.dtype == torch.bfloat16, f"expected bf16, got {x.dtype}"
+
+    if masked_m is None:
+        assert x.dim() == 2, f"expected 2D, got {x.shape}"
+        M_total, D = x.shape
+        rows_per_expert = 1
+    else:
+        assert x.dim() == 3, f"expected 3D, got {x.shape}"
+        _, rows_per_expert, D = x.shape
+        M_total = x.shape[0] * rows_per_expert
+        assert rows_per_expert % 64 == 0, (
+            f"rows_per_expert ({rows_per_expert}) must be a multiple of BLOCK_M (64)"
+        )
+        masked_m = masked_m.to(torch.int32)
+
+    assert D % group_size == 0
+    num_groups = D // group_size
+    fp8_dtype = torch.float8_e4m3fn
+    finfo = torch.finfo(fp8_dtype)
+    out_q = torch.empty(x.shape, dtype=fp8_dtype, device=x.device)
+    out_s = torch.empty(x.shape[:-1] + (num_groups,), dtype=torch.float32, device=x.device)
+    if M_total == 0:
+        return out_q, out_s
+
+    BLOCK_M = 64
+    grid = (num_groups, (M_total + BLOCK_M - 1) // BLOCK_M)
+    _per_token_group_quant_f32_scale_masked_kernel[grid](
+        x,
+        out_q,
+        out_s,
+        M_total,
+        rows_per_expert,
+        masked_m if masked_m is not None else x,
+        eps,
+        x.stride(-2),
+        out_q.stride(-2),
+        out_s.stride(-2),
+        out_s.stride(-1),
+        D=D,
+        NUM_GROUPS=num_groups,
+        fp8_min=finfo.min,
+        fp8_max=finfo.max,
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M,
+        HAS_MASK=masked_m is not None,
+        num_warps=max(4, group_size // 32),
+        num_stages=2,
+    )
+    return out_q, out_s
