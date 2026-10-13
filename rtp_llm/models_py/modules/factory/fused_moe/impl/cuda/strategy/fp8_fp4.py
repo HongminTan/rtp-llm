@@ -125,3 +125,48 @@ class CudaLocalLoopStrategy(_CudaFp8Fp4Strategy):
         )
 
         return LocalLoopExecutor
+
+
+class CudaGroupedFp4Sm90Strategy(_CudaFp8Fp4Strategy):
+    """Hopper path: dequantize FP4 experts to FP8, grouped FP8 GEMMs.
+
+    Selected automatically only on SM90 hosts (DeepGEMM's FP4 and MegaMoE
+    kernels are SM100-only there), so SM100 ``auto`` resolution is unchanged.
+    """
+
+    strategy_name = "grouped_fp4_sm90"
+    requires_ep = False
+
+    @classmethod
+    def get_executor_class(cls) -> Type:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.grouped_fp4_sm90 import (
+            GroupedFp4Sm90Executor,
+        )
+
+        return GroupedFp4Sm90Executor
+
+
+class CudaGroupedFp4Sm90EpStrategy(CudaGroupedFp4Sm90Strategy):
+    """Hopper EP path: the same executor with NCCL all-to-all dispatch.
+
+    Requires ``world_size == ep_size`` (e.g. DP8 x EP8): the pass-through
+    :class:`Fp8Fp4Router` is kept because the executor owns dispatch —
+    unlike MegaMoE, which drives its own symmetric-memory router.
+    """
+
+    strategy_name = "grouped_fp4_sm90_ep"
+    requires_ep = True
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.fp8_fp4_router import (
+            Fp8Fp4Router,
+        )
+
+        return StrategyAttributes(
+            router_class=Fp8Fp4Router,
+            executor_class=self.get_executor_class(),
+            quant_config=FusedMoEQuantConfig(
+                quant_dtype="fp8_fp4",
+                block_shape=[128, 32],
+            ),
+        )

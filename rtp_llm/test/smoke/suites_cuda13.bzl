@@ -149,6 +149,70 @@ def cuda13_suites():
                 envs=["DG_JIT_CPP_STANDARD=20"],
                 gpu_type=[cuda13_x86_test_gpu()],
             ),
+            # DeepSeek-V4-Flash on H20 (SM90): the dequant-to-FP8 grouped
+            # executor path (grouped_fp4_sm90 strategy) with a 4-layer cut
+            # of the real checkpoint (~16 GB, single card). Local model path
+            # is replaced by a NAS location once the case is promoted to CI.
+            smoke_test(
+                name="v4_flash_4layer_sm90_h20",
+                task_info="data/model/deepseek_v4/q_r_v4_flash_4layer_h20.json",
+                smoke_args="--warm_up 0 --load_method fastsafetensors --max_seq_len 512 --enable_cuda_graph 1 --decode_capture_config '1,2,4,8' --act_type BF16 --tp_size 1 --world_size 1 --seq_size_per_block 64 --test_block_num 512 --fp8_kv_cache 1 --reserver_runtime_mem_mb 8192",
+                envs=[
+                    "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
+                    "DSV4_TRAP_INVALID_KV_ACCESS=0",
+                ],
+                gpu_type=["H20_CU13"],
+            ),
+            # Full DeepSeek-V4-Flash (43 layers, 155 GB FP4/FP8) on 8x H20:
+            # DP8 x EP8 x TP1 with the grouped_fp4_sm90_ep NCCL all-to-all
+            # executor. Eager decode first (EP graph capture is follow-up).
+            # Full DeepSeek-V4-Flash PD topology on 8x H20: prefill role
+            # (world 4, eager dynamic-split a2a EP) + decode role (world 4,
+            # DeepEP low-latency + CUDA graphs). This is the production
+            # pattern (mirrors the SM100 0731 case): the decode process
+            # runs ONLY decode steps, so every EP forward - eager or
+            # graph-replayed, real or fake stream - enters the same DeepEP
+            # LL dispatch/combine sequence; the mixed-phase collective
+            # mismatch that deadlocks single-process dp+ep+graph cannot
+            # occur (RUN issues/ep-graph-replay-deadlock.md).
+            smoke_test(
+                name="v4_flash_full_pd_dp4ep4_ll_sm90_h20",
+                task_info="data/model/deepseek_v4/q_r_v4_flash_full_pd_dp4ep4_ll_h20.json",
+                smoke_args={
+                    "prefill": "--warm_up 0 --load_method fastsafetensors --max_seq_len 2048 --enable_cuda_graph 0 --act_type BF16 --dp_size 4 --ep_size 4 --tp_size 1 --world_size 4 --moe_strategy grouped_fp4_sm90_ep --seq_size_per_block 256 --test_block_num 1024 --fp8_kv_cache 1 --role_type PREFILL --cache_store_rdma_mode 0 --use_local 1 --reuse_cache 1 --enable_memory_cache 1 --memory_cache_size_mb 8192 --concurrency_limit 1 --max_context_batch_size 1 --reserver_runtime_mem_mb 12288",
+                    "decode": "--warm_up 0 --load_method fastsafetensors --max_seq_len 2048 --enable_cuda_graph 1 --decode_capture_config '1,2,4' --act_type BF16 --dp_size 4 --ep_size 4 --tp_size 1 --world_size 4 --moe_strategy grouped_fp4_sm90_ep --seq_size_per_block 256 --test_block_num 1024 --fp8_kv_cache 1 --role_type DECODE --use_deepep_moe 1 --use_deepep_low_latency 1 --reuse_cache 1 --enable_memory_cache 1 --memory_cache_size_mb 2048 --reserver_runtime_mem_mb 8192 --load_cache_timeout_ms 60000",
+                },
+                envs={
+                    "prefill": [
+                        "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
+                        "DSV4_TRAP_INVALID_KV_ACCESS=0",
+                    ],
+                    "decode": [
+                        "DSV4_EP_DEEPEP_LL=1",
+                        "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
+                        "DSV4_TRAP_INVALID_KV_ACCESS=0",
+                        # The NVSHMEM bootstrap creates a second NCCL comm
+                        # whose NVLS setup allocates multicast buffers; on a
+                        # shared machine those 2KB-class cudaMallocAsync
+                        # calls are the first to OOM. Ring/tree fallback is
+                        # fine for a smoke (deep_ep's own
+                        # NVSHMEM_DISABLE_NVLS does not cover NCCL's NVLS).
+                        "NCCL_NVLS_ENABLE=0",
+                    ],
+                },
+                gpu_type=["H20_CU13"],
+            ),
+            smoke_test(
+                name="v4_flash_full_dp8ep8_sm90_h20",
+                task_info="data/model/deepseek_v4/q_r_v4_flash_full_dp8ep8_h20.json",
+                smoke_args="--warm_up 0 --load_method fastsafetensors --max_seq_len 2048 --enable_cuda_graph 0 --act_type BF16 --dp_size 8 --ep_size 8 --tp_size 1 --world_size 8 --moe_strategy grouped_fp4_sm90_ep --seq_size_per_block 256 --test_block_num 1024 --fp8_kv_cache 1 --concurrency_limit 1 --max_context_batch_size 1 --reserver_runtime_mem_mb 12288",
+                envs=[
+                    "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
+                    "DSV4_TRAP_INVALID_KV_ACCESS=0",
+                ],
+                gpu_type=["H20_CU13"],
+                sleep_time_qr=15,
+            ),
         ],
         tags = ["manual"],
     )

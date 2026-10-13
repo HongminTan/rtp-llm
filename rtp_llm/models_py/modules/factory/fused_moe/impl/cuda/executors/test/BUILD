@@ -275,6 +275,20 @@ cuda13_sm100_py_test(
     ],
 )
 
+# SM90 (Hopper) counterpart: FP4 experts dequantized to FP8 + FP32 block
+# scales, validated against an exact-FP32 reference. Runs on the H20 pool.
+py_test(
+    name = "grouped_fp4_sm90_test",
+    srcs = ["grouped_fp4_sm90_test.py"],
+    env_inherit = ["HOME"],
+    tags = ["H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13", "gpu_count": "1"},
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:modules",
+    ],
+)
+
 cuda13_sm100_py_test(
     name = "mega_moe_routed_only_execution_test",
     srcs = ["mega_moe_routed_only_execution_test.py"],

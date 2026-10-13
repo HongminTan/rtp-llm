@@ -393,6 +393,25 @@ class DeepEPWrapper:
             raise e
 
     @classmethod
+    def get_initialized_wrapper(cls) -> Optional["DeepEPWrapper"]:
+        """Return the initialized wrapper without a config-equality check.
+
+        Executors that own their own dispatch (e.g. the DSv4 SM90
+        FP8/FP4 path) are not built from a MoEConfigAdapter, so they cannot
+        reconstruct the exact DeepepWrapperConfig the engine used at
+        ``init_deepep_wrapper`` time. The engine-level initialization is the
+        single sizing authority; this accessor hands out that instance.
+
+        Returns:
+            The initialized DeepEPWrapper, or None when DeepEP is not
+            initialized in this process.
+        """
+        with cls._lock:
+            if cls._initialized and cls._instance is not None:
+                return cls._instance
+            return None
+
+    @classmethod
     def reset(cls) -> None:
         """Reset DeepEP singleton state (for testing only).
 

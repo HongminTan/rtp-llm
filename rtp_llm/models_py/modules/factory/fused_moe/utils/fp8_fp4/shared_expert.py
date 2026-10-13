@@ -407,13 +407,43 @@ class FusedSharedExpertFastPath:
         if T == 0:
             return out
 
-        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import fp8_gemm_nt
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            fp8_gemm_nt,
+            is_deep_gemm_e8m0_used,
+        )
         from rtp_llm.models_py.triton_kernels.moe.shared_expert import (
             quant_bf16_fp8_packed_ue8m0,
         )
         from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
             silu_mul_fp8_quant_packed,
         )
+
+        if not is_deep_gemm_e8m0_used():
+            # Hopper: plain FP32 per-token-group scales + the FP32-scale
+            # SiLU+quant kernel. The workspace's FP8/BF16 output buffers
+            # keep their role; only the packed-int32 scale storage is
+            # bypassed by small per-call FP32 allocations.
+            from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+                sgl_per_token_group_quant_fp8,
+            )
+
+            x_fp8_q, x_scale_q = sgl_per_token_group_quant_fp8(
+                x.contiguous(),
+                group_size=128,
+                eps=1.0e-4,
+                column_major_scales=False,
+                scale_tma_aligned=False,
+                scale_ue8m0=False,
+            )
+            fp8_gemm_nt((x_fp8_q, x_scale_q), w13_parts, gate_up)
+            hidden_q, hidden_scale_q = silu_mul_fp8_quant_f32_scale(
+                gate_up,
+                clamp_limit=self.swiglu_limit,
+                group_size=128,
+            )
+            fp8_gemm_nt((hidden_q, hidden_scale_q), w2_parts, out)
+            return out
 
         quant_bf16_fp8_packed_ue8m0(x, x_fp8, x_scale, group_size=128, eps=1.0e-4)
         fp8_gemm_nt(

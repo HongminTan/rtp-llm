@@ -374,6 +374,14 @@ def _prepare_wo_a_stacked(
     ``deep_gemm.fp8_einsum(..., recipe=(1, 1, 128))`` expectations."""
     w_stk = weight_fp8.view(G, R, K).contiguous()
     scale_fp32 = scale_raw.float().view(G, R // 128, K // 128)
+    from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+        is_deep_gemm_e8m0_used,
+    )
+
+    if not is_deep_gemm_e8m0_used():
+        # Hopper: fp8_einsum consumes FP32 block scales with the (1, 128,
+        # 128) recipe; keep the plain [G, R/128, K/128] grid.
+        return w_stk, scale_fp32.contiguous()
     idx = torch.arange(R, device=scale_raw.device) // 128
     scale_rep = scale_fp32.index_select(-2, idx).contiguous()  # [G, R, K/128]
     s_stk = get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_rep)
@@ -385,10 +393,24 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
 
     Repacks the UE8M0 ``float8_e8m0fnu`` scale into DeepGEMM's int32
     TMA-aligned packed layout when needed. Framework descriptor path may
-    deliver the scale already packed (dtype int32) — we no-op then."""
+    deliver the scale already packed (dtype int32) — we no-op then.
+    On SM90 (Hopper) DeepGEMM consumes FP32 scales instead, so the UE8M0
+    block scale converts exactly with a plain ``.float()``."""
     assert s is not None, "expected non-null FP8 scale"
     if s.dtype == torch.float8_e8m0fnu:
-        s = _repack_v4_fp8_scale_to_int32(s)
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            is_deep_gemm_e8m0_used,
+        )
+
+        if not is_deep_gemm_e8m0_used():
+            # Hopper: plain FP32 scales (UE8M0 converts exactly), and the
+            # linear's non-e8m0 branch reads inputs as [K, N] /
+            # [K/128, N/128] — re-label the checkpoint's [N, K] tensors
+            # with views; memory is unchanged.
+            w = w.reshape(w.shape[1], w.shape[0])
+            s = s.float().reshape(s.shape[1], s.shape[0])
+        else:
+            s = _repack_v4_fp8_scale_to_int32(s)
     # LinearFactory.create_linear_from_weights consumes a (weights_dict,
     # weight_key, scale_key) triple — feed it a one-shot dict so the
     # factory plumbing is unchanged.
@@ -404,10 +426,15 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
 def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):
     """Backwards-compat bridge over ``_v4_fp8_linear`` for callers that
     still pass a flat dict + keys.  Mutates ``weights[scale_key]`` to the
-    packed form so subsequent callers don't repack."""
+    packed form so subsequent callers don't repack (SM100 only; on SM90
+    the delegate converts to FP32 and re-labels, nothing to cache)."""
+    from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+        is_deep_gemm_e8m0_used,
+    )
+
     w = weights[weight_key]
     s = weights[scale_key]
-    if s.dtype == torch.float8_e8m0fnu:
+    if s.dtype == torch.float8_e8m0fnu and is_deep_gemm_e8m0_used():
         s = _repack_v4_fp8_scale_to_int32(s)
         weights[scale_key] = s
     return _v4_fp8_linear(w, s)
@@ -1994,6 +2021,25 @@ class AttentionFP8(nn.Module):
         M, G, _K = o_fp8.shape
         R = self.o_lora_rank
         out = torch.empty(M, G, R, dtype=torch.bfloat16, device=o_fp8.device)
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            is_deep_gemm_e8m0_used,
+        )
+
+        if not is_deep_gemm_e8m0_used():
+            # Hopper: fp8_einsum takes FP32 scales + the (1, 128, 128)
+            # recipe. Unpack the fused kernel's packed-UE8M0 activation
+            # scale ([M, G, K/512] int32, 4 bytes per int32, little-endian
+            # group order) into the [M, G, K/128] FP32 grid.
+            packed = o_scale.contiguous().view(torch.uint8).to(torch.int32)
+            o_scale_f32 = (packed - 127).to(torch.float32).exp2()
+            deep_gemm.fp8_einsum(
+                "bhr,hdr->bhd",
+                (o_fp8, o_scale_f32),
+                (self._wo_a_stk_w, self._wo_a_stk_s),
+                out,
+                recipe=(1, 128, 128),
+            )
+            return out.view(B, S, G, R)
         deep_gemm.fp8_einsum(
             "bhr,hdr->bhd",
             (o_fp8, o_scale),

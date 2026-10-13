@@ -37,19 +37,42 @@ _FP8_BLOCK_CONFIG = Fp8BlockWiseQuantConfig()
 
 
 def create_fp8_linear(weight: torch.Tensor, scale: torch.Tensor):
-    """Build the CUDA FP8 linear used by FP8 shared experts."""
+    """Build the CUDA FP8 linear used by FP8 shared experts.
+
+    Input contract: checkpoint-order weight ``[N, K]`` plus a 2D block scale
+    ``[N/128, K/128]`` in either UE8M0 or plain FP32.
+    """
     from rtp_llm.models_py.modules.factory.linear import LinearFactory
+    from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+        is_deep_gemm_e8m0_used,
+    )
 
-    if scale.dtype == torch.float8_e8m0fnu:
-        from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
-
+    if scale.dtype in (torch.float8_e8m0fnu, torch.float32):
         if scale.dim() != 2:
             raise ValueError(f"FP8 scale must be 2D, got {scale.dim()}D")
-        row_count = scale.shape[0] * FP8_BLOCK
-        row_index = torch.arange(row_count, device=scale.device) // FP8_BLOCK
-        scale = get_mn_major_tma_aligned_packed_ue8m0_tensor(
-            scale.float().index_select(-2, row_index)
-        )
+        if not is_deep_gemm_e8m0_used():
+            # Hopper: DeepGEMM consumes FP32 scales; UE8M0 (power-of-two)
+            # converts exactly. CudaFp8DeepGEMMLinear's non-e8m0 branch reads
+            # the incoming weight as [K, N] and scale as [K/128, N/128] (the
+            # legacy loader's shape labels); re-label the checkpoint's
+            # [N, K] / [N/128, K/128] contiguous tensors with plain views —
+            # memory unchanged, and the linear's reshape() undoes the label.
+            out_dim, in_dim = weight.shape
+            if scale.shape != (out_dim // FP8_BLOCK, in_dim // FP8_BLOCK):
+                raise ValueError(
+                    f"FP8 scale grid {tuple(scale.shape)} does not match "
+                    f"weight [{out_dim}, {in_dim}] / 128 blocks"
+                )
+            weight = weight.reshape(in_dim, out_dim)
+            scale = scale.float().reshape(in_dim // FP8_BLOCK, out_dim // FP8_BLOCK)
+        elif scale.dtype == torch.float8_e8m0fnu:
+            from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
+
+            row_count = scale.shape[0] * FP8_BLOCK
+            row_index = torch.arange(row_count, device=scale.device) // FP8_BLOCK
+            scale = get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                scale.float().index_select(-2, row_index)
+            )
     local_weights = {"weight": weight, "scale": scale}
     return LinearFactory.create_linear_from_weights(
         local_weights,
