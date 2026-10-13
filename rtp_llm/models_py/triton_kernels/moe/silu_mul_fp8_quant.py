@@ -303,12 +303,14 @@ def silu_mul_fp8_quant_packed(
     return output_q, output_scale_packed
 
 
-@triton.jit(do_not_specialize=["M"])
+@triton.jit(do_not_specialize=["M", "rows_per_expert"])
 def _silu_mul_fp8_quant_f32_scale_kernel(
-    input_ptr,  # [M, N=2*inter] BF16 (gate_up)
+    input_ptr,  # [M, N=2*inter] BF16 (gate_up) — flat rows; M = total rows
     output_q_ptr,  # [M, N_2=inter]  FP8 e4m3fn
     output_scale_ptr,  # [M, NUM_GROUPS] FP32 row-major
     M,
+    rows_per_expert,  # grouped mode: rows per expert (BLOCK_M-aligned); else 1
+    masked_m_ptr,  # grouped mode: [E] int32 valid row counts; unused otherwise
     input_stride_m,
     output_q_stride_m,
     output_scale_stride_m,
@@ -321,11 +323,12 @@ def _silu_mul_fp8_quant_f32_scale_kernel(
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
+    HAS_MASK: tl.constexpr,
 ):
     N_2: tl.constexpr = N // 2
 
     pid_g = tl.program_id(0).to(tl.int64)  # which group column
-    pid_m = tl.program_id(1).to(tl.int64)  # which BLOCK_M row tile
+    pid_m = tl.program_id(1).to(tl.int64)  # which BLOCK_M row tile (global rows)
     m_offset = pid_m * BLOCK_M
 
     if m_offset >= M:
@@ -333,7 +336,19 @@ def _silu_mul_fp8_quant_f32_scale_kernel(
 
     offs_m = tl.arange(0, BLOCK_M).to(tl.int64)
     offs_n = tl.arange(0, GROUP_SIZE)
-    row_mask = (m_offset + offs_m) < M
+    if HAS_MASK:
+        # Grouped-capacity layout [E, rows_per_expert, N] flattened to rows:
+        # BLOCK_M tiles never straddle experts (rows_per_expert is a multiple
+        # of BLOCK_M, asserted by the wrapper). Rows past the expert's count
+        # stay unwritten — the downstream masked grouped GEMM only consumes
+        # rows below masked_m, so their garbage never reaches an output.
+        expert = m_offset // rows_per_expert
+        row_bound = expert * rows_per_expert + tl.load(masked_m_ptr + expert).to(
+            tl.int64
+        )
+    else:
+        row_bound = M
+    row_mask = (m_offset + offs_m) < row_bound
 
     base_row_offset = (m_offset + offs_m[:, None]) * input_stride_m
     base_out_offset = (m_offset + offs_m[:, None]) * output_q_stride_m
@@ -386,6 +401,7 @@ def silu_mul_fp8_quant_f32_scale(
     gate_up: torch.Tensor,
     clamp_limit: float = 0.0,
     group_size: int = 128,
+    masked_m: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse SiLU + clamp + mul + per-token-group FP8 quant with FP32 scales.
 
@@ -393,12 +409,31 @@ def silu_mul_fp8_quant_f32_scale(
     DeepGEMM kernels consume FP32 scaling factors instead of packed UE8M0
     int32, so this variant emits ``[M, num_groups]`` row-major FP32 scales
     alongside the same ``[M, inter]`` FP8 output.
+
+    ``masked_m`` (optional, [E] int32 per-expert valid row counts) switches
+    to the grouped-capacity layout: ``gate_up`` is then ``[E, M, 2*inter]``
+    and only rows below each expert's count are computed. Rows past the
+    count stay unwritten — the masked grouped GEMM downstream only consumes
+    rows below ``masked_m``, so this skips the (often ~1000x at decode)
+    wasted work over padded capacity without touching numerics. ``M`` must
+    be a multiple of BLOCK_M so tiles never straddle experts.
     """
-    assert gate_up.dim() == 2, f"expected 2D, got {gate_up.shape}"
     assert gate_up.is_contiguous(), "gate_up must be contiguous"
     assert gate_up.dtype == torch.bfloat16, f"expected bf16, got {gate_up.dtype}"
 
-    M, N = gate_up.shape
+    if masked_m is None:
+        assert gate_up.dim() == 2, f"expected 2D, got {gate_up.shape}"
+        M_total, N = gate_up.shape
+        rows_per_expert = 1
+    else:
+        assert gate_up.dim() == 3, f"expected 3D, got {gate_up.shape}"
+        _, rows_per_expert, N = gate_up.shape
+        M_total = gate_up.shape[0] * rows_per_expert
+        assert rows_per_expert % 8 == 0, (
+            f"rows_per_expert ({rows_per_expert}) must be a multiple of BLOCK_M (8)"
+        )
+        masked_m = masked_m.to(torch.int32)
+
     N_2 = N // 2
     assert N_2 % group_size == 0, (
         f"inter ({N_2}) must be a multiple of group_size ({group_size})"
@@ -410,26 +445,28 @@ def silu_mul_fp8_quant_f32_scale(
 
     num_groups_per_row = N_2 // group_size
 
-    output_q = torch.empty((M, N_2), dtype=fp8_dtype, device=gate_up.device)
-    output_scale = torch.empty(
-        (M, num_groups_per_row), dtype=torch.float32, device=gate_up.device
-    )
-    if M == 0:
+    out_q_shape = gate_up.shape[:-1] + (N_2,)
+    out_s_shape = gate_up.shape[:-1] + (num_groups_per_row,)
+    output_q = torch.empty(out_q_shape, dtype=fp8_dtype, device=gate_up.device)
+    output_scale = torch.empty(out_s_shape, dtype=torch.float32, device=gate_up.device)
+    if M_total == 0:
         return output_q, output_scale
 
     BLOCK_M = 8
-    grid = (num_groups_per_row, (M + BLOCK_M - 1) // BLOCK_M)
+    grid = (num_groups_per_row, (M_total + BLOCK_M - 1) // BLOCK_M)
     num_warps = max(4, group_size // 32)
     has_clamp = clamp_limit > 0
     _silu_mul_fp8_quant_f32_scale_kernel[grid](
         gate_up,
         output_q,
         output_scale,
-        M,
-        gate_up.stride(0),
-        output_q.stride(0),
-        output_scale.stride(0),
-        output_scale.stride(1),
+        M_total,
+        rows_per_expert,
+        masked_m if masked_m is not None else gate_up,
+        gate_up.stride(-2),
+        output_q.stride(-2),
+        output_scale.stride(-2),
+        output_scale.stride(-1),
         clamp_limit if has_clamp else 0.0,
         N=N,
         NUM_GROUPS=num_groups_per_row,
@@ -438,6 +475,7 @@ def silu_mul_fp8_quant_f32_scale(
         GROUP_SIZE=group_size,
         BLOCK_M=BLOCK_M,
         HAS_CLAMP=has_clamp,
+        HAS_MASK=masked_m is not None,
         num_warps=num_warps,
         num_stages=2,
     )

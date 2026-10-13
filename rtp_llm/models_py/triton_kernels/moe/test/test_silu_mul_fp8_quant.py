@@ -184,5 +184,100 @@ class SiluMulFp8QuantPackedTest(unittest.TestCase):
         self._check(M=512, inter=512, clamp_limit=5.0)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class SiluMulFp8QuantF32ScaleMaskedTest(unittest.TestCase):
+    """Correctness of silu_mul_fp8_quant_f32_scale with/without masked_m.
+
+    The masked mode serves the DeepEP low-latency grouped-capacity layout
+    [E, M, 2*inter]: rows past each expert's count stay unwritten (the
+    masked grouped GEMM never reads them) and valid rows must match the
+    2D unmasked result bit-for-bit-equivalently.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
+        )
+
+        cls._fused = staticmethod(silu_mul_fp8_quant_f32_scale)
+
+    @staticmethod
+    def _check_valid_rows(
+        got_q: torch.Tensor,
+        got_s: torch.Tensor,
+        gate_up_2d: torch.Tensor,
+        clamp_limit: float,
+        group_size: int = 128,
+    ) -> None:
+        """Reference check on the VALID rows of one expert slice."""
+        import torch.nn.functional as F
+
+        inter = gate_up_2d.size(-1) // 2
+        gate = gate_up_2d[:, :inter].float()
+        up = gate_up_2d[:, inter:].float()
+        if clamp_limit > 0:
+            up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+            gate = torch.clamp(gate, max=clamp_limit)
+        y = (F.silu(gate) * up).to(torch.bfloat16).to(torch.float32)
+        num_groups = inter // group_size
+        yg = y.view(y.size(0), num_groups, group_size)
+        absmax = yg.abs().amax(dim=-1).clamp_min(1e-10)
+        scale = (absmax / 448.0).clamp_min(1e-10)
+        ref_q = (
+            (yg / scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        ).view(y.size(0), inter)
+
+        gq = got_q.to(torch.float32)
+        rq = ref_q.to(torch.float32)
+        max_abs = (gq - rq).abs().max().item()
+        assert max_abs < 1e-2, f"FP8 output diff too large: {max_abs}"
+        assert torch.allclose(got_s, scale, rtol=1e-3, atol=1e-9), (
+            f"FP32 scale mismatch: max rel "
+            f"{((got_s - scale).abs() / scale.clamp_min(1e-10)).max().item()}"
+        )
+
+    def test_masked_partial_counts(self):
+        torch.manual_seed(1234)
+        E, M, inter = 8, 256, 2048
+        gate_up = torch.randn(E, M, 2 * inter, device="cuda", dtype=torch.bfloat16)
+        counts = torch.randint(0, M + 1, (E,), device="cuda", dtype=torch.int32)
+        counts[0] = 0  # empty expert
+        counts[1] = M  # full expert
+        q, s = self._fused(gate_up, clamp_limit=10.0, group_size=128, masked_m=counts)
+        self.assertEqual(q.shape, (E, M, inter))
+        self.assertEqual(s.shape, (E, M, inter // 128))
+        self.assertEqual(q.dtype, torch.float8_e4m3fn)
+        self.assertEqual(s.dtype, torch.float32)
+        for e in range(E):
+            c = int(counts[e])
+            if c == 0:
+                continue
+            self._check_valid_rows(q[e, :c], s[e, :c], gate_up[e, :c], 10.0)
+
+    def test_masked_full_equals_unmasked(self):
+        torch.manual_seed(4321)
+        E, M, inter = 4, 512, 1024
+        gate_up = torch.randn(E, M, 2 * inter, device="cuda", dtype=torch.bfloat16)
+        counts = torch.full((E,), M, device="cuda", dtype=torch.int32)
+        q_m, s_m = self._fused(gate_up, clamp_limit=10.0, group_size=128, masked_m=counts)
+        q_p, s_p = self._fused(
+            gate_up.view(E * M, 2 * inter), clamp_limit=10.0, group_size=128
+        )
+        # All rows valid → masked output equals the plain 2D output.
+        self.assertTrue(
+            torch.equal(q_m.view(E * M, inter).to(torch.float32), q_p.to(torch.float32))
+        )
+        self.assertTrue(torch.equal(s_m.view(E * M, inter // 128), s_p))
+
+    def test_unmasked_2d_regression(self):
+        torch.manual_seed(999)
+        M, inter = 1024, 2048
+        gate_up = torch.randn(M, 2 * inter, device="cuda", dtype=torch.bfloat16)
+        q, s = self._fused(gate_up, clamp_limit=10.0, group_size=128)
+        self.assertEqual(q.shape, (M, inter))
+        self._check_valid_rows(q, s, gate_up, 10.0)
+
+
 if __name__ == "__main__":
     unittest.main()

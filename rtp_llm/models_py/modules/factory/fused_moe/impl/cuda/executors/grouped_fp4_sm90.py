@@ -787,6 +787,13 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         E, M_tot, D_r = recv_x.shape
         assert E == e_local and D_r == D
 
+        # Masked activation quant for the SwiGLU stage only: rows past each
+        # expert's count are garbage the masked GEMM never reads, and at
+        # decode shapes the valid fraction is tiny (N*K*world valid rows of
+        # E*M_tot), so the unmasked activation+quant burned ~1000x redundant
+        # work at bs=1. (The input-side masked quant via the v2 kernel path
+        # stays unmasked: not validated in-server yet.)
+        recv_count_i32 = recv_count.to(torch.int32)
         a_fp8, a_scale = sgl_per_token_group_quant_fp8(
             recv_x.reshape(E * M_tot, D).contiguous(),
             group_size=FP8_BLOCK,
@@ -806,9 +813,10 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
             expected_m,
         )
         h_fp8, h_scale = silu_mul_fp8_quant_f32_scale(
-            gate_up.view(E * M_tot, 2 * inter),
+            gate_up,
             clamp_limit=cfg.swiglu_limit,
             group_size=FP8_BLOCK,
+            masked_m=recv_count_i32,
         )
         down = torch.empty((E, M_tot, D), device=device, dtype=torch.bfloat16)
         m_grouped_fp8_gemm_nt_masked(
