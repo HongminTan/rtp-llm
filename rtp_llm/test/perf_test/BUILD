@@ -1033,7 +1033,7 @@ py_test(
     ],
     env = {
         "WORLD_SIZE": "8",
-        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
         "DSV4_TRAP_INVALID_KV_ACCESS": "0",
     },
     tags = ["manual", "H20_CU13"],
