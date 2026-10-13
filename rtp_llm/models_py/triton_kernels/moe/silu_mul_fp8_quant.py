@@ -648,8 +648,8 @@ def per_token_group_quant_f32_scale_masked(
         assert x.dim() == 3, f"expected 3D, got {x.shape}"
         _, rows_per_expert, D = x.shape
         M_total = x.shape[0] * rows_per_expert
-        assert rows_per_expert % 64 == 0, (
-            f"rows_per_expert ({rows_per_expert}) must be a multiple of BLOCK_M (64)"
+        assert rows_per_expert % 256 == 0, (
+            f"rows_per_expert ({rows_per_expert}) must be a multiple of BLOCK_M (256)"
         )
         masked_m = masked_m.to(torch.int32)
 
@@ -662,7 +662,7 @@ def per_token_group_quant_f32_scale_masked(
     if M_total == 0:
         return out_q, out_s
 
-    BLOCK_M = 64
+    BLOCK_M = 256
     grid = (num_groups, (M_total + BLOCK_M - 1) // BLOCK_M)
     _per_token_group_quant_f32_scale_masked_kernel[grid](
         x,
