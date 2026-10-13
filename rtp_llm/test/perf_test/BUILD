@@ -991,3 +991,51 @@ test_suite(
     ],
     tags = ["manual"],
 )
+
+# V4-Flash DP=8 + EP=8 eager decode baseline on SM90 (H20). Mirrors the
+# engine args of smoke target v4_flash_full_dp8ep8_sm90_h20 (dynamic-split
+# NCCL a2a, no graphs); the formal TPOT/TPS reference for the SM90
+# adaptation ahead of the DeepEP-LL/PD and MegaMoE decode measurements.
+py_test(
+    name = "v4_flash_dp8_decode_eager_sm90_h20_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--batch_size", "1,16,64,128",
+        "--input_len", "512,4096",
+        "--partial", "1",
+        "--decode_test_length", "30",
+        "--num_measures", "5",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "8192",
+        "--tp_size", "1",
+        "--dp_size", "8",
+        "--ep_size", "8",
+        "--world_size", "8",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "128",
+        "--reserver_runtime_mem_mb", "12288",
+        "--dsv4_fixed_pool_blocks", "512",
+    ],
+    env = {
+        "WORLD_SIZE": "8",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
