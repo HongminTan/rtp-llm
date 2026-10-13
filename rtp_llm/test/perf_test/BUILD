@@ -1138,3 +1138,50 @@ py_test(
     tags = ["manual", "H20_CU13"],
     exec_properties = {"gpu": "H20_CU13"},
 )
+
+# V4-Flash 90%-prefix-cache prefill TPM on SM90 (H20): the adapt-model
+# performance standard's cache-hit scenario. Case 1 = exact 90% cached
+# continuation (input 10240, cache 9216, tail 1024), case 2 = cold control.
+py_test(
+    name = "v4_flash_dp8_cache_grid_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--cache_grid_json", "/data2/liukan.lk/runs/dsv4_flash_h20_20261013/build_logs/dsv4_cache_grid.json",
+        "--partial", "2",
+        "--cache_measure_runs", "3",
+        "--cache_commit_tail_tokens", "1024",
+        "--num_measures", "3",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "11264",
+        "--tp_size", "1",
+        "--dp_size", "8",
+        "--ep_size", "8",
+        "--world_size", "8",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "4",
+        "--reserver_runtime_mem_mb", "12288",
+        "--reuse_cache", "1",
+    ],
+    env = {
+        "WORLD_SIZE": "8",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
