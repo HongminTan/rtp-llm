@@ -1039,3 +1039,102 @@ py_test(
     tags = ["manual", "H20_CU13"],
     exec_properties = {"gpu": "H20_CU13"},
 )
+
+# V4-Flash skill-standard perf lengths on SM90 (H20): the adapt-model
+# performance standard's 64K/128K input definitions. Prefill TPM from the
+# grid runner's prefill phase; decode TPOT at the long context (eager
+# dp8ep8 engine config - the perf framework has no PD role support, so
+# this measures the prefill-role-representative eager topology).
+py_test(
+    name = "v4_flash_dp8_skill_len_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--batch_size", "1",
+        "--input_len", "65536",
+        "--partial", "1",
+        "--decode_test_length", "30",
+        "--num_measures", "3",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "65824",
+        "--tp_size", "1",
+        "--dp_size", "8",
+        "--ep_size", "8",
+        "--world_size", "8",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "4",
+        "--reserver_runtime_mem_mb", "24576",
+        "--dsv4_fixed_pool_blocks", "4096",
+    ],
+    env = {
+        "WORLD_SIZE": "8",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
+# V4-Flash skill decode gate on SM90: binary-search the max concurrency
+# satisfying TPOT<=20ms and report TPS at that point (adapt-model
+# performance standard). Eager dp8ep8 engine config (no PD role support
+# in the perf framework - the gate evaluates the measurable topology;
+# the PD-optimized TPOT is tracked in the RUN perf report).
+py_test(
+    name = "v4_flash_dp8_tpot_gate_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--batch_size", "1,8,32",
+        "--input_len", "4096",
+        "--partial", "1",
+        "--target_tpot", "20",
+        "--decode_test_length", "30",
+        "--num_measures", "3",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "8192",
+        "--tp_size", "1",
+        "--dp_size", "8",
+        "--ep_size", "8",
+        "--world_size", "8",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "64",
+        "--reserver_runtime_mem_mb", "12288",
+        "--dsv4_fixed_pool_blocks", "2048",
+    ],
+    env = {
+        "WORLD_SIZE": "8",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
