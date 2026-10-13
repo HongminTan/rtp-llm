@@ -1128,7 +1128,7 @@ py_test(
         "--enable_cuda_graph", "0",
         "--max_context_batch_size", "64",
         "--reserver_runtime_mem_mb", "12288",
-        "--dsv4_fixed_pool_blocks", "2048",
+        "--dsv4_fixed_pool_blocks", "256",
     ],
     env = {
         "WORLD_SIZE": "8",
@@ -1181,6 +1181,54 @@ py_test(
         "WORLD_SIZE": "8",
         "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
         "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
+# V4-Flash prefill-phase timeline capture on SM90 (H20): partial=2 with
+# the engine timeline enabled, feeding the step-6 prefill share/Top-10/
+# MFU analysis (gates_calc.py -P prefill).
+py_test(
+    name = "v4_flash_dp8_prefill_trace_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/mnt/nas1/hf/DeepSeek-V4-Flash",
+        "--batch_size", "1",
+        "--input_len", "4096",
+        "--partial", "2",
+        "--num_measures", "3",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "8192",
+        "--tp_size", "1",
+        "--dp_size", "8",
+        "--ep_size", "8",
+        "--world_size", "8",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "4",
+        "--reserver_runtime_mem_mb", "12288",
+    ],
+    env = {
+        "WORLD_SIZE": "8",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+        "GEN_TIMELINE_SYNC": "1",
+        "GEN_TIMELINE_START_STEP": "1",
+        "GEN_TIMELINE_NUM_STEPS": "2",
     },
     tags = ["manual", "H20_CU13"],
     exec_properties = {"gpu": "H20_CU13"},
