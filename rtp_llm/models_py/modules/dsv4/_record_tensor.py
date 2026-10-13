@@ -121,6 +121,13 @@ def dump(*, step: int, extra: Optional[Dict[str, Any]] = None) -> None:
     """Sync, serialize the current buffer, and write to disk."""
     if not ENABLED:
         return
+    # CUDA-graph capture forbids the host copies below; skip (and keep the
+    # buffer) rather than aborting the capture.
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
     buf = _get_buf()
     if not buf:
         return

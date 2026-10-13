@@ -15,6 +15,10 @@ dsv4_indexer_topk_cuda_copts = copts() + cuda_default_copts_without_arch() + [
     # TopK is defined by exact FP32 ordering. The global CUDA defaults enable
     # ftz=true, which collapses distinct subnormal scores to zero in compares.
     '-nvcc_options=ftz=false',
+    # SM90 (Hopper) runs the dequant-to-FP8 DSv4 path: thread-block
+    # clusters, __grid_constant__ and PDL are all available there; the
+    # sm100-only smem-spilling pragma is arch-guarded in the compat header.
+    '--cuda-include-ptx=sm_90', '--cuda-gpu-arch=sm_90',
     '--cuda-include-ptx=sm_100', '--cuda-gpu-arch=sm_100',
     '--cuda-include-ptx=sm_100a', '--cuda-gpu-arch=sm_100a',
     '--cuda-include-ptx=sm_103', '--cuda-gpu-arch=sm_103',
