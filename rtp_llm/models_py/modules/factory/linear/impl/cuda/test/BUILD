@@ -24,6 +24,17 @@ py_test(
 )
 
 py_test(
+    name = "fp8_v4_ue8m0_sm90_test",
+    srcs = ["fp8_v4_ue8m0_sm90_test.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:modules",
+    ],
+    tags = ["H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
+py_test(
     name = "fp8_deepgemm_linear_quantized_input_contract_test",
     srcs = ["fp8_deepgemm_linear_quantized_input_contract_test.py"],
     deps = py_test_deps,

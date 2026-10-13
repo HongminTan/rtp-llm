@@ -303,6 +303,147 @@ def silu_mul_fp8_quant_packed(
     return output_q, output_scale_packed
 
 
+@triton.jit(do_not_specialize=["M"])
+def _silu_mul_fp8_quant_f32_scale_kernel(
+    input_ptr,  # [M, N=2*inter] BF16 (gate_up)
+    output_q_ptr,  # [M, N_2=inter]  FP8 e4m3fn
+    output_scale_ptr,  # [M, NUM_GROUPS] FP32 row-major
+    M,
+    input_stride_m,
+    output_q_stride_m,
+    output_scale_stride_m,
+    output_scale_stride_g,
+    clamp_limit,
+    N: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
+):
+    N_2: tl.constexpr = N // 2
+
+    pid_g = tl.program_id(0).to(tl.int64)  # which group column
+    pid_m = tl.program_id(1).to(tl.int64)  # which BLOCK_M row tile
+    m_offset = pid_m * BLOCK_M
+
+    if m_offset >= M:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_n = tl.arange(0, GROUP_SIZE)
+    row_mask = (m_offset + offs_m) < M
+
+    base_row_offset = (m_offset + offs_m[:, None]) * input_stride_m
+    base_out_offset = (m_offset + offs_m[:, None]) * output_q_stride_m
+
+    n_offset = pid_g * GROUP_SIZE
+
+    # Load gate (first half, [:N_2]) and up (second half, [N_2:N])
+    act_ptrs = input_ptr + base_row_offset + n_offset + offs_n[None, :]
+    act_in = tl.load(act_ptrs, mask=row_mask[:, None], other=0.0)
+    mul_ptrs = act_ptrs + N_2
+    mul_in = tl.load(mul_ptrs, mask=row_mask[:, None], other=0.0)
+
+    act_f32 = act_in.to(tl.float32)
+    mul_f32 = mul_in.to(tl.float32)
+
+    # Same SwiGLU clamp convention as the packed kernel: gate upper-only,
+    # up symmetric.
+    if HAS_CLAMP:
+        act_f32 = tl.minimum(act_f32, clamp_limit)
+        mul_f32 = tl.clamp(mul_f32, -clamp_limit, clamp_limit)
+
+    y = (act_f32 / (1.0 + tl.exp(-act_f32))) * mul_f32
+    # Round through bf16 to match the legacy unfused path's precision.
+    y = y.to(tl.bfloat16).to(tl.float32)
+
+    # Per-row absmax -> plain FP8 scale (no UE8M0 power-of-2 rounding: SM90
+    # DeepGEMM consumes FP32 scales directly).
+    absmax = tl.max(tl.abs(y), axis=1)
+    scale = tl.maximum(absmax / fp8_max, 1e-10)
+
+    # Quantize and store
+    y_q = tl.clamp(y / scale[:, None], fp8_min, fp8_max)
+    out_q_ptrs = output_q_ptr + base_out_offset + n_offset + offs_n[None, :]
+    tl.store(
+        out_q_ptrs,
+        y_q.to(output_q_ptr.dtype.element_ty),
+        mask=row_mask[:, None],
+    )
+
+    # One FP32 scale per (row, group), row-major.
+    scale_ptrs = (
+        output_scale_ptr
+        + (m_offset + offs_m) * output_scale_stride_m
+        + pid_g * output_scale_stride_g
+    )
+    tl.store(scale_ptrs, scale, mask=row_mask)
+
+
+def silu_mul_fp8_quant_f32_scale(
+    gate_up: torch.Tensor,
+    clamp_limit: float = 0.0,
+    group_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse SiLU + clamp + mul + per-token-group FP8 quant with FP32 scales.
+
+    SM90 (Hopper) counterpart of :func:`silu_mul_fp8_quant_packed`: Hopper
+    DeepGEMM kernels consume FP32 scaling factors instead of packed UE8M0
+    int32, so this variant emits ``[M, num_groups]`` row-major FP32 scales
+    alongside the same ``[M, inter]`` FP8 output.
+    """
+    assert gate_up.dim() == 2, f"expected 2D, got {gate_up.shape}"
+    assert gate_up.is_contiguous(), "gate_up must be contiguous"
+    assert gate_up.dtype == torch.bfloat16, f"expected bf16, got {gate_up.dtype}"
+
+    M, N = gate_up.shape
+    N_2 = N // 2
+    assert N_2 % group_size == 0, (
+        f"inter ({N_2}) must be a multiple of group_size ({group_size})"
+    )
+
+    fp8_dtype = torch.float8_e4m3fn
+    finfo = torch.finfo(fp8_dtype)
+    fp8_min, fp8_max = finfo.min, finfo.max
+
+    num_groups_per_row = N_2 // group_size
+
+    output_q = torch.empty((M, N_2), dtype=fp8_dtype, device=gate_up.device)
+    output_scale = torch.empty(
+        (M, num_groups_per_row), dtype=torch.float32, device=gate_up.device
+    )
+    if M == 0:
+        return output_q, output_scale
+
+    BLOCK_M = 8
+    grid = (num_groups_per_row, (M + BLOCK_M - 1) // BLOCK_M)
+    num_warps = max(4, group_size // 32)
+    has_clamp = clamp_limit > 0
+    _silu_mul_fp8_quant_f32_scale_kernel[grid](
+        gate_up,
+        output_q,
+        output_scale,
+        M,
+        gate_up.stride(0),
+        output_q.stride(0),
+        output_scale.stride(0),
+        output_scale.stride(1),
+        clamp_limit if has_clamp else 0.0,
+        N=N,
+        NUM_GROUPS=num_groups_per_row,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M,
+        HAS_CLAMP=has_clamp,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return output_q, output_scale
+
+
 def silu_mul_fp8_quant_packed_from_parts(
     gate: torch.Tensor,
     up: torch.Tensor,
