@@ -67,6 +67,37 @@ from .fp8_fp4_base import Fp8Fp4ExecutorBase, normalize_moe_w13_gate_up
 # alignment (128 on both SM90 and SM100).
 _GROUPED_ALIGNMENT = 128
 
+# Opt-in persistent masked workspace (team/perf-log.md R36/R42): the per-
+# forward torch.zeros of masked_in re-fills a ~33 MB fp8 buffer every decode
+# step (the FillFunctor family, ~0.47 ms/step on the 4x H20 dp4ep4 decode
+# trace). ep_scatter_v2 is a pure-STORE scatter and every downstream
+# consumer (masked GEMM, silu+quant, ep_gather) is row-independent and only
+# reads rows below masked_m, so uninitialized capacity rows never reach the
+# output. Default off pending the A/B + semantic gate.
+_MASKED_WS_CACHE: Dict[Any, Any] = {}
+
+
+def _masked_ws_reuse_enabled() -> bool:
+    return os.environ.get("DSV4_MASKED_WS_REUSE", "0") == "1"
+
+
+def _masked_ws_buffers(
+    e_local: int, cap_m: int, D: int, device: torch.device
+) -> tuple:
+    """Persistent (masked_in, masked_scale) buffers, torch.empty (no fill)."""
+    key = (e_local, cap_m, D, str(device))
+    bufs = _MASKED_WS_CACHE.get(key)
+    if bufs is None:
+        masked_in = torch.empty(
+            (e_local, cap_m, D), dtype=torch.float8_e4m3fn, device=device
+        )
+        masked_scale = torch.empty(
+            (e_local, cap_m, D // FP8_BLOCK), dtype=torch.float32, device=device
+        )
+        bufs = (masked_in, masked_scale)
+        _MASKED_WS_CACHE[key] = bufs
+    return bufs
+
 
 def _has_sm90_grouped_fp8_kernel() -> bool:
     """Whether the dequant-then-grouped-FP8 path is runnable on this host.
@@ -618,12 +649,17 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
 
         # ---- masked grouped layout: [E, cap_m, .], constant shapes ----
         cap_m = align(cap * world, _GROUPED_ALIGNMENT)
-        masked_in = torch.zeros(
-            (e_local, cap_m, D), dtype=torch.float8_e4m3fn, device=device
-        )
-        masked_scale = torch.zeros(
-            (e_local, cap_m, D // FP8_BLOCK), dtype=torch.float32, device=device
-        )
+        if _masked_ws_reuse_enabled():
+            masked_in, masked_scale = _masked_ws_buffers(
+                e_local, cap_m, D, device
+            )
+        else:
+            masked_in = torch.zeros(
+                (e_local, cap_m, D), dtype=torch.float8_e4m3fn, device=device
+            )
+            masked_scale = torch.zeros(
+                (e_local, cap_m, D // FP8_BLOCK), dtype=torch.float32, device=device
+            )
         expert_start_loc = torch.arange(
             e_local, device=device, dtype=torch.int32
         ) * cap_m
