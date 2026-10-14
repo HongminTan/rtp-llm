@@ -6,6 +6,40 @@ from typing import Dict, List, Optional
 from rtp_llm.test.perf_test.dataset import extract_arg
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 
+# The CUDA host compiler the JIT (TileLang / DeepGEMM) should use when the one
+# pinned by `.bazelrc` is not present in this container.
+_SYSTEM_CC = "/usr/bin/gcc"
+_SYSTEM_CXX = "/usr/bin/g++"
+
+
+def _host_compiler_fallback() -> Dict[str, str]:
+    """Redirect the JIT host compiler when the pinned one is missing.
+
+    ``.bazelrc test:cuda12_9`` pins ``CC``/``CXX``/``CUDAHOSTCXX``/
+    ``NVCC_PREPEND_FLAGS`` to the CI image's gcc-toolset-12 path. Containers
+    that do not ship that toolset make nvcc abort with "Failed to preprocess
+    host compiler properties" as soon as a JIT kernel is built during model
+    init, so no perf test can start. When the pinned host compiler does not
+    exist -- and the system compiler does -- hand the server subprocess the
+    system one instead. On images that do ship the toolset this is a no-op.
+    """
+    pinned = os.environ.get("CXX") or os.environ.get("CC") or ""
+    if not pinned or os.path.exists(pinned):
+        return {}
+    if not (os.path.exists(_SYSTEM_CC) and os.path.exists(_SYSTEM_CXX)):
+        return {}
+    logging.info(
+        "host compiler %s is missing; falling back to %s for the JIT",
+        pinned,
+        _SYSTEM_CXX,
+    )
+    return {
+        "CC": _SYSTEM_CC,
+        "CXX": _SYSTEM_CXX,
+        "CUDAHOSTCXX": _SYSTEM_CXX,
+        "NVCC_PREPEND_FLAGS": f"-ccbin={_SYSTEM_CXX}",
+    }
+
 
 class EngineServer:
     """Engine server lifecycle management (start / stop / port)."""
@@ -36,6 +70,7 @@ class EngineServer:
             env["USE_BATCH_DECODE_SCHEDULER"] = (
                 "1" if use_batch_decode_scheduler else "0"
             )
+        env.update(_host_compiler_fallback())
 
         logging.info(f"Starting server with engine CLI: {engine_cli}")
         logging.info(f"remaining_args (raw list): {self._remaining_args}")
