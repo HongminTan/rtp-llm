@@ -1334,6 +1334,66 @@ py_test(
     exec_properties = {"gpu": "H20_CU13"},
 )
 
+# GSM8K task-level gate (team/perf-log.md R34): batch-driven eval on the
+# exact decode perf-target engine form above (graph1 / ctxbs128 / reserve
+# 16384 — the form with dozens of deadlock-free runs, unlike the graph-1
+# service form). 200 fixed questions, 8-way concurrency (pitfall #10 cap),
+# greedy. Arm A = this target as-is (tilelang_single via env below); arm B =
+# bazel --test_env=DSV4_MHC_PRE_GEMM_BACKEND=tilelang_splitk (overrides the
+# BUILD env, pitfall #6). Gate: arm-B accuracy >= arm-A - 1pp (INBOX r7).
+py_test(
+    name = "v4_flash_dp4_gsm8k_gate_h20",
+    main = "gsm8k_gate_test.py",
+    srcs = ["gsm8k_gate_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--question_file", "/home/admin/dsv4_hmz/bench/gsm8k/gsm8k_test_200.jsonl",
+        "--fewshot_prefix", "/home/admin/dsv4_hmz/bench/gsm8k/gsm8k_fewshot_prefix.txt",
+        "--arm_tag", "armA",
+        "--num_questions", "200",
+        "--concurrency", "8",
+        "--max_new_tokens", "512",
+        # ---- engine args: identical to v4_flash_dp4_decode_eager_sm90_h20_perf
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "8192",
+        "--tp_size", "1",
+        "--dp_size", "4",
+        "--ep_size", "4",
+        "--world_size", "4",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "1",
+        "--max_context_batch_size", "128",
+        "--reserver_runtime_mem_mb", "16384",
+        "--dsv4_fixed_pool_blocks", "512",
+    ],
+    env = {
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.6",
+        "WORLD_SIZE": "4",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+        "FASTSAFETENSORS_NOGDS": "1",
+        "CC": "/usr/bin/gcc",
+        "CXX": "/usr/bin/g++",
+        "CUDAHOSTCXX": "/usr/bin/g++",
+        "NVCC_PREPEND_FLAGS": "-ccbin=/usr/bin/g++",
+        "FLASHINFER_WORKSPACE_BASE": "/home/admin/dsv4-flashinfer-ws",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
 # V4-Flash prefill TTFT on 4x H20 (SM90): single-request TTFT at 16k/32k
 # prompt (GridRunner pins BS=1 in prefill mode). max_seq_len covers 32k
 # prompt + generated tail. Prefix-cache reuse stays off (default) so every
