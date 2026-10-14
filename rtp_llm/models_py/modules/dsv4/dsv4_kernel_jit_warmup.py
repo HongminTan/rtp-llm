@@ -1745,6 +1745,15 @@ def _fp8_mqa_logits_available() -> bool:
         return False
 
 
+def _fp8_einsum_available() -> bool:
+    try:
+        import deep_gemm
+
+        return hasattr(deep_gemm, "fp8_einsum")
+    except Exception:
+        return False
+
+
 @torch.inference_mode()
 def warmup_dense_gemm_jit(
     shapes: Dict[tuple[str, int, int], dict],
@@ -1837,6 +1846,10 @@ def warmup_batched_fp8_einsum_jit(
     """Compile reachable DeepGEMM wo_a batched FP8 einsum layouts."""
 
     if not model_warm_up_enabled():
+        return
+    if not _fp8_einsum_available():
+        # deep_gemm < 2.8 (the cu129-pinned 2.1.1 build) has no fp8_einsum;
+        # the runtime path falls back to per-group fp8_gemm_nt instead.
         return
     device = torch.device(device)
     if not _is_cuda_device(device) or not shapes:

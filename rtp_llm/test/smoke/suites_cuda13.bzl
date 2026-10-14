@@ -149,20 +149,11 @@ def cuda13_suites():
                 envs=["DG_JIT_CPP_STANDARD=20"],
                 gpu_type=[cuda13_x86_test_gpu()],
             ),
-            # DeepSeek-V4-Flash on H20 (SM90): the dequant-to-FP8 grouped
-            # executor path (grouped_fp4_sm90 strategy) with a 4-layer cut
-            # of the real checkpoint (~16 GB, single card). Local model path
-            # is replaced by a NAS location once the case is promoted to CI.
-            smoke_test(
-                name="v4_flash_4layer_sm90_h20",
-                task_info="data/model/deepseek_v4/q_r_v4_flash_4layer_h20.json",
-                smoke_args="--warm_up 0 --load_method fastsafetensors --max_seq_len 512 --enable_cuda_graph 1 --decode_capture_config '1,2,4,8' --act_type BF16 --tp_size 1 --world_size 1 --seq_size_per_block 64 --test_block_num 512 --fp8_kv_cache 1 --reserver_runtime_mem_mb 8192",
-                envs=[
-                    "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
-                    "DSV4_TRAP_INVALID_KV_ACCESS=0",
-                ],
-                gpu_type=["H20_CU13"],
-            ),
+            # NOTE: the reference branch's single-card 4-layer cut case
+            # (v4_flash_4layer_sm90_h20) is dropped here: the handover ships
+            # neither the 4-layer checkpoint nor its task_info JSON, so the
+            # target cannot even analyze. Bring-up goes straight to the full
+            # model on 4 cards (v4_flash_full_dp4ep4_sm90_h20 below).
             # Full DeepSeek-V4-Flash (43 layers, 155 GB FP4/FP8) on 8x H20:
             # DP8 x EP8 x TP1 with the grouped_fp4_sm90_ep NCCL all-to-all
             # executor. Eager decode first (EP graph capture is follow-up).
@@ -219,6 +210,45 @@ def cuda13_suites():
                 envs=[
                     "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
                     "DSV4_TRAP_INVALID_KV_ACCESS=0",
+                ],
+                gpu_type=["H20_CU13"],
+                sleep_time_qr=15,
+            ),
+            # Full DeepSeek-V4-Flash on 4x H20 (the 4-free-card shape on a
+            # shared 8x H20 host): single-instance DP4 x EP4 x TP1, eager
+            # decode. Decode CUDA graphs need the PD topology (mixed-phase
+            # collective mismatch deadlocks single-process dp+ep+graph), and
+            # PD is memory-infeasible on 4 cards with FP8-resident experts
+            # (284 GB dequantized / 4 = 71 GB per card at ep=4; ep=2 would
+            # need 142 GB > 141 GB HBM), so eager is the reference shape.
+            smoke_test(
+                name="v4_flash_full_dp4ep4_sm90_h20",
+                task_info="data/model/deepseek_v4/q_r_v4_flash_full_pd_dp4ep4_ll_h20.json",
+                smoke_args="--warm_up 0 --load_method fastsafetensors --max_seq_len 2048 --enable_cuda_graph 0 --act_type BF16 --dp_size 4 --ep_size 4 --tp_size 1 --world_size 4 --moe_strategy grouped_fp4_sm90_ep --seq_size_per_block 256 --test_block_num 1024 --fp8_kv_cache 1 --concurrency_limit 1 --max_context_batch_size 1 --reserver_runtime_mem_mb 12288",
+                envs=[
+                    "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
+                    "DSV4_TRAP_INVALID_KV_ACCESS=0",
+                    # torch 2.8 (cuda12_9) lacks float8_e8m0fnu: force the
+                    # nogds copier so UE8M0 scales load via fastsafetensors'
+                    # byte-mode U8 fallback instead of fast_safetensors' C++
+                    # shm reader, which rejects the F8_E8M0 dtype outright.
+                    "FASTSAFETENSORS_NOGDS=1",
+                    # .bazelrc test:cuda12_9 points CC/CXX at the CI image's
+                    # gcc-toolset-12, which this container does not ship;
+                    # Triton compiles its launcher stub at first forward.
+                    "CC=/usr/bin/gcc",
+                    "CXX=/usr/bin/g++",
+                    "CUDAHOSTCXX=/usr/bin/g++",
+                    "NVCC_PREPEND_FLAGS=-ccbin=/usr/bin/g++",
+                    # Task-private flashinfer JIT workspace: the shared
+                    # ~/.cache/flashinfer/0.6.9+e87d610f holds cached_ops .so
+                    # built Aug against the old tvm-ffi 0.1.8 headers
+                    # (NDArray=72); loading them under tvm-ffi 0.1.12
+                    # (Map=72) kills every rank with "Conflicting static
+                    # index 72 between ffi.Map and ffi.NDArray" at the first
+                    # forward. A fresh base dir forces a rebuild against the
+                    # current headers.
+                    "FLASHINFER_WORKSPACE_BASE=/home/admin/dsv4-flashinfer-ws",
                 ],
                 gpu_type=["H20_CU13"],
                 sleep_time_qr=15,

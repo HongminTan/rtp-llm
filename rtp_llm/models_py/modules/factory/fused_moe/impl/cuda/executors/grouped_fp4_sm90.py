@@ -3,10 +3,13 @@
 Hopper has no FP4 tensor cores: DeepGEMM's native ``fp8_fp4`` family and the
 MegaMoE kernels are SM100-only. This executor dequantizes the packed-FP4
 routed-expert weights into FP8 e4m3 with FP32 128x128-block scaling factors
-once at weight-bind time, then runs the same grouped
-``m_grouped_fp8_fp4_gemm_nt_contiguous`` entry point, which DeepGEMM >= 2.8
-dispatches on SM90 to ``sm90_m_grouped_fp8_gemm_contiguous_1d2d`` (FP8
-operands, FP32 scales).
+once at weight-bind time, then runs the grouped FP8 contiguous entry point
+(``m_grouped_fp8_gemm_nt_contiguous``; DeepGEMM >= 2.8 also exposes it as
+``m_grouped_fp8_fp4_gemm_nt_contiguous``), which dispatches on SM90 to
+``sm90_m_grouped_fp8_gemm_contiguous_1d2d`` (FP8 operands, FP32 scales).
+The FP8 name is used directly so the cu129-pinned DeepGEMM 2.1.1 build —
+which carries the same SM90 kernel but not the unified FP8/FP4 dispatcher —
+runs this path too.
 
 Numerics: unpacking FP4 e2m1 x UE8M0 (power-of-two) is exact in FP32; the
 per-128x128-block requantization to e4m3 adds the same class of rounding a
@@ -35,7 +38,7 @@ from typing import Any, Dict
 import torch
 
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
-    m_grouped_fp8_fp4_gemm_nt_contiguous,
+    m_grouped_fp8_gemm_nt_contiguous,
     m_grouped_fp8_gemm_nt_masked,
 )
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
@@ -68,14 +71,16 @@ _GROUPED_ALIGNMENT = 128
 def _has_sm90_grouped_fp8_kernel() -> bool:
     """Whether the dequant-then-grouped-FP8 path is runnable on this host.
 
-    Requires DeepGEMM >= 2.8 (the ``m_grouped_fp8_fp4_*`` entry points
-    dispatch to the SM90 FP32-scale grouped kernels) and an SM90 device.
+    Requires the grouped FP8 contiguous entry point — available as
+    ``m_grouped_fp8_gemm_nt_contiguous`` since DeepGEMM 2.1.1, and aliased by
+    >= 2.8's unified ``m_grouped_fp8_fp4_gemm_nt_contiguous`` dispatcher —
+    plus an SM90 device.
     """
     try:
         import deep_gemm
     except Exception:
         return False
-    if not hasattr(deep_gemm, "m_grouped_fp8_fp4_gemm_nt_contiguous"):
+    if not hasattr(deep_gemm, "m_grouped_fp8_gemm_nt_contiguous"):
         return False
     if not hasattr(deep_gemm, "get_mk_alignment_for_contiguous_layout"):
         return False
@@ -331,7 +336,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         gate_up = torch.empty(
             all_tokens, 2 * inter, device=device, dtype=torch.bfloat16
         )
-        m_grouped_fp8_fp4_gemm_nt_contiguous(
+        m_grouped_fp8_gemm_nt_contiguous(
             (scatter_out, scatter_out_scale),
             (self._w13, self._s13),
             gate_up,
@@ -349,7 +354,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
 
         # GEMM 2: down
         down_out = torch.empty(all_tokens, D, device=device, dtype=torch.bfloat16)
-        m_grouped_fp8_fp4_gemm_nt_contiguous(
+        m_grouped_fp8_gemm_nt_contiguous(
             (h_fp8, h_scale),
             (self._w2, self._s2),
             down_out,

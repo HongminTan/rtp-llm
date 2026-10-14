@@ -1233,3 +1233,129 @@ py_test(
     tags = ["manual", "H20_CU13"],
     exec_properties = {"gpu": "H20_CU13"},
 )
+
+# V4-Flash DP=4 + EP=4 eager decode on 4x H20 (SM90): the 4-free-card shape
+# on a shared 8x H20 host. batch_size is per DP rank, so total concurrency
+# is 4x the listed value (bs 1,2 -> conc 4,8). Conc-1 TPOT is measured as a
+# documented single-request run (GridRunner requires total % dp_size == 0).
+py_test(
+    name = "v4_flash_dp4_decode_eager_sm90_h20_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--batch_size", "1,2",
+        "--input_len", "512,4096",
+        "--partial", "1",
+        "--decode_test_length", "30",
+        "--num_measures", "5",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "8192",
+        "--tp_size", "1",
+        "--dp_size", "4",
+        "--ep_size", "4",
+        "--world_size", "4",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "128",
+        "--reserver_runtime_mem_mb", "12288",
+        "--dsv4_fixed_pool_blocks", "512",
+    ],
+    env = {
+        "WORLD_SIZE": "4",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+        # torch 2.8 (cuda12_9) lacks float8_e8m0fnu: nogds copier loads
+        # UE8M0 scales via the byte-mode U8 fallback (see smoke target).
+        "FASTSAFETENSORS_NOGDS": "1",
+        # .bazelrc test:cuda12_9 points CC/CXX at the CI image's
+        # gcc-toolset-12; this container ships only /usr/bin/gcc (see smoke).
+        "CC": "/usr/bin/gcc",
+        "CXX": "/usr/bin/g++",
+        "CUDAHOSTCXX": "/usr/bin/g++",
+        "NVCC_PREPEND_FLAGS": "-ccbin=/usr/bin/g++",
+        # Task-private flashinfer JIT workspace: the shared
+        # ~/.cache/flashinfer/0.6.9+e87d610f cached_ops were built against
+        # tvm-ffi 0.1.8 (NDArray=72) and crash tvm-ffi 0.1.12 (Map=72) with
+        # "Conflicting static index 72" at first forward. Fresh base dir
+        # forces a rebuild against the current headers (see smoke target).
+        "FLASHINFER_WORKSPACE_BASE": "/home/admin/dsv4-flashinfer-ws",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
+# V4-Flash prefill TTFT on 4x H20 (SM90): single-request TTFT at 16k/32k
+# prompt (GridRunner pins BS=1 in prefill mode). max_seq_len covers 32k
+# prompt + generated tail. Prefix-cache reuse stays off (default) so every
+# measure is a real prefill of the fixed "hello ..." query.
+py_test(
+    name = "v4_flash_dp4_prefill_eager_sm90_h20_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--batch_size", "1",
+        "--input_len", "16000,32000",
+        "--partial", "2",
+        "--decode_test_length", "30",
+        "--num_measures", "5",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "40960",
+        "--tp_size", "1",
+        "--dp_size", "4",
+        "--ep_size", "4",
+        "--world_size", "4",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "128",
+        "--reserver_runtime_mem_mb", "12288",
+        "--dsv4_fixed_pool_blocks", "512",
+    ],
+    env = {
+        "WORLD_SIZE": "4",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+        # torch 2.8 (cuda12_9) lacks float8_e8m0fnu: nogds copier loads
+        # UE8M0 scales via the byte-mode U8 fallback (see smoke target).
+        "FASTSAFETENSORS_NOGDS": "1",
+        # .bazelrc test:cuda12_9 points CC/CXX at the CI image's
+        # gcc-toolset-12; this container ships only /usr/bin/gcc (see smoke).
+        "CC": "/usr/bin/gcc",
+        "CXX": "/usr/bin/g++",
+        "CUDAHOSTCXX": "/usr/bin/g++",
+        "NVCC_PREPEND_FLAGS": "-ccbin=/usr/bin/g++",
+        # Task-private flashinfer JIT workspace: the shared
+        # ~/.cache/flashinfer/0.6.9+e87d610f cached_ops were built against
+        # tvm-ffi 0.1.8 (NDArray=72) and crash tvm-ffi 0.1.12 (Map=72) with
+        # "Conflicting static index 72" at first forward. Fresh base dir
+        # forces a rebuild against the current headers (see smoke target).
+        "FLASHINFER_WORKSPACE_BASE": "/home/admin/dsv4-flashinfer-ws",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)

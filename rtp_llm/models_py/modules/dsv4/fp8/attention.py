@@ -2032,13 +2032,30 @@ class AttentionFP8(nn.Module):
             # group order) into the [M, G, K/128] FP32 grid.
             packed = o_scale.contiguous().view(torch.uint8).to(torch.int32)
             o_scale_f32 = (packed - 127).to(torch.float32).exp2()
-            deep_gemm.fp8_einsum(
-                "bhr,hdr->bhd",
-                (o_fp8, o_scale_f32),
-                (self._wo_a_stk_w, self._wo_a_stk_s),
-                out,
-                recipe=(1, 128, 128),
-            )
+            if hasattr(deep_gemm, "fp8_einsum"):
+                deep_gemm.fp8_einsum(
+                    "bhr,hdr->bhd",
+                    (o_fp8, o_scale_f32),
+                    (self._wo_a_stk_w, self._wo_a_stk_s),
+                    out,
+                    recipe=(1, 128, 128),
+                )
+                return out.view(B, S, G, R)
+            # deep_gemm < 2.8 (the cu129-pinned 2.1.1 build) has no unified
+            # fp8_einsum entry point. Emulate "bhr,hdr->bhd" with one
+            # fp8_gemm_nt per head group: same SM90 FP32-scale
+            # (1, 128, 128) blockwise FP8 math, G small (<= 8).
+            for g in range(G):
+                d_g = torch.empty(M, R, dtype=torch.bfloat16, device=o_fp8.device)
+                deep_gemm.fp8_gemm_nt(
+                    (o_fp8[:, g, :].contiguous(), o_scale_f32[:, g, :].contiguous()),
+                    (self._wo_a_stk_w[g], self._wo_a_stk_s[g]),
+                    d_g,
+                    c=None,
+                    recipe=(1, 128, 128),
+                    disable_ue8m0_cast=True,
+                )
+                out[:, g, :].copy_(d_g)
             return out.view(B, S, G, R)
         deep_gemm.fp8_einsum(
             "bhr,hdr->bhd",

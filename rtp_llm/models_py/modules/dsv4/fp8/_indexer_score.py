@@ -54,11 +54,20 @@ try:
     _DEEP_GEMM_SM100_LEGACY_OK = bool(_match) and tuple(
         int(x) for x in _match.groups()
     ) < (2, 8, 1)
+    # DeepGEMM 2.8 added a trailing ``max_seqlen_k`` parameter to
+    # ``fp8_mqa_logits`` (default 0 = derive the K extent from
+    # ``cu_seq_len_k_end``). Older builds (the cu129-pinned 2.1.1) reject
+    # the extra argument and always derive it internally; every in-tree
+    # caller passes the default, so dropping it there is a no-op.
+    _FP8_MQA_LOGITS_HAS_MAX_SEQLEN_K = _HAS_DEEP_GEMM_MQA and "max_seqlen_k" in (
+        getattr(_deep_gemm.fp8_mqa_logits, "__doc__", None) or ""
+    )
 except ImportError:
     _deep_gemm = None
     _HAS_DEEP_GEMM = False
     _HAS_DEEP_GEMM_MQA = False
     _DEEP_GEMM_SM100_LEGACY_OK = False
+    _FP8_MQA_LOGITS_HAS_MAX_SEQLEN_K = False
 
 
 def _sm100_needs_triton_fallback(device) -> bool:
@@ -212,6 +221,21 @@ def fp8_mqa_indexer_score(
             max_seqlen_k=max_seqlen_k,
         )
 
+    if _FP8_MQA_LOGITS_HAS_MAX_SEQLEN_K:
+        return _deep_gemm.fp8_mqa_logits(
+            q_fp8.contiguous(),
+            (k_quant.contiguous(), k_scale.contiguous()),
+            w_fold.contiguous(),
+            cu_seqlen_ks.contiguous(),
+            cu_seqlen_ke.contiguous(),
+            clean_logits,
+            max_seqlen_k,
+        )
+    # deep_gemm < 2.8 (the cu129-pinned 2.1.1 build) has no max_seqlen_k
+    # parameter and derives the K extent from cu_seq_len_k_end internally.
+    assert (
+        max_seqlen_k == 0
+    ), f"max_seqlen_k={max_seqlen_k} requires DeepGEMM >= 2.8"
     return _deep_gemm.fp8_mqa_logits(
         q_fp8.contiguous(),
         (k_quant.contiguous(), k_scale.contiguous()),
@@ -219,5 +243,4 @@ def fp8_mqa_indexer_score(
         cu_seqlen_ks.contiguous(),
         cu_seqlen_ke.contiguous(),
         clean_logits,
-        max_seqlen_k,
     )
