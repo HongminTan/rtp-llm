@@ -1303,6 +1303,14 @@ py_test(
         # (issues/expandable-segments-corrupts-at-memory-edge.md), and their
         # 7610109e4 picked exactly these two knobs (team/perf-log.md R12b).
         "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.6",
+        # Persistent masked workspace (INBOX r11 instruction 2): the per-forward
+        # torch.zeros of the [e_local, cap_m, D] buffer replays as a fill kernel
+        # every graph step (~0.5 ms/step on this target). Two reversed-order
+        # back-to-back A/B pairs + the semantic gate passed (team/perf-log.md
+        # R43.4-R43.6); conservative -3.2% TPOT. Decode target only: prefill has
+        # zero data for this env (pitfall #2) and the gsm8k gate target must
+        # stay single-variable (splitk only).
+        "DSV4_MASKED_WS_REUSE": "1",
         # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
         # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
         # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
