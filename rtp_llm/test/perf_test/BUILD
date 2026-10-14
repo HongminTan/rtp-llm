@@ -1281,9 +1281,36 @@ py_test(
         "--fp8_kv_cache", "1",
         "--load_method", "fastsafetensors",
         "--moe_strategy", "grouped_fp4_sm90_ep",
+        # CUDA graph stays OFF on the prefill target: prefill is barely captured (only
+        # 4 graph instances are built in prefill mode, all decode-shaped), and
+        # flipping it is not properly measured yet. The one 16k datapoint taken
+        # with it on was faster (9377 ms vs 14406 ms mean over 5 with it off),
+        # which is suggestive but n=1 against a +/-15% spread -- see
+        # team/perf-log.md R7/R8 before treating that as a result.
         "--enable_cuda_graph", "0",
-        "--max_context_batch_size", "128",
-        "--reserver_runtime_mem_mb", "12288",
+        # max_context_batch_size MUST stay 1 here. The engine's prefill warmup
+        # (NormalEngine::prefillWarmUp -> PyWrappedModel::forward with
+        # kv_cache=None) allocates a buffer of
+        #   max_context_batch_size x max_seq_len x hidden x 2 bytes
+        # and at 128 x 40960 x 4096 x 2 that is exactly 40.00 GiB. Model + KV
+        # already hold 113.47 GiB of the 139.80 GiB card, leaving ~12 GiB, so
+        # the engine dies during init with
+        #   "CUDA out of memory. Tried to allocate 40.00 GiB"
+        # and the target never starts -- with or without CUDA graph (see
+        # team/perf-log.md R6; 128x is the whole error). Prefill mode pins BS=1
+        # anyway, so 1 is both sufficient and 128x smaller (0.31 GiB).
+        "--max_context_batch_size", "1",
+        # reserver_runtime_mem_mb 16384 is NOT optional here either, and it is
+        # the one that was isolated: at 12288 the engine still brings the model
+        # up cleanly (the init OOM above is gone) but the backend dies on the
+        # first real 16k prefill -- 8205_CONNECTION_RESET_BY_PEER for all 4
+        # requests, ranks gone, 0/4 on every measure. With 16384 the same
+        # request returns 4/4 five times out of five, with the graph still off,
+        # so the arena is the cause and not the capture. TTFT@16k is still
+        # 14406 ms mean (12656..16586) -- the prefill body runs the eager EP
+        # path and pays the same per-layer rendezvous stall the decode target
+        # did before its graph was enabled (R3/R8).
+        "--reserver_runtime_mem_mb", "16384",
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
