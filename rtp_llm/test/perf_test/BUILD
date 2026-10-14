@@ -1026,22 +1026,9 @@ py_test(
         "--fp8_kv_cache", "1",
         "--load_method", "fastsafetensors",
         "--moe_strategy", "grouped_fp4_sm90_ep",
-        # CUDA graph capture is NOT optional on this lane (team/perf-log.md R3/R4).
-        # With enable_cuda_graph 0 the EP MoE takes grouped_fp4_sm90._forward_ep(),
-        # which does 2 device->host syncs + 4 dist.all_to_all_single per layer;
-        # the ranks then re-rendezvous once per layer and the host blocks ~90 ms
-        # per layer in the DtoH sync that follows. Measured on 4x H20:
-        #   0 -> 13,196 ms/tok  (avg_total_ms 57,781 / 30 decode tokens)
-        #   1 ->     30.4 ms/tok (avg_total_ms    945 / 30 decode tokens)  434x
-        # Capture diverts to _forward_ep_static(): 2 collectives/layer and no
-        # host syncs (scatter_add instead of the synchronising bincount).
-        # reserver_runtime_mem_mb must be raised: the graph memory pools are
-        # carved out of the reserved runtime arena, 12288 OOMs at capture.
-        # 16384 is the value R4 measured with; see 7610109e4 on the reference
-        # branch for the same recipe.
-        "--enable_cuda_graph", "1",
+        "--enable_cuda_graph", "0",
         "--max_context_batch_size", "128",
-        "--reserver_runtime_mem_mb", "16384",
+        "--reserver_runtime_mem_mb", "12288",
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
@@ -1281,49 +1268,21 @@ py_test(
         "--fp8_kv_cache", "1",
         "--load_method", "fastsafetensors",
         "--moe_strategy", "grouped_fp4_sm90_ep",
-        # CUDA graph ON. This was flipped only after a same-n, single-variable
-        # A/B at input_len 16000, num_measures 5 (team/perf-log.md R10):
-        #   graph OFF: 16586.5 16261.7 12656.3 13175.1 13348.4  -> mean 14405.6
-        #   graph ON :  8854.3  9799.1  9650.1  9409.2  9618.6  -> mean  9466.3
-        # The two ranges do not even overlap (max ON 9799 < min OFF 12656), so
-        # the 1.52x / -34.3% is a result and not the +/-15% noise the earlier
-        # single graph-on datapoint could not beat (R7/R8).
-        # Note what this does and does not say: 16k prefill is NOT captured.
-        # The prefill capture range is generated as 1..160 tokens
-        # (hw_kernel_group_args.py _parse_prefill_capture_config, default
-        # "160:1", logs "Generated 160 sequence lengths from range (step=1,
-        # max=160)"; the runner dump shows max_kernel_block_table_width_: 160
-        # and is_prefill_cuda_graph_mode_: 0), so a 16k request hits
-        # cuda_graph_runner.cc "prefill seq_len %d exceeds max captured %d,
-        # fallback to normal run" and still runs the eager EP path. The 1.52x
-        # is therefore a side effect of enabling the graph at all (graph
-        # memory pools carved out up front, so the eager path stops doing
-        # synchronising allocator work mid-layer), NOT of capture. Widening
-        # the capture range to cover 16k is the next, much larger lever.
+        # CUDA graph capture is NOT optional on this lane (team/perf-log.md R3/R4).
+        # With enable_cuda_graph 0 the EP MoE takes grouped_fp4_sm90._forward_ep(),
+        # which does 2 device->host syncs + 4 dist.all_to_all_single per layer;
+        # the ranks then re-rendezvous once per layer and the host blocks ~90 ms
+        # per layer in the DtoH sync that follows. Measured on 4x H20:
+        #   0 -> 13,196 ms/tok  (avg_total_ms 57,781 / 30 decode tokens)
+        #   1 ->     30.4 ms/tok (avg_total_ms    945 / 30 decode tokens)  434x
+        # Capture diverts to _forward_ep_static(): 2 collectives/layer and no
+        # host syncs (scatter_add instead of the synchronising bincount).
+        # reserver_runtime_mem_mb must be raised: the graph memory pools are
+        # carved out of the reserved runtime arena, 12288 OOMs at capture.
+        # 16384 is the value R4 measured with; see 7610109e4 on the reference
+        # branch for the same recipe.
         "--enable_cuda_graph", "1",
-        # max_context_batch_size MUST stay 1 here. The engine's prefill warmup
-        # (NormalEngine::prefillWarmUp -> PyWrappedModel::forward with
-        # kv_cache=None) allocates a buffer of
-        #   max_context_batch_size x max_seq_len x hidden x 2 bytes
-        # and at 128 x 40960 x 4096 x 2 that is exactly 40.00 GiB. Model + KV
-        # already hold 113.47 GiB of the 139.80 GiB card, leaving ~12 GiB, so
-        # the engine dies during init with
-        #   "CUDA out of memory. Tried to allocate 40.00 GiB"
-        # and the target never starts -- with or without CUDA graph (see
-        # team/perf-log.md R6; 128x is the whole error). Prefill mode pins BS=1
-        # anyway, so 1 is both sufficient and 128x smaller (0.31 GiB).
-        "--max_context_batch_size", "1",
-        # reserver_runtime_mem_mb 16384 is NOT optional here either, and it is
-        # the one that was isolated: at 12288 the engine still brings the model
-        # up cleanly (the init OOM above is gone) but the backend dies on the
-        # first real 16k prefill -- 8205_CONNECTION_RESET_BY_PEER for all 4
-        # requests, ranks gone, 0/4 on every measure. With 16384 the same
-        # request returns 4/4 five times out of five, with the graph still off,
-        # so the arena is the cause and not the capture. At the committed
-        # setting (arena 16384 + graph on) TTFT@16k is 9466 ms mean over 5
-        # (8854..9799); the prefill body still runs the eager EP path and pays
-        # the same per-layer rendezvous stall the decode target had before its
-        # graph was enabled (R3/R8/R10).
+        "--max_context_batch_size", "128",
         "--reserver_runtime_mem_mb", "16384",
         "--dsv4_fixed_pool_blocks", "512",
     ],
@@ -1409,18 +1368,65 @@ py_test(
         "--fp8_kv_cache", "1",
         "--load_method", "fastsafetensors",
         "--moe_strategy", "grouped_fp4_sm90_ep",
-        "--enable_cuda_graph", "0",
-        "--max_context_batch_size", "128",
-        "--reserver_runtime_mem_mb", "12288",
+        # CUDA graph ON. This was flipped only after a same-n, single-variable
+        # A/B at input_len 16000, num_measures 5 (team/perf-log.md R10):
+        #   graph OFF: 16586.5 16261.7 12656.3 13175.1 13348.4  -> mean 14405.6
+        #   graph ON :  8854.3  9799.1  9650.1  9409.2  9618.6  -> mean  9466.3
+        # The two ranges do not even overlap (max ON 9799 < min OFF 12656), so
+        # the 1.52x / -34.3% is a result and not the +/-15% noise the earlier
+        # single graph-on datapoint could not beat (R7/R8).
+        # Note what this does and does not say: 16k prefill is NOT captured.
+        # The prefill capture range is generated as 1..160 tokens
+        # (hw_kernel_group_args.py _parse_prefill_capture_config, default
+        # "160:1", logs "Generated 160 sequence lengths from range (step=1,
+        # max=160)"; the runner dump shows max_kernel_block_table_width_: 160
+        # and is_prefill_cuda_graph_mode_: 0), so a 16k request hits
+        # cuda_graph_runner.cc "prefill seq_len %d exceeds max captured %d,
+        # fallback to normal run" and still runs the eager EP path. The 1.52x
+        # is therefore a side effect of enabling the graph at all (graph
+        # memory pools carved out up front, so the eager path stops doing
+        # synchronising allocator work mid-layer), NOT of capture. Widening
+        # the capture range to cover 16k is the next, much larger lever.
+        "--enable_cuda_graph", "1",
+        # max_context_batch_size MUST stay 1 here. The engine's prefill warmup
+        # (NormalEngine::prefillWarmUp -> PyWrappedModel::forward with
+        # kv_cache=None) allocates a buffer of
+        #   max_context_batch_size x max_seq_len x hidden x 2 bytes
+        # and at 128 x 40960 x 4096 x 2 that is exactly 40.00 GiB. Model + KV
+        # already hold 113.47 GiB of the 139.80 GiB card, leaving ~12 GiB, so
+        # the engine dies during init with
+        #   "CUDA out of memory. Tried to allocate 40.00 GiB"
+        # and the target never starts -- with or without CUDA graph (see
+        # team/perf-log.md R6; 128x is the whole error). Prefill mode pins BS=1
+        # anyway, so 1 is both sufficient and 128x smaller (0.31 GiB).
+        "--max_context_batch_size", "1",
+        # reserver_runtime_mem_mb 16384 is NOT optional here either, and it is
+        # the one that was isolated: at 12288 the engine still brings the model
+        # up cleanly (the init OOM above is gone) but the backend dies on the
+        # first real 16k prefill -- 8205_CONNECTION_RESET_BY_PEER for all 4
+        # requests, ranks gone, 0/4 on every measure. With 16384 the same
+        # request returns 4/4 five times out of five, with the graph still off,
+        # so the arena is the cause and not the capture. At the committed
+        # setting (arena 16384 + graph on) TTFT@16k is 9466 ms mean over 5
+        # (8854..9799); the prefill body still runs the eager EP path and pays
+        # the same per-layer rendezvous stall the decode target had before its
+        # graph was enabled (R3/R8/R10).
+        "--reserver_runtime_mem_mb", "16384",
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
-        # Same allocator policy as the decode target, where it was measured at
-        # -5% TPOT (team/perf-log.md R13). It is set here WITHOUT a local A/B:
-        # the mechanism is allocator-global and the knob is a documented PD
-        # runtime prerequisite on the reference branch (7610109e4), but the
-        # prefill-side gain is unverified. Treat it as inherited, not proven.
-        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.6",
+        # Do NOT set PYTORCH_CUDA_ALLOC_CONF here. It is set on the DECODE
+        # target, where it was measured at -5% TPOT (team/perf-log.md R13),
+        # but on this prefill target the exact same env kills the backend:
+        # every request on the first 16k prefill comes back
+        # 8205_CONNECTION_RESET_BY_PEER and then 8202_CONNECT_FAILED, 0/4 on
+        # the pre-arm measure and 0/4 on all five measured runs -- the same
+        # signature as R7b's under-sized arena, but now with the arena at the
+        # known-good 16384 and the allocator policy as the only diff against
+        # R10's 5/5-PASSED graph-on run. See R14: the knob is net-negative
+        # here, so it stays decode-only until someone isolates which of the
+        # two sub-knobs (max_split_size_mb / garbage_collection_threshold)
+        # does it and why.
         # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
         # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
         # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
