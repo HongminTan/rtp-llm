@@ -1745,6 +1745,23 @@ def _fp8_mqa_logits_available() -> bool:
         return False
 
 
+def _fp8_mqa_logits_has_max_seqlen_k() -> bool:
+    # DeepGEMM 2.8 added a trailing ``max_seqlen_k`` parameter to
+    # ``fp8_mqa_logits`` (default 0 = derive the K extent from
+    # ``cu_seq_len_k_end``). Older builds (the cu129-pinned 2.1.1) reject
+    # the extra argument and always derive it internally; dropping the
+    # trailing 0 there is a no-op. Mirrors
+    # ``dsv4.fp8._indexer_score._FP8_MQA_LOGITS_HAS_MAX_SEQLEN_K``.
+    try:
+        import deep_gemm
+
+        return "max_seqlen_k" in (
+            getattr(deep_gemm.fp8_mqa_logits, "__doc__", None) or ""
+        )
+    except Exception:
+        return False
+
+
 def _fp8_einsum_available() -> bool:
     try:
         import deep_gemm
@@ -2737,13 +2754,25 @@ def _launch_dummy_fp8_mqa_logits(
     ks = torch.zeros((seq_len,), dtype=torch.int32, device=device)
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device=device)
 
-    logits = deep_gemm.fp8_mqa_logits(
-        q,
-        (k, k_scale),
-        weights,
-        ks,
-        ke,
-        False,
-        0,
-    )
+    if _fp8_mqa_logits_has_max_seqlen_k():
+        logits = deep_gemm.fp8_mqa_logits(
+            q,
+            (k, k_scale),
+            weights,
+            ks,
+            ke,
+            False,
+            0,
+        )
+    else:
+        # deep_gemm < 2.8 (the cu129-pinned 2.1.1 build) has no max_seqlen_k
+        # parameter; it derives the K extent from cu_seq_len_k_end.
+        logits = deep_gemm.fp8_mqa_logits(
+            q,
+            (k, k_scale),
+            weights,
+            ks,
+            ke,
+            False,
+        )
     del q, k, k_scale, weights, ks, ke, logits
