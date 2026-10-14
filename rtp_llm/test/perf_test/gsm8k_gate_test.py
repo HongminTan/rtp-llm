@@ -117,7 +117,12 @@ def main() -> int:
 
         def _one(q):
             t0 = time.monotonic()
-            r = _post_question(port, prompts[q["qid"]], args.max_new_tokens, args.request_timeout)
+            try:
+                r = _post_question(
+                    port, prompts[q["qid"]], args.max_new_tokens, args.request_timeout
+                )
+            except Exception as e:  # noqa: BLE001 - never fail the whole gate
+                r = {"ok": False, "error": str(e)[:200]}
             wall = time.monotonic() - t0
             entry: Dict[str, Any] = {
                 "qid": q["qid"],
@@ -127,8 +132,9 @@ def main() -> int:
             if r.get("ok"):
                 body = r["body"]
                 texts = body.get("response") or []
-                aux = (body.get("aux_info") or [{}])[0]
-                text = texts[0] if texts else ""
+                # aux_info is a dict (see dataclass.py ResponseInfo), not a list.
+                aux = body.get("aux_info") or {}
+                text = texts[0] if texts and isinstance(texts, list) else str(texts)
                 entry["ok"] = True
                 entry["finished"] = bool(body.get("finished"))
                 entry["output_len"] = int(aux.get("output_len", len(text)))
