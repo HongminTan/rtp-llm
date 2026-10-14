@@ -664,10 +664,15 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
             masked_m,
             expected_m,
         )
+        # Pass masked_m so the silu+quant kernel skips the padded capacity
+        # rows (the same HAS_MASK fast path the LL executor already uses):
+        # at decode the valid fraction of [e_local, cap_m] is <1%, so the
+        # unmasked launch spent ~88us/call traversing empty rows.
         h_fp8, h_scale = silu_mul_fp8_quant_f32_scale(
-            gate_up.view(e_local * cap_m, 2 * inter),
+            gate_up,
             clamp_limit=cfg.swiglu_limit,
             group_size=FP8_BLOCK,
+            masked_m=masked_m,
         )
         down = torch.empty((e_local, cap_m, D), device=device, dtype=bf16)
         m_grouped_fp8_gemm_nt_masked(
