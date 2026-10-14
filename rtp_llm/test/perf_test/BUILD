@@ -1274,6 +1274,14 @@ py_test(
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
+        # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
+        # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
+        # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
+        # available" during model init and the engine never starts. That is a
+        # third 2.1.1 compat gap after fp8_einsum and max_seqlen_k. Until the
+        # symbol lands (see team/perf-log.md R2) tilelang_single is the only
+        # backend this build can actually run -- do not flip this to deepgemm
+        # (the reference branch's target uses it because its DeepGEMM has it).
         "WORLD_SIZE": "4",
         "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
         "DSV4_TRAP_INVALID_KV_ACCESS": "0",
@@ -1337,6 +1345,14 @@ py_test(
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
+        # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
+        # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
+        # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
+        # available" during model init and the engine never starts. That is a
+        # third 2.1.1 compat gap after fp8_einsum and max_seqlen_k. Until the
+        # symbol lands (see team/perf-log.md R2) tilelang_single is the only
+        # backend this build can actually run -- do not flip this to deepgemm
+        # (the reference branch's target uses it because its DeepGEMM has it).
         "WORLD_SIZE": "4",
         "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
         "DSV4_TRAP_INVALID_KV_ACCESS": "0",
