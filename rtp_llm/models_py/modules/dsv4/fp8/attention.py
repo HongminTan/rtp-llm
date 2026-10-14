@@ -352,6 +352,46 @@ def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
     return get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_rep)
 
 
+_WOA_GROUPED_BUFFERS: Dict[Tuple[int, int, int, str], tuple] = {}
+_WOA_MASKED_M_CACHE: Dict[Tuple[int, str], torch.Tensor] = {}
+# The SM90 masked grouped GEMM requires a per-group row capacity >= one
+# M-tile (64); cap_m=1 produces wrong results (empirically pinned).
+_WOA_MASKED_CAP = 64
+
+
+def _wo_a_grouped_gemm_enabled() -> bool:
+    """Opt-in: replace the per-group fp8_gemm_nt fallback loop with one
+    m_grouped_fp8_gemm_nt_masked launch (cu129-pinned deep_gemm 2.1.1 has no
+    unified fp8_einsum entry point). Default off pending A/B."""
+    return os.environ.get("DSV4_WOA_GROUPED_GEMM", "0") == "1"
+
+
+def _wo_a_grouped_buffers(G: int, R: int, K: int, device: torch.device) -> tuple:
+    """Persistent (a_m, a_sf, d_m) masked-layout buffers, shared by every
+    attention layer of the same shape (sequential-stream reuse is safe both
+    eager and under CUDA graph replay: layer i consumes d_m before layer
+    i+1 overwrites it)."""
+    key = (G, R, K, str(device))
+    bufs = _WOA_GROUPED_BUFFERS.get(key)
+    if bufs is None:
+        cap = _WOA_MASKED_CAP
+        a_m = torch.zeros(G, cap, K, dtype=torch.float8_e4m3fn, device=device)
+        a_sf = torch.zeros(G, cap, K // 128, dtype=torch.float32, device=device)
+        d_m = torch.zeros(G, cap, R, dtype=torch.bfloat16, device=device)
+        bufs = (a_m, a_sf, d_m)
+        _WOA_GROUPED_BUFFERS[key] = bufs
+    return bufs
+
+
+def _wo_a_masked_m(G: int, device: torch.device) -> torch.Tensor:
+    key = (G, str(device))
+    masked_m = _WOA_MASKED_M_CACHE.get(key)
+    if masked_m is None:
+        masked_m = torch.ones(G, dtype=torch.int32, device=device)
+        _WOA_MASKED_M_CACHE[key] = masked_m
+    return masked_m
+
+
 def _prepare_wo_a_stacked(
     weight_fp8: torch.Tensor,
     scale_raw: torch.Tensor,
@@ -2042,9 +2082,30 @@ class AttentionFP8(nn.Module):
                 )
                 return out.view(B, S, G, R)
             # deep_gemm < 2.8 (the cu129-pinned 2.1.1 build) has no unified
-            # fp8_einsum entry point. Emulate "bhr,hdr->bhd" with one
-            # fp8_gemm_nt per head group: same SM90 FP32-scale
-            # (1, 128, 128) blockwise FP8 math, G small (<= 8).
+            # fp8_einsum entry point. Prefer one m_grouped_fp8_gemm_nt_masked
+            # launch over the per-group loop below for decode (M == 1): the
+            # loop costs G launches + G strided contiguous() + G copy_ per
+            # layer (G == 8 on V4 Flash); the masked path is one GEMM plus
+            # two small strided copies (pad-in / unpad-out). Bit-identical
+            # to the loop on the per-group math (bench/probe_woa_grouped_vs_
+            # loop.py, cap_m=64 pinned empirically; cap_m=1 is invalid).
+            if _wo_a_grouped_gemm_enabled() and M == 1:
+                K = _K
+                a_m, a_sf, d_m = _wo_a_grouped_buffers(G, R, K, o_fp8.device)
+                a_m[:, 0, :] = o_fp8.squeeze(0)
+                a_sf[:, 0, :] = o_scale_f32.squeeze(0)
+                deep_gemm.m_grouped_fp8_gemm_nt_masked(
+                    (a_m, a_sf),
+                    (self._wo_a_stk_w, self._wo_a_stk_s),
+                    d_m,
+                    _wo_a_masked_m(G, o_fp8.device),
+                    1,
+                )
+                out.copy_(d_m[:, :1, :].permute(1, 0, 2))
+                return out.view(B, S, G, R)
+            # Emulate "bhr,hdr->bhd" with one fp8_gemm_nt per head group:
+            # same SM90 FP32-scale (1, 128, 128) blockwise FP8 math, G small
+            # (<= 8).
             for g in range(G):
                 d_g = torch.empty(M, R, dtype=torch.bfloat16, device=o_fp8.device)
                 deep_gemm.fp8_gemm_nt(
