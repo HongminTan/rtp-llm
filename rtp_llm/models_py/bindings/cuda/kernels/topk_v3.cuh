@@ -1083,8 +1083,7 @@ private:
         const auto  threshold_bin = smem->threshold_bin;
         const float v_hi          = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
         const float v_lo          = coarse_bin_lower_bound<kHistBits>(threshold_bin);
-        // Keep the local temporary arm in the SM90 cluster address space.
-        const auto cur_out = is_primary ? problem.out : cluster.map_shared_rank(smem->tmp_out, this_rank);
+        const auto  cur_out       = is_primary ? problem.out : smem->tmp_out;
         // Deterministic per-rank positions: counting sweep, thread-order block
         // prefix, then emit/append in the same iteration order. Replaces the
         // atomicAdd arrival order so outputs are reproducible run to run.
