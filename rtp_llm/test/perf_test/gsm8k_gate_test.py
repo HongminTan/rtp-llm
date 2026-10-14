@@ -115,6 +115,31 @@ def main() -> int:
         port = server.port
         logging.info("[GSM8K GATE] engine up on port %d", port)
 
+        # Mirror the perf chain's scheduler contract (batch_perf_impl
+        # ._set_concurrency): broadcast the expected per-rank batch size and
+        # decode mode to every DP rank before driving requests. R34.8: the
+        # free-flow client broke rank phase symmetry and ranks 1-3 spun in
+        # the EP collective waiting for rank 0 (GPU0 0% vs 1-3 100%).
+        sched_payload = {
+            "batch_size": max(1, args.concurrency // args.dp_size),
+            "mode": "decode",
+        }
+        for attempt in range(20):
+            try:
+                r = requests.post(
+                    f"http://127.0.0.1:{port}/update_scheduler_info",
+                    json=sched_payload,
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    logging.info(
+                        "[GSM8K GATE] update_scheduler_info ok: %s", sched_payload
+                    )
+                    break
+            except Exception as e:  # noqa: BLE001 - retry like the perf chain
+                logging.warning("update_scheduler_info attempt %d failed: %s", attempt + 1, e)
+            time.sleep(1)
+
         def _one(q):
             t0 = time.monotonic()
             try:
