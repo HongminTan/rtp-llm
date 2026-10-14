@@ -1026,9 +1026,22 @@ py_test(
         "--fp8_kv_cache", "1",
         "--load_method", "fastsafetensors",
         "--moe_strategy", "grouped_fp4_sm90_ep",
-        "--enable_cuda_graph", "0",
+        # CUDA graph capture is NOT optional on this lane (team/perf-log.md R3/R4).
+        # With enable_cuda_graph 0 the EP MoE takes grouped_fp4_sm90._forward_ep(),
+        # which does 2 device->host syncs + 4 dist.all_to_all_single per layer;
+        # the ranks then re-rendezvous once per layer and the host blocks ~90 ms
+        # per layer in the DtoH sync that follows. Measured on 4x H20:
+        #   0 -> 13,196 ms/tok  (avg_total_ms 57,781 / 30 decode tokens)
+        #   1 ->     30.4 ms/tok (avg_total_ms    945 / 30 decode tokens)  434x
+        # Capture diverts to _forward_ep_static(): 2 collectives/layer and no
+        # host syncs (scatter_add instead of the synchronising bincount).
+        # reserver_runtime_mem_mb must be raised: the graph memory pools are
+        # carved out of the reserved runtime arena, 12288 OOMs at capture.
+        # 16384 is the value R4 measured with; see 7610109e4 on the reference
+        # branch for the same recipe.
+        "--enable_cuda_graph", "1",
         "--max_context_batch_size", "128",
-        "--reserver_runtime_mem_mb", "12288",
+        "--reserver_runtime_mem_mb", "16384",
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
