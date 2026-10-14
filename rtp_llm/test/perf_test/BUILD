@@ -1328,6 +1328,22 @@ py_test(
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
+        # Allocator policy, MEASURED on this very target (team/perf-log.md R13).
+        # That run carried zero --test_arg, so the only diff against the R5
+        # table is this one env var:
+        #   TPOT  512/1 33.14 -> 31.38, 512/2 35.19 -> 33.32,
+        #         4096/1 33.65 -> 32.01, 4096/2 35.27 -> 33.55   (all -5%)
+        # and bs1-512 avg_total_ms 998.65 -> 948.95 mean (-5.0%) against a
+        # within-run spread of only 1.2%. Uniform across four independent
+        # points, so it is a result and not drift. max_split_size_mb:256 caps
+        # the block split size so the graph-capture pools come out of a less
+        # fragmented arena; garbage_collection_threshold:0.6 lets the collector
+        # run earlier instead of growing the reserved segment. Do NOT swap in
+        # expandable_segments: the reference branch documents it corrupting
+        # numerics at this occupancy
+        # (issues/expandable-segments-corrupts-at-memory-edge.md), and their
+        # 7610109e4 picked exactly these two knobs (team/perf-log.md R12b).
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.6",
         # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
         # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
         # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
@@ -1399,6 +1415,12 @@ py_test(
         "--dsv4_fixed_pool_blocks", "512",
     ],
     env = {
+        # Same allocator policy as the decode target, where it was measured at
+        # -5% TPOT (team/perf-log.md R13). It is set here WITHOUT a local A/B:
+        # the mechanism is allocator-global and the knob is a documented PD
+        # runtime prerequisite on the reference branch (7610109e4), but the
+        # prefill-side gain is unverified. Treat it as inherited, not proven.
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.6",
         # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
         # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
         # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
