@@ -1281,13 +1281,26 @@ py_test(
         "--fp8_kv_cache", "1",
         "--load_method", "fastsafetensors",
         "--moe_strategy", "grouped_fp4_sm90_ep",
-        # CUDA graph stays OFF on the prefill target: prefill is barely captured (only
-        # 4 graph instances are built in prefill mode, all decode-shaped), and
-        # flipping it is not properly measured yet. The one 16k datapoint taken
-        # with it on was faster (9377 ms vs 14406 ms mean over 5 with it off),
-        # which is suggestive but n=1 against a +/-15% spread -- see
-        # team/perf-log.md R7/R8 before treating that as a result.
-        "--enable_cuda_graph", "0",
+        # CUDA graph ON. This was flipped only after a same-n, single-variable
+        # A/B at input_len 16000, num_measures 5 (team/perf-log.md R10):
+        #   graph OFF: 16586.5 16261.7 12656.3 13175.1 13348.4  -> mean 14405.6
+        #   graph ON :  8854.3  9799.1  9650.1  9409.2  9618.6  -> mean  9466.3
+        # The two ranges do not even overlap (max ON 9799 < min OFF 12656), so
+        # the 1.52x / -34.3% is a result and not the +/-15% noise the earlier
+        # single graph-on datapoint could not beat (R7/R8).
+        # Note what this does and does not say: 16k prefill is NOT captured.
+        # The prefill capture range is generated as 1..160 tokens
+        # (hw_kernel_group_args.py _parse_prefill_capture_config, default
+        # "160:1", logs "Generated 160 sequence lengths from range (step=1,
+        # max=160)"; the runner dump shows max_kernel_block_table_width_: 160
+        # and is_prefill_cuda_graph_mode_: 0), so a 16k request hits
+        # cuda_graph_runner.cc "prefill seq_len %d exceeds max captured %d,
+        # fallback to normal run" and still runs the eager EP path. The 1.52x
+        # is therefore a side effect of enabling the graph at all (graph
+        # memory pools carved out up front, so the eager path stops doing
+        # synchronising allocator work mid-layer), NOT of capture. Widening
+        # the capture range to cover 16k is the next, much larger lever.
+        "--enable_cuda_graph", "1",
         # max_context_batch_size MUST stay 1 here. The engine's prefill warmup
         # (NormalEngine::prefillWarmUp -> PyWrappedModel::forward with
         # kv_cache=None) allocates a buffer of
@@ -1306,10 +1319,11 @@ py_test(
         # first real 16k prefill -- 8205_CONNECTION_RESET_BY_PEER for all 4
         # requests, ranks gone, 0/4 on every measure. With 16384 the same
         # request returns 4/4 five times out of five, with the graph still off,
-        # so the arena is the cause and not the capture. TTFT@16k is still
-        # 14406 ms mean (12656..16586) -- the prefill body runs the eager EP
-        # path and pays the same per-layer rendezvous stall the decode target
-        # did before its graph was enabled (R3/R8).
+        # so the arena is the cause and not the capture. At the committed
+        # setting (arena 16384 + graph on) TTFT@16k is 9466 ms mean over 5
+        # (8854..9799); the prefill body still runs the eager EP path and pays
+        # the same per-layer rendezvous stall the decode target had before its
+        # graph was enabled (R3/R8/R10).
         "--reserver_runtime_mem_mb", "16384",
         "--dsv4_fixed_pool_blocks", "512",
     ],
