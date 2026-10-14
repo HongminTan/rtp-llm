@@ -171,11 +171,15 @@ def main() -> int:
                 entry["verdict"] = "request_failed"
             return entry
 
-        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            for i, entry in enumerate(pool.map(_one, questions), 1):
-                results.append(entry)
-                if i % 25 == 0:
-                    logging.info("[GSM8K GATE] %d/%d done", i, len(questions))
+        # R34.8 step 2: lockstep waves (perf chain wave semantics) — fire
+        # exactly args.concurrency questions simultaneously and wait for all
+        # responses before the next wave, so every DP rank keeps the same
+        # stream count and phase at all times.
+        for wave_start in range(0, len(questions), args.concurrency):
+            wave = questions[wave_start : wave_start + args.concurrency]
+            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                results.extend(pool.map(_one, wave))
+            logging.info("[GSM8K GATE] %d/%d done", len(results), len(questions))
     finally:
         server.stop()
 
