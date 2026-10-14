@@ -56,7 +56,6 @@ def _post_question(
         "generate_config": {
             "max_new_tokens": max_new_tokens,
             "min_new_tokens": 1,
-            "temperature": 0.0,
             "top_k": 1,
             "force_sp_accept": True,
         },
