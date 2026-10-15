@@ -155,6 +155,12 @@ _JIT_CACHE_SRCS = [
 _JIT_CACHE_ENV_SRCS = ["utils/jit_cache_env.py"]
 
 py_library(
+    name = "package_init",
+    srcs = ["__init__.py"],
+    deps = [":utils"],
+)
+
+py_library(
     name = "utils",
     srcs = glob([
         "utils/**/*.py",
@@ -305,6 +311,7 @@ py_library(
         "//rtp_llm/model_loader:loader",
         "//rtp_llm/models_py:models",
         ":multimodal",
+        ":async_model",
     ] + select({
         # cuda13 locks ship deep-gemm and deep-ep.
         "@//:using_cuda13_x86": deep,
@@ -555,6 +562,7 @@ py_library(
 py_library(
     name = "rtp_llm_frontend_lib",
     deps = [
+        ":package_init",
         ":utils",
         ":eplb",
         ":ops",

@@ -9,6 +9,7 @@ from .fp8_fp4 import (
     CudaGroupedFp4Strategy,
     CudaGroupedFp4Sm90EpStrategy,
     CudaGroupedFp4Sm90Strategy,
+    CudaGroupedFp8Strategy,
     CudaLocalLoopStrategy,
     CudaMegaMoeSEStrategy,
     CudaMegaMoeStrategy,
@@ -65,5 +66,6 @@ __all__ = [
     "CudaGroupedFp4Strategy",
     "CudaGroupedFp4Sm90EpStrategy",
     "CudaGroupedFp4Sm90Strategy",
+    "CudaGroupedFp8Strategy",
     "CudaLocalLoopStrategy",
 ]

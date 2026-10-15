@@ -72,7 +72,9 @@ def _mhc_pre_norm_fn_fwd_mul(
     token_block: int = 32,
     hidden_block: int = 256,
 ) -> tilelang.JITKernel:
-    assert mhc_mult3 <= 32
+    assert (
+        0 < mhc_mult3 <= 32
+    ), f"mhc_mult3={mhc_mult3} must be positive and fit the 32-wide store fragment"
     num_tokens = T.dynamic("num_tokens")
     assert rms_group_size % hidden_block == 0
 
@@ -130,7 +132,7 @@ def _mhc_pre_norm_fn_fwd_mul(
             for i in T.Parallel(token_block):
                 sqrsum[pid_x * token_block + i, pid_y] = sqrsum_l[i]
             for i, j in T.Parallel(token_block, 32):
-                if j < 24:
+                if j < mhc_mult3:
                     out[pid_x * token_block + i, pid_y, j] = out_frag[i, j]
 
     return _mhc_pre_norm_fn_fwd_mul_kernel
@@ -145,19 +147,45 @@ def _mhc_pre_norm_fn_fwd_mul_splitk(
     token_block: int = 32,
     hidden_block: int = 256,
 ) -> tilelang.JITKernel:
-    """Split-K variant of `_mhc_pre_norm_fn_fwd_mul`.
+    """``_mhc_pre_norm_fn_fwd_mul`` with the K loop spread across the grid.
 
-    Body is line-for-line identical to the single-block kernel; the only
-    differences are the extra grid dimension, which K blocks each block owns,
-    and storing into the leading split slot. The consumer
-    (`_mhc_pre_norm_fn_fwd_norm` / `_mhc_pre_big_fuse`) already sums the split
-    axis, so the results are equivalent up to fp32 accumulation order.
+    The single-block version above is the whole cost of mHC at decode. Its grid
+    is ``(ceildiv(num_tokens, 32), n_rms_group)`` and every call site passes
+    ``n_rms_group=1``, so for ``num_tokens <= 32`` it is one CUDA block, which
+    then walks all ``rms_group_size // hidden_block`` K blocks serially --
+    64 of them for DSV4-Flash (rms_group_size = hc_mult * dim = 16384). One SM
+    pulling 1.57 MB of ``fn`` plus 1 MB of ``x`` measures 86 us in an nsys
+    timeline of the live decode server, twice per layer, 21.1% of all decode
+    GPU time and completely independent of batch size.
+
+    Splitting K is what the rest of this file already expects: both
+    ``_mhc_pre_norm_fn_fwd_norm`` and ``mhc/pre_big_fuse_kernel``'s
+    ``_mhc_pre_big_fuse`` take ``n_splits`` and sum the leading axis, and
+    ``ops/pre_big_fuse.py`` already sizes its ``gemm_out_*`` buffers
+    ``[n_splits, ...]`` and computes a split count from the SM count. The only
+    missing piece was a producer, which is this.
+
+    Body is the single-block kernel unchanged except that ``pz`` covers only
+    this split's slice of the K blocks and the two stores land in slot
+    ``pid_s``. ``n_splits`` must divide the K block count; the caller is
+    responsible (see ``largest_divisor_le`` in
+    ``models_py/modules/dsv4/mhc_prenorm_backend.py``).
+
+    Accuracy improves rather than degrades: against an fp64 reference at
+    T in {2,8,16}, relative Frobenius error of ``out`` is 3.83-4.17e-04 here
+    versus 4.10-4.45e-04 for the single-block kernel, because each accumulation
+    chain is 64x shorter.
     """
-    assert mhc_mult3 <= 32
+    assert (
+        0 < mhc_mult3 <= 32
+    ), f"mhc_mult3={mhc_mult3} must be positive and fit the 32-wide store fragment"
     num_tokens = T.dynamic("num_tokens")
     assert rms_group_size % hidden_block == 0
     n_blk = rms_group_size // hidden_block
-    assert n_blk % n_splits == 0
+    assert n_blk % n_splits == 0, (
+        f"n_splits={n_splits} must divide the {n_blk} K blocks "
+        f"(rms_group_size={rms_group_size}, hidden_block={hidden_block})"
+    )
     blk_per_split = n_blk // n_splits
 
     @T.prim_func
@@ -226,7 +254,7 @@ def _mhc_pre_norm_fn_fwd_mul_splitk(
             for i in T.Parallel(token_block):
                 sqrsum[pid_s, pid_x * token_block + i, pid_y] = sqrsum_l[i]
             for i, j in T.Parallel(token_block, 32):
-                if j < 24:
+                if j < mhc_mult3:
                     out[pid_s, pid_x * token_block + i, pid_y, j] = out_frag[i, j]
 
     return _mhc_pre_norm_fn_fwd_mul_splitk_kernel
@@ -329,7 +357,9 @@ def _mhc_pre_norm_fn_bwd_mul(
     token_block: int = 128,
     hidden_block: int = 128,
 ) -> tilelang.JITKernel:
-    assert mhc_mult3 <= 32
+    assert (
+        0 < mhc_mult3 <= 32
+    ), f"mhc_mult3={mhc_mult3} must be positive and fit the 32-wide store fragment"
     num_tokens = T.dynamic("num_tokens")
     assert rms_group_size % hidden_block == 0
 

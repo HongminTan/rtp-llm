@@ -33,7 +33,7 @@ from deep_gemm.utils.layout import (  # noqa: E402
     get_mn_major_tma_aligned_packed_ue8m0_tensor,
 )
 
-from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton import (
     fused_inv_rope_fp8_quant,
 )
@@ -72,10 +72,15 @@ from rtp_llm.models_py.modules.dsv4.fp8._swa_cp_byte_sliced import (
     CPByteSlicedSlotCompaction,
     build_cp_byte_sliced_slot_compaction,
 )
+from rtp_llm.models_py.modules.dsv4.fp8._wo_a_sm90 import (
+    prepare_wo_a_grouped,
+    wo_a_grouped_gemm,
+)
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import CompressorFP8, CompressorMeta
 from rtp_llm.models_py.modules.dsv4.fp8.indexer import IndexerFP8
 from rtp_llm.models_py.modules.dsv4.prefill_workspace import PrefillWorkspace
 from rtp_llm.models_py.modules.dsv4.rope import precompute_freqs_cis
+from rtp_llm.models_py.modules.dsv4.utils import _V4_FP8_BLOCK_CFG, _v4_fp8_linear
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 from rtp_llm.models_py.utils.memory import dispose_tensor
 
@@ -285,8 +290,6 @@ def _build_suffix_cp_sliced_slot_mapping(
     return torch.where(valid, slot, torch.full_like(slot, -1)).contiguous()
 
 
-_V4_FP8_BLOCK_CFG = Fp8BlockWiseQuantConfig()
-
 _DSV4_FP8_KV_ENTRY_BYTES = 584
 
 # Call sites whose first byte-sliced (CP-RR) SWA cache write has been logged.
@@ -466,15 +469,19 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
     )
 
 
+
+
 def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):
     """Backwards-compat bridge over ``_v4_fp8_linear`` for callers that
     still pass a flat dict + keys.  Mutates ``weights[scale_key]`` to the
-    packed form so subsequent callers don't repack (SM100 only; on SM90
-    the delegate converts to FP32 and re-labels, nothing to cache)."""
-    from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
-        is_deep_gemm_e8m0_used,
-    )
+    packed form so subsequent callers don't repack.
 
+    The write-back is deliberately confined to the SM100 packed layout.
+    The SM90 form is a *per-weight* relabel (its shape is derived from that
+    weight's N and K), and callers such as ``_fp8_w_s`` branch their TP
+    slicing on the scale dtype (``//512`` when packed, ``//128`` when raw),
+    so caching a relabelled fp32 scale under the raw key would silently
+    mis-slice. Recomputing the fp32 cast is a few microseconds at init."""
     w = weights[weight_key]
     s = weights[scale_key]
     if s.dtype == torch.float8_e8m0fnu and is_deep_gemm_e8m0_used():
