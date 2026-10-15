@@ -634,14 +634,17 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         """Capacity-padded sync-free EP forward (decode / graph capture).
 
         Dispatch shape is independent of the routing content: every rank
-        sends a fixed ``[world, cap, D+2]`` buffer (``cap = N*K`` slots per
+        sends a fixed ``[world, cap, .]`` buffer (``cap = N*K`` slots per
         destination, worst case), so the two all-to-alls use equal splits —
         no count exchange, no host synchronization, CUDA-graph-capturable.
         Expert/assignment metadata is bit-cast into two extra BF16 columns
-        (both are small non-negative integers, exact in BF16; padding slots
-        carry eid = -1). The expert-side compute runs on the masked grouped
-        GEMMs (fixed ``[E, cap_m, .]`` allocation, device-side ``masked_m``),
-        so only real rows compute while every shape stays constant.
+        on the capture path (small non-negative integers, exact in BF16 at
+        decode scale; padding slots carry eid = -1); the eager path carries
+        it in an FP32 sidecar instead — assign_idx reaches cap-1 at chunk
+        scale, beyond BF16's exact-integer range (R62.1). The expert-side
+        compute runs on the masked grouped GEMMs (fixed ``[E, cap_m, .]``
+        allocation, device-side ``masked_m``), so only real rows compute
+        while every shape stays constant.
 
         ``global_cap`` (eager variant): use a config-static slot count
         instead of this rank's ``N*K`` so heterogeneous-N ranks stay
@@ -683,17 +686,46 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         assign_idx = order  # original assignment index per sorted position
 
         x_rows = x.repeat_interleave(K, dim=0).index_select(0, order).to(bf16)
-        send_buf = torch.zeros((world, cap, D + 2), dtype=bf16, device=device)
-        send_buf[..., D] = -1.0  # padding sentinel; valid slots overwrite
+        # Eager path (global_cap): metadata travels in an FP32 sidecar
+        # instead of the two BF16 columns. BF16 integers are exact only
+        # below 256: eid qualifies at any chunk size, but assign_idx
+        # reaches cap-1 (24575 at the 4096-token bucket), so the
+        # "small non-negative integers, exact in BF16" assumption fails
+        # at prefill scale (R62.1). The columns are write-only today,
+        # but carry exact integers so no future consumer can silently
+        # read corrupted indices back. FP32 is integer-exact to 2^24.
+        use_sidecar = global_cap is not None
+        send_buf = torch.zeros(
+            (world, cap, D + (0 if use_sidecar else 2)), dtype=bf16, device=device
+        )
         send_buf[dest_sorted, within, :D] = x_rows
-        send_buf[dest_sorted, within, D] = flat_ids.index_select(0, order).to(bf16)
-        send_buf[dest_sorted, within, D + 1] = assign_idx.to(bf16)
+        send_meta = None
+        if use_sidecar:
+            send_meta = torch.zeros(
+                (world, cap, 2), dtype=torch.float32, device=device
+            )
+            send_meta[..., 0] = -1.0  # padding sentinel; valid slots overwrite
+            send_meta[dest_sorted, within, 0] = (
+                flat_ids.index_select(0, order).to(torch.float32)
+            )
+            send_meta[dest_sorted, within, 1] = assign_idx.to(torch.float32)
+        else:
+            send_buf[..., D] = -1.0  # padding sentinel; valid slots overwrite
+            send_buf[dest_sorted, within, D] = (
+                flat_ids.index_select(0, order).to(bf16)
+            )
+            send_buf[dest_sorted, within, D + 1] = assign_idx.to(bf16)
 
         # ---- equal-split all-to-alls (no splits, no host sync) ----
         recv_buf = torch.empty_like(send_buf)
         dist.all_to_all_single(recv_buf, send_buf)
-
-        recv_eid = recv_buf[..., D].to(torch.int64)
+        if use_sidecar:
+            recv_meta = torch.empty_like(send_meta)
+            dist.all_to_all_single(recv_meta, send_meta)
+            recv_eid = recv_meta[..., 0].to(torch.int64)
+        else:
+            recv_meta = None
+            recv_eid = recv_buf[..., D].to(torch.int64)
         local_eid = (recv_eid - expert_start).clamp_(0, e_local - 1)
         recv_valid = recv_eid >= 0
 
@@ -720,14 +752,28 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         if global_cap is None:
             cap_m = align(cap * world, _GROUPED_ALIGNMENT)
         else:
-            # Default 0.5 (R60 budget memo): per-expert capacity = 8x the
-            # bs1 real mean (~384/expert) and 2x at bs4, keeping the
-            # phase-peak transient footprint at ~7 GB against the ~16 GiB
-            # post-capture headroom (slack=2 demanded ~21 GB and OOMed the
-            # decode capture when the buffers were allocated early).
+            # Default 0.5 (R60 budget memo): slack-scaled equal-share mean,
+            # keeping the phase-peak transient footprint low against the
+            # ~16 GiB post-capture headroom (slack=2 demanded ~21 GB and
+            # OOMed the decode capture when the buffers were allocated
+            # early).
             raw_slack = os.environ.get("DSV4_EP_STATIC_EAGER_SLACK", "0.5")
             slack = max(1, int(float(raw_slack) * 2))
-            cap_m = align(max(1, slack * cap * world // (e_local * 2)), _GROUPED_ALIGNMENT)
+            share = max(1, slack * cap * world // (e_local * 2))
+            # Structural floor (v5 crash root cause, team/perf-log R62.2):
+            # topk routes are per-token DISTINCT, so a single active DP
+            # rank contributes at most cap//K rows to any one expert. The
+            # perf harness's degenerate repeated "hello" prompt routes
+            # ~every token of a chunk to the same top-6 experts (~cap//K
+            # rows each), which blows past the 8x-mean share (3072 < 4096
+            # at the 4096-token bucket) and drives the unguarded
+            # ep_scatter_v2 atomic cursor past the expert segment — the
+            # OOB write surfaces as CUBLAS_STATUS_EXECUTION_FAILED at the
+            # next gate GEMM. With the floor, single-active-rank overflow
+            # is impossible by construction; multi-rank skew beyond it
+            # still trips the device-side overflow counter.
+            bound = cap // K
+            cap_m = align(max(share, bound), _GROUPED_ALIGNMENT)
         if _masked_ws_reuse_enabled():
             masked_in, masked_scale = _masked_ws_buffers(
                 e_local, cap_m, D, device

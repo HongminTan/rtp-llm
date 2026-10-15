@@ -550,7 +550,7 @@ class DeepEPWrapper:
                 flush=True,
             )
 
-        num_qps_per_rank = config.expert_num / config.ep_size
+        num_qps_per_rank = config.expert_num // config.ep_size
 
         init_kwargs = {
             "group": group,
