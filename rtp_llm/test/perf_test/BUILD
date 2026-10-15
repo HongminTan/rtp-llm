@@ -1412,6 +1412,70 @@ py_test(
 )
 
 # V4-Flash prefill TTFT on 4x H20 (SM90): single-request TTFT at 16k/32k
+# CP4 x DP1 x EP4 prefill -- the lane's main prefill form since r36
+# (reviewer ruling 3, 2026-10-16). Baked here as the measured-exact
+# configuration: the same form/strategy/transport/env that produced the
+# 890.38 ms TTFT@16k conc-1 anchor (perf-log R104.3, report-caliber triangle
+# 1.076x) and passed both CP semantic gates (R96.2 FP8 route / R103.6 FP4
+# route). Deltas vs the dp4 target below: tp/dp/cp_rotate form params,
+# single input_len 16k, graph off (the PDFUSION-role grouped_fp8 gate does
+# not apply to the FP4 family, but graph=0 is the measured-exact form and
+# the eager prefill path is what the campaign validated), and the DeepEP
+# normal transport env (DSV4_EP_DEEPEP_NORMAL=1; the transport pairing put
+# it at -5.7% conservative vs the WORLD a2a, R99.6). The dp4 target below
+# stays as the paired reference arm.
+py_test(
+    name = "v4_flash_cp4_prefill_sm90_h20_perf",
+    main = "batch_decode_test.py",
+    srcs = ["batch_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--batch_size", "1",
+        "--input_len", "16000",
+        "--partial", "2",
+        "--decode_test_length", "30",
+        "--num_measures", "5",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "40960",
+        "--tp_size", "4",
+        "--dp_size", "1",
+        "--ep_size", "4",
+        "--world_size", "4",
+        "--cp_rotate_method", "ALL_GATHER",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "0",
+        "--max_context_batch_size", "1",
+        "--reserver_runtime_mem_mb", "16384",
+        "--dsv4_fixed_pool_blocks", "512",
+    ],
+    env = {
+        "WORLD_SIZE": "4",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
+        "DSV4_EP_DEEPEP_NORMAL": "1",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+        "FASTSAFETENSORS_NOGDS": "1",
+        "CC": "/usr/bin/gcc",
+        "CXX": "/usr/bin/g++",
+        "CUDAHOSTCXX": "/usr/bin/g++",
+        "NVCC_PREPEND_FLAGS": "-ccbin=/usr/bin/g++",
+        "FLASHINFER_WORKSPACE_BASE": "/home/admin/dsv4-flashinfer-ws",
+    },
+    tags = ["manual", "H20_CU13"],
+    exec_properties = {"gpu": "H20_CU13"},
+)
+
 # prompt (GridRunner pins BS=1 in prefill mode). max_seq_len covers 32k
 # prompt + generated tail. Prefix-cache reuse stays off (default) so every
 # measure is a real prefill of the fixed "hello ..." query.
