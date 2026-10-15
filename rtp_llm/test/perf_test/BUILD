@@ -1311,6 +1311,13 @@ py_test(
         # zero data for this env (pitfall #2) and the gsm8k gate target must
         # stay single-variable (splitk only).
         "DSV4_MASKED_WS_REUSE": "1",
+        # wo_a single masked grouped GEMM incl. the M<=8 widening (INBOX r12
+        # instruction 2): bit-identical to the per-group loop at M in
+        # {1,2,4,8} (bench probe), bs2 anchors -4.3/-4.4% vs bs1 controls
+        # -2.3/-2.4% in a diff-in-diff A/B (team/perf-log.md R32/R46).
+        # Conservative -2% external claim; decode target only (prefill has
+        # zero data, gsm8k gate stays single-variable).
+        "DSV4_WOA_GROUPED_GEMM": "1",
         # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
         # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
         # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
