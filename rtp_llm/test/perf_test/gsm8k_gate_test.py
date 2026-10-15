@@ -51,18 +51,26 @@ def _parse(argv: List[str]):
 def _post_question(
     port: int, prompt: str, max_new_tokens: int, timeout: int
 ) -> Dict[str, Any]:
+    # Step 5 (INBOX r12 instruction 1): mirror the smoke target's proven
+    # request chain verbatim — POST /v1/chat/completions with the prompt in a
+    # user message (chat template applied by the frontend). The raw
+    # {"prompt": ...} root endpoint is template-less bare completion, which
+    # produced degenerate output on this instruction-tuned model (pitfall
+    # #40). min=max stays via the framework's own GenerateConfig passthrough
+    # (extra_configs), top_k=1 for greedy, no temperature.
     req = {
-        "prompt": prompt,
-        "generate_config": {
-            "max_new_tokens": max_new_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_new_tokens,
+        "top_k": 1,
+        "extra_configs": {
             "min_new_tokens": max_new_tokens,
-            "top_k": 1,
             "force_sp_accept": True,
         },
-        "top_k": 1,
     }
     try:
-        resp = requests.post(f"http://127.0.0.1:{port}", json=req, timeout=timeout)
+        resp = requests.post(
+            f"http://127.0.0.1:{port}/v1/chat/completions", json=req, timeout=timeout
+        )
         if resp.status_code != 200:
             return {"ok": False, "error": f"http {resp.status_code}: {resp.content[:200]}"}
         return {"ok": True, "body": resp.json()}
@@ -155,13 +163,12 @@ def main() -> int:
             }
             if r.get("ok"):
                 body = r["body"]
-                texts = body.get("response") or []
-                # aux_info is a dict (see dataclass.py ResponseInfo), not a list.
-                aux = body.get("aux_info") or {}
-                text = texts[0] if texts and isinstance(texts, list) else str(texts)
+                choices = body.get("choices") or [{}]
+                text = (choices[0].get("message") or {}).get("content", "") or ""
+                usage = body.get("usage") or {}
                 entry["ok"] = True
-                entry["finished"] = bool(body.get("finished"))
-                entry["output_len"] = int(aux.get("output_len", len(text)))
+                entry["finished"] = choices[0].get("finish_reason") is not None
+                entry["output_len"] = int(usage.get("completion_tokens", len(text)))
                 entry["text"] = text
                 entry["verdict"] = _score(text, q["gold"])
             else:
