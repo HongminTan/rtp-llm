@@ -353,10 +353,13 @@ def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
 
 
 _WOA_GROUPED_BUFFERS: Dict[Tuple[int, int, int, str], tuple] = {}
-_WOA_MASKED_M_CACHE: Dict[Tuple[int, str], torch.Tensor] = {}
+_WOA_MASKED_M_CACHE: Dict[Tuple[int, int, str], torch.Tensor] = {}
 # The SM90 masked grouped GEMM requires a per-group row capacity >= one
 # M-tile (64); cap_m=1 produces wrong results (empirically pinned).
 _WOA_MASKED_CAP = 64
+# Upper M bound for the grouped path (decode M is bs/dp per rank; bs <= 8
+# with dp 4 gives M <= 2, but keep headroom to the pitfall #10 proven zone).
+_WOA_GROUPED_M_MAX = 8
 
 
 def _wo_a_grouped_gemm_enabled() -> bool:
@@ -383,11 +386,11 @@ def _wo_a_grouped_buffers(G: int, R: int, K: int, device: torch.device) -> tuple
     return bufs
 
 
-def _wo_a_masked_m(G: int, device: torch.device) -> torch.Tensor:
-    key = (G, str(device))
+def _wo_a_masked_m(G: int, M: int, device: torch.device) -> torch.Tensor:
+    key = (G, M, str(device))
     masked_m = _WOA_MASKED_M_CACHE.get(key)
     if masked_m is None:
-        masked_m = torch.ones(G, dtype=torch.int32, device=device)
+        masked_m = torch.full((G,), M, dtype=torch.int32, device=device)
         _WOA_MASKED_M_CACHE[key] = masked_m
     return masked_m
 
@@ -2089,19 +2092,24 @@ class AttentionFP8(nn.Module):
             # two small strided copies (pad-in / unpad-out). Bit-identical
             # to the loop on the per-group math (bench/probe_woa_grouped_vs_
             # loop.py, cap_m=64 pinned empirically; cap_m=1 is invalid).
-            if _wo_a_grouped_gemm_enabled() and M == 1:
+            if (
+                _wo_a_grouped_gemm_enabled()
+                and 1 <= M <= _WOA_GROUPED_M_MAX
+            ):
                 K = _K
                 a_m, a_sf, d_m = _wo_a_grouped_buffers(G, R, K, o_fp8.device)
-                a_m[:, 0, :] = o_fp8.squeeze(0)
-                a_sf[:, 0, :] = o_scale_f32.squeeze(0)
+                # [M, G, K] -> [G, M, K] group-major pad-in (free for M == 1,
+                # one strided transpose copy for M > 1).
+                a_m[:, :M, :] = o_fp8.permute(1, 0, 2)
+                a_sf[:, :M, :] = o_scale_f32.permute(1, 0, 2)
                 deep_gemm.m_grouped_fp8_gemm_nt_masked(
                     (a_m, a_sf),
                     (self._wo_a_stk_w, self._wo_a_stk_s),
                     d_m,
-                    _wo_a_masked_m(G, o_fp8.device),
-                    1,
+                    _wo_a_masked_m(G, M, o_fp8.device),
+                    M,
                 )
-                out.copy_(d_m[:, :1, :].permute(1, 0, 2))
+                out.copy_(d_m[:, :M, :].permute(1, 0, 2))
                 return out.view(B, S, G, R)
             # Emulate "bhr,hdr->bhd" with one fp8_gemm_nt per head group:
             # same SM90 FP32-scale (1, 128, 128) blockwise FP8 math, G small
