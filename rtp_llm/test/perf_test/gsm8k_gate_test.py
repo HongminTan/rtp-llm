@@ -55,7 +55,7 @@ def _post_question(
         "prompt": prompt,
         "generate_config": {
             "max_new_tokens": max_new_tokens,
-            "min_new_tokens": 1,
+            "min_new_tokens": max_new_tokens,
             "top_k": 1,
             "force_sp_accept": True,
         },
