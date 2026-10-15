@@ -221,6 +221,29 @@ def cuda13_suites():
             # PD is memory-infeasible on 4 cards with FP8-resident experts
             # (284 GB dequantized / 4 = 71 GB per card at ep=4; ep=2 would
             # need 142 GB > 141 GB HBM), so eager is the reference shape.
+            # CP-form semantic gate for the pr-1508 grouped_fp8 route
+            # (R95.7 open point): mirrors v4_flash_full_dp4_fp8_sm90_h20's
+            # checkpoint+strategy with the CP4 x DP1 x EP4 form params of the
+            # CP4-01 perf arm (R95.3). CP is single-replica TP-group lockstep
+            # (phase-pure, pitfall #54 class absent), so chunking stays at its
+            # default -- matching the CP4-01 main-arm config exactly.
+            smoke_test(
+                name="v4_flash_full_cp4_fp8_sm90_h20",
+                task_info="data/model/deepseek_v4/q_r_v4_flash_full_cp4_fp8_h20.json",
+                smoke_args="--warm_up 0 --load_method fastsafetensors --max_seq_len 2048 --enable_cuda_graph 0 --act_type BF16 --dp_size 1 --ep_size 4 --tp_size 4 --cp_rotate_method ALL_GATHER --world_size 4 --moe_strategy grouped_fp8 --seq_size_per_block 256 --test_block_num 1024 --fp8_kv_cache 1 --concurrency_limit 1 --max_context_batch_size 1 --reserver_runtime_mem_mb 12288",
+                envs=[
+                    "DSV4_MHC_PRE_GEMM_BACKEND=tilelang_single",
+                    "DSV4_TRAP_INVALID_KV_ACCESS=0",
+                    "FASTSAFETENSORS_NOGDS=1",
+                    "CC=/usr/bin/gcc",
+                    "CXX=/usr/bin/g++",
+                    "CUDAHOSTCXX=/usr/bin/g++",
+                    "NVCC_PREPEND_FLAGS=-ccbin=/usr/bin/g++",
+                    "FLASHINFER_WORKSPACE_BASE=/home/admin/dsv4-flashinfer-ws",
+                ],
+                gpu_type=["H20_CU13"],
+                sleep_time_qr=15,
+            ),
             # D arm (route b ladder 1): same shape/queries as
             # v4_flash_full_dp4ep4_sm90_h20 with the two D deltas only --
             # converted FP8 checkpoint + grouped_fp8 strategy. Semantic gate
