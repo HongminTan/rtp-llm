@@ -720,8 +720,14 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         if global_cap is None:
             cap_m = align(cap * world, _GROUPED_ALIGNMENT)
         else:
-            slack = int(os.environ.get("DSV4_EP_STATIC_EAGER_SLACK", "2"))
-            cap_m = align(max(1, slack * cap * world // e_local), _GROUPED_ALIGNMENT)
+            # Default 0.5 (R60 budget memo): per-expert capacity = 8x the
+            # bs1 real mean (~384/expert) and 2x at bs4, keeping the
+            # phase-peak transient footprint at ~7 GB against the ~16 GiB
+            # post-capture headroom (slack=2 demanded ~21 GB and OOMed the
+            # decode capture when the buffers were allocated early).
+            raw_slack = os.environ.get("DSV4_EP_STATIC_EAGER_SLACK", "0.5")
+            slack = max(1, int(float(raw_slack) * 2))
+            cap_m = align(max(1, slack * cap * world // (e_local * 2)), _GROUPED_ALIGNMENT)
         if _masked_ws_reuse_enabled():
             masked_in, masked_scale = _masked_ws_buffers(
                 e_local, cap_m, D, device
