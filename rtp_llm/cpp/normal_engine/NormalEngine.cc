@@ -220,6 +220,12 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
         reserve_step_ = 0;
     }
     RTP_LLM_LOG_INFO("normal engine speculative reserve_step is %d", reserve_step_);
+    if (const char* multi_step_env = std::getenv("RTP_LLM_MULTI_STEP_MAX"); multi_step_env != nullptr) {
+        multi_step_max_ = std::max(atoi(multi_step_env), 0);
+    }
+    RTP_LLM_LOG_INFO("[normal-multi-step] RTP_LLM_MULTI_STEP_MAX=%s -> multi_step_max=%d",
+                     std::getenv("RTP_LLM_MULTI_STEP_MAX") ? std::getenv("RTP_LLM_MULTI_STEP_MAX") : "(unset)",
+                     multi_step_max_);
 #if !USING_CUDA
     // On ROCm, this constructor runs on a gRPC handler thread that defaults to
     // GPU 0. Set the correct device so all GPU allocations (KV cache, etc.) go
@@ -877,23 +883,61 @@ absl::Status NormalEngine::step() try {
         }
     }
 
-    {
-        // NormalExecutor drives startStep/finishStep via callbacks; MtpExecutor
-        // has no callbacks yet, so bracket the propose path here on the engine
-        // loop thread (Kineto requires enable/disable on the same thread).
-        if (propose_params_) {
-            step_profiler_.startStep();
+    // Multi-step decode window: run the batch through several decode steps
+    // without re-entering schedule()/mayAddFakeStream(). The host chain
+    // (state-machine walk + fake-stream fill + input gather) amortizes over
+    // the window while every process() call still participates in the
+    // per-step collectives exactly as before, so the rank lockstep is
+    // untouched. Any stream finishing or erroring ends the window early so
+    // the next full schedule re-runs the state machine and the graph replay
+    // never sees a mid-window batch-shape change.
+    int multi_step_window = 1;
+    if (multi_step_max_ > 0 && !propose_params_ && !streams.empty()) {
+        bool all_decode = true;
+        for (const auto& stream : streams) {
+            if (stream->isContextStream()) {
+                all_decode = false;
+                break;
+            }
         }
-        RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute(stream_size=%zu)", streams.size());
-        const bool refresh_cache_status_snapshot =
-            resource_context_.cache_manager && shouldRefreshCacheStatusSnapshot(pd_sep_config.role_type, streams);
-        status = executor_->process(streams, tps_schedule_time_us);
-        if (status.ok() && refresh_cache_status_snapshot) {
-            RTP_LLM_PROFILE_SCOPE("engine.normal.refresh_cache_status_snapshot");
-            resource_context_.cache_manager->refreshKVCacheInfoSnapshot();
+        if (all_decode) {
+            multi_step_window = multi_step_max_;
         }
-        if (propose_params_) {
-            step_profiler_.finishStep();
+    }
+    for (int step_in_window = 0; step_in_window < multi_step_window; ++step_in_window) {
+        if (step_in_window > 0) {
+            bool any_done = false;
+            for (const auto& stream : streams) {
+                if (stream->isFinished() || stream->hasError()) {
+                    any_done = true;
+                    break;
+                }
+            }
+            if (any_done) {
+                break;
+            }
+        }
+        {
+            // NormalExecutor drives startStep/finishStep via callbacks; MtpExecutor
+            // has no callbacks yet, so bracket the propose path here on the engine
+            // loop thread (Kineto requires enable/disable on the same thread).
+            if (propose_params_) {
+                step_profiler_.startStep();
+            }
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute(stream_size=%zu)", streams.size());
+            const bool refresh_cache_status_snapshot =
+                resource_context_.cache_manager && shouldRefreshCacheStatusSnapshot(pd_sep_config.role_type, streams);
+            status = executor_->process(streams, tps_schedule_time_us);
+            if (status.ok() && refresh_cache_status_snapshot) {
+                RTP_LLM_PROFILE_SCOPE("engine.normal.refresh_cache_status_snapshot");
+                resource_context_.cache_manager->refreshKVCacheInfoSnapshot();
+            }
+            if (propose_params_) {
+                step_profiler_.finishStep();
+            }
+        }
+        if (!status.ok()) {
+            break;
         }
     }
 

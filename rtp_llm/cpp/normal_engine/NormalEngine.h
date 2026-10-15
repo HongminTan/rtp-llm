@@ -99,6 +99,13 @@ private:
     std::unique_ptr<ProposeModelEngineInitParams> propose_params_;
     StepWindowProfiler                            step_profiler_;
     int                                           reserve_step_ = 0;
+    // Multi-step decode window (env RTP_LLM_MULTI_STEP_MAX, 0 = off): the
+    // schedule/mayAddFake/gather host chain runs once per window instead of
+    // once per decode step. Decode-only, non-spec batches only; the window
+    // breaks early when any stream finishes or errors so the state machine
+    // re-runs on the next full schedule (the batch shape never changes
+    // mid-window, so the graph replay stays stable).
+    int                                           multi_step_max_ = 0;
 };
 
 }  // namespace rtp_llm
