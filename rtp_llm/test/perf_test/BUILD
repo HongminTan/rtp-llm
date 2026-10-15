@@ -1318,16 +1318,18 @@ py_test(
         # Conservative -2% external claim; decode target only (prefill has
         # zero data, gsm8k gate stays single-variable).
         "DSV4_WOA_GROUPED_GEMM": "1",
-        # The deepgemm split-K mHC pre-gemm is NOT reachable on this lane: the
-        # cu129-pinned DeepGEMM 2.1.1 does not export tf32_hc_prenorm_gemm, so
-        # deepgemm_wrapper._missing_deep_gemm() raises "DeepGEMM is not
-        # available" during model init and the engine never starts. That is a
-        # third 2.1.1 compat gap after fp8_einsum and max_seqlen_k. Until the
-        # symbol lands (see team/perf-log.md R2) tilelang_single is the only
-        # backend this build can actually run -- do not flip this to deepgemm
-        # (the reference branch's target uses it because its DeepGEMM has it).
+        # mHC pre-gemm tilelang_splitk (flip pending INBOX r13 via the
+        # no-task-eval path after the GSM8K gate closed): R17 decode
+        # -20.6~-22.4% (4-point, success-full); formal trace R47.6 confirms
+        # -7.04 ms/step (mHC family 7.81 -> 0.77). Decode target only —
+        # prefill MUST stay tilelang_single (R44.5 verdict: paired re-test
+        # inconclusive; R25 判例).
+        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_splitk",
         "WORLD_SIZE": "4",
-        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_single",
+        # (The old tilelang_single entry is superseded by the splitk flip
+        # above. Historical note: deepgemm is NOT reachable on this lane —
+        # the cu129-pinned DeepGEMM 2.1.1 lacks tf32_hc_prenorm_gemm — so
+        # the only valid values here are tilelang_single/tilelang_splitk.)
         "DSV4_TRAP_INVALID_KV_ACCESS": "0",
         # torch 2.8 (cuda12_9) lacks float8_e8m0fnu: nogds copier loads
         # UE8M0 scales via the byte-mode U8 fallback (see smoke target).
