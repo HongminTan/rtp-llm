@@ -90,6 +90,17 @@ def _static_eager_enabled() -> bool:
     return os.environ.get("DSV4_EP_STATIC_EAGER", "0") == "1"
 
 
+def _static_eager_min_tokens() -> int:
+    """Only route prefill-sized forwards through the static-eager path.
+
+    Decode-sized eager forwards (engine warmup, tiny batches) must stay on
+    the dynamic path: the capacity buffers (~13 GB at the 16384-token
+    bucket) would otherwise be allocated and allocator-retained right
+    before the decode CUDA-graph capture and OOM it (R59.4).
+    """
+    return int(os.environ.get("DSV4_EP_STATIC_EAGER_MIN_TOKENS", "1024"))
+
+
 def _static_eager_cap_tokens() -> int:
     """Dispatch capacity in tokens: the MoE chunk upper bound (prompts are
     chunked to <= this many tokens upstream, so N*K <= cap always holds)."""
@@ -319,11 +330,14 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
                 # the capacity-padded equal-split path applies (no host
                 # syncs, constant shapes).
                 return self._forward_ep_static(x, weights, indices)
-            if _static_eager_enabled():
-                # Eager + opt-in: the capacity-padded equal-split path with a
-                # CONFIG-static global capacity (chunk upper bound), which
-                # keeps the shapes symmetric across heterogeneous-N ranks
-                # without any host sync (see _forward_ep_eager_static).
+            if _static_eager_enabled() and N >= _static_eager_min_tokens():
+                # Eager + opt-in + prefill-sized: the capacity-padded
+                # equal-split path with a CONFIG-static global capacity
+                # (chunk upper bound), which keeps the shapes symmetric
+                # across heterogeneous-N ranks without any host sync (see
+                # _forward_ep_eager_static). Small-N eager forwards (engine
+                # warmup before graph capture) stay dynamic: the capacity
+                # buffers would OOM the capture (R59.4).
                 return self._forward_ep_eager_static(x, weights, indices)
             # Eager: dynamic splits (DP ranks may hold different token
             # counts, including empty batches).
