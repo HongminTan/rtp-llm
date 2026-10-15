@@ -292,9 +292,18 @@ def prepare_config(args: argparse.Namespace, remaining: List[str]) -> PerfTestCo
     # Grid mode
     input_len_list = [int(x) for x in args.input_len.split(",")]
 
-    # Prefill mode (partial=2): always BS=1, no need for large BS list
+    # Prefill mode (partial=2): pins the measured BS to 1 unless the caller
+    # explicitly requests a multi-request wave (--batch_size entries above
+    # 1). The engine's admission limit is derived from max(batch_size_list)
+    # further down, so the explicit entries must survive the pin, otherwise
+    # the server starts with concurrency_limit=1 and every wave above BS=1
+    # is rejected with 409 (perf-log R108 / pitfall #62 chain).
     if args.partial == 2:
         batch_size_list = [1]
+        if batch_size_explicit:
+            batch_size_list = sorted(
+                {1} | {int(x) for x in args.batch_size.split(",") if int(x) > 1}
+            )
     elif batch_size_explicit:
         batch_size_list = [int(x) for x in args.batch_size.split(",")]
     else:
