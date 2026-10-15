@@ -90,6 +90,15 @@ def _static_eager_enabled() -> bool:
     return os.environ.get("DSV4_EP_STATIC_EAGER", "0") == "1"
 
 
+def _allgather_ep_enabled() -> bool:
+    """Route eager (non-captured) EP forwards through the all-gather +
+    reduce-scatter combine (INBOX user note 2026-10-15 16:20: borrow the
+    grouped_fp8 Hopper transport — one host sync per layer, no host
+    rendezvous, no per-assignment all-to-alls — onto the FP4 grouped
+    compute; "borrow, don't copy PR #1508")."""
+    return os.environ.get("DSV4_EP_ALLGATHER", "0") == "1"
+
+
 def _static_eager_min_tokens() -> int:
     """Only route prefill-sized forwards through the static-eager path.
 
@@ -378,6 +387,14 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
                 # equal-split sender with a dynamic count-based receiver
                 # (NCCL mismatch, v5/v6 corruption root cause, R63.1).
                 return self._forward_ep_eager_static(x, weights, indices)
+            if _allgather_ep_enabled():
+                # Eager + opt-in: the all-gather/reduce-scatter combine —
+                # one host sync per layer, shape-stable collectives, the
+                # stock _forward_local compute over the gathered rows.
+                # Lower priority than the static-eager gate above on
+                # purpose: the two are alternative eager transports and
+                # only one should ever be enabled.
+                return self._forward_ep_allgather(x, weights, indices)
             # Eager: dynamic splits (DP ranks may hold different token
             # counts, including empty batches).
             return self._forward_ep(x, weights, indices)
@@ -662,6 +679,119 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         assign_out.index_copy_(0, order, recv_back.float())
         y = (assign_out.view(N, K, D) * flat_w.view(N, K, 1)).sum(dim=1)
         return y
+
+    def _forward_ep_allgather(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """All-gather + reduce-scatter EP combine over the FP4 grouped compute.
+
+        The transport of the upstream grouped_fp8 Hopper path (PR #1508)
+        borrowed onto this executor's FP4 compute, per the 2026-10-15 16:20
+        direction note: keep the masked/contiguous grouped GEMMs, replace
+        only dispatch/combine. Per layer: one MAX all-reduce on the local
+        token count (the only COLLECTIVE host sync — _forward_local's
+        per-expert count readback is a second, local D2H), three
+        all_gather_into_tensor calls (activations, router weights, expert
+        ids), the stock _forward_local compute over the gathered rows with
+        ids remapped to the local expert range, then one
+        reduce_scatter_tensor whose cross-rank sum rebuilds each rank's
+        own token rows.
+
+        Versus _forward_ep's per-assignment all-to-alls (N*K rows each way,
+        a counts exchange, and two host syncs per layer), this moves ~K
+        times fewer activation bytes (K=6, ep=4) through shape-stable
+        NCCL collectives and drops the argsort/bincount host work
+        entirely. Numerics: the router weight is applied inside ep_gather
+        per local assignment and each rank's partial is summed in FP32
+        there, then rounded to BF16 once for the reduce-scatter payload
+        (the same BF16 wire format _forward_ep uses per assignment) — no
+        bit-parity claim against the all-to-all path is made or needed
+        (output-semantics obligation only).
+
+        Eager only: the .item() on the count sync forbids graph capture
+        (capture keeps taking _forward_ep_static). Empty local batches
+        still participate: exchange_n is floored at 1 and zero-padded rows
+        are inert (-1 ids are skipped by ep_scatter and leave ep_gather's
+        accumulator at zero).
+        """
+        import torch.distributed as dist
+
+        cfg = self.cfg
+        N, D = x.shape
+        K = indices.size(1)
+        device = x.device
+        world = int(cfg.ep_size)
+        e_local = self._e_local
+        expert_start = int(cfg.ep_rank) * e_local
+
+        if not (dist.is_available() and dist.is_initialized()):
+            raise RuntimeError("grouped_fp4_sm90 EP path requires torch.distributed")
+        if dist.get_world_size() != world:
+            raise RuntimeError(
+                f"EP executor world mismatch: torch.distributed "
+                f"{dist.get_world_size()} != cfg.ep_size {world}"
+            )
+
+        # Rank-uniform exchange size — the one host sync per layer.
+        # Independent DP schedulers may hold unequal batches (including
+        # zero); the MAX keeps every rank's collectives shape-symmetric.
+        count = torch.tensor(N, dtype=torch.int64, device=device)
+        dist.all_reduce(count, op=dist.ReduceOp.MAX)
+        exchange_n = max(int(count.item()), 1)
+
+        if N < exchange_n:
+            pad = exchange_n - N
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad), value=0.0)
+            weights = torch.nn.functional.pad(weights, (0, 0, 0, pad), value=0.0)
+            indices = torch.nn.functional.pad(indices, (0, 0, 0, pad), value=-1)
+
+        # All ranks' tokens, router weights, and expert ids. The gathered
+        # activation block is world*exchange_n rows — the only per-layer
+        # transient beyond _forward_local's own (chunk-aware via the
+        # caller's chunking; see the R84 memory budget note).
+        x_full = torch.empty((world * exchange_n, D), dtype=x.dtype, device=device)
+        dist.all_gather_into_tensor(x_full, x.contiguous())
+        w_full = torch.empty(
+            (world * exchange_n, K), dtype=torch.float32, device=device
+        )
+        dist.all_gather_into_tensor(
+            w_full, weights.reshape(x.shape[0], -1).to(torch.float32).contiguous()
+        )
+        i_full = torch.empty(
+            (world * exchange_n, K), dtype=torch.int64, device=device
+        )
+        dist.all_gather_into_tensor(
+            i_full, indices.reshape(x.shape[0], -1).to(torch.int64).contiguous()
+        )
+
+        # Remap ids to the local expert range. Non-local, invalid, and
+        # padding slots become -1: the recompute kernel's sentinel contract
+        # (ep_kernels.recompute_topk_ids_sum_expert_count) drops them from
+        # the expert counts, ep_scatter skips them, and ep_gather leaves
+        # those tokens' accumulator at zero — so this rank's partial is
+        # exactly its local experts' weighted contribution.
+        flat = i_full.reshape(-1)
+        valid = (flat >= 0) & (flat < world * e_local)
+        local = torch.where(valid, flat - expert_start, torch.full_like(flat, -1))
+        keep = (local >= 0) & (local < e_local)
+        i_remapped = torch.where(keep, local, torch.full_like(local, -1)).view(
+            world * exchange_n, K
+        )
+
+        partial = self._forward_local(x_full, w_full, i_remapped)
+
+        # reduce_scatter_tensor sums element-wise across ranks and hands
+        # rank r the r-th chunk of rows; summed over ranks, each row is the
+        # full top-k total for that token. BF16 payload halves the wire
+        # bytes (the MoE output is BF16 downstream regardless).
+        out = torch.empty((exchange_n, D), dtype=torch.bfloat16, device=device)
+        dist.reduce_scatter_tensor(
+            out, partial.to(torch.bfloat16).contiguous()
+        )
+        return out[:N].float()
 
     def _forward_ep_static(
         self,
