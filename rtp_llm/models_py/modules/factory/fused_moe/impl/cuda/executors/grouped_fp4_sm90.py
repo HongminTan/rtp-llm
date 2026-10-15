@@ -101,6 +101,36 @@ def _static_eager_min_tokens() -> int:
     return int(os.environ.get("DSV4_EP_STATIC_EAGER_MIN_TOKENS", "1024"))
 
 
+_CHUNKED_TOKENS_VAR = None
+
+
+def _static_eager_chunked_tokens() -> int:
+    """Rank-consistent prefill signal for the static-eager gate.
+
+    The chunker synchronizes the prompt token count across DP ranks
+    (all_reduce MAX) before chunking, so this value is IDENTICAL on every
+    rank — unlike the local batch size N, which is 0 on the idle ranks of
+    a single-request prefill. Gating on the local N alone splits the
+    ranks across two different collective sequences (static: equal-split
+    all-to-alls; dynamic: count-based all-to-alls) — the mismatched first
+    collective corrupts the NCCL send/recv pairings and manifests as
+    downstream memory corruption (v5/v6 crash root cause,
+    team/perf-log R63.1). Returns 0 when no chunked prefill is in flight
+    (warmup / decode), preserving the R59.4 small-N guard.
+    """
+    global _CHUNKED_TOKENS_VAR
+    if _CHUNKED_TOKENS_VAR is None:
+        # Deferred import: chunked_layer pulls in the strategy registry,
+        # which imports this module.
+        from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
+            _SYNCHRONIZED_CHUNK_TOKENS,
+        )
+
+        _CHUNKED_TOKENS_VAR = _SYNCHRONIZED_CHUNK_TOKENS
+    planned = _CHUNKED_TOKENS_VAR.get()
+    return planned if planned is not None else 0
+
+
 def _static_eager_cap_tokens() -> int:
     """Dispatch capacity in tokens: the MoE chunk upper bound (prompts are
     chunked to <= this many tokens upstream, so N*K <= cap always holds)."""
@@ -330,14 +360,23 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
                 # the capacity-padded equal-split path applies (no host
                 # syncs, constant shapes).
                 return self._forward_ep_static(x, weights, indices)
-            if _static_eager_enabled() and N >= _static_eager_min_tokens():
+            if _static_eager_enabled() and (
+                N >= _static_eager_min_tokens()
+                or _static_eager_chunked_tokens() >= _static_eager_min_tokens()
+            ):
                 # Eager + opt-in + prefill-sized: the capacity-padded
                 # equal-split path with a CONFIG-static global capacity
                 # (chunk upper bound), which keeps the shapes symmetric
                 # across heterogeneous-N ranks without any host sync (see
                 # _forward_ep_eager_static). Small-N eager forwards (engine
                 # warmup before graph capture) stay dynamic: the capacity
-                # buffers would OOM the capture (R59.4).
+                # buffers would OOM the capture (R59.4). The gate reads the
+                # chunker's RANK-SYNCHRONIZED token count alongside the
+                # local N so every rank picks the same collective sequence —
+                # idle DP ranks of a single-request prefill must enter the
+                # static path too, or the first all-to-all pairs a static
+                # equal-split sender with a dynamic count-based receiver
+                # (NCCL mismatch, v5/v6 corruption root cause, R63.1).
                 return self._forward_ep_eager_static(x, weights, indices)
             # Eager: dynamic splits (DP ranks may hold different token
             # counts, including empty batches).
