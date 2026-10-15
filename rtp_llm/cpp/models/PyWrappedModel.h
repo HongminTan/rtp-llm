@@ -10,6 +10,8 @@
 #include "rtp_llm/models_py/bindings/core/torch_utils/TypeConvert.h"
 #include <limits>
 #include <optional>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <atomic>
 #include <cstdint>
@@ -241,7 +243,16 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         params.hw_kernel_config.generation_prefill_capture_token_buckets;
     if (owns_generation_prefill_cuda_graph_) {
         const auto& parallelism = params.parallelism_config;
-        RTP_LLM_CHECK_WITH_INFO(isSingleDeviceGenerationPrefillCudaGraphConfig(parallelism),
+        // Experimental multi-rank bypass (team/perf-log.md R55 route (a)):
+        // the single-device guard is first-version conservatism, not a
+        // proven semantic limit. DSV4_GENPREFILL_MULTIRANK=1 skips it for
+        // same-shape single-process dp/ep forms so the multi-rank 16k-bucket
+        // capture attempt can proceed (validation in progress).
+        static const bool multirank_bypass = []() {
+            const char* raw = std::getenv("DSV4_GENPREFILL_MULTIRANK");
+            return raw != nullptr && std::strcmp(raw, "1") == 0;
+        }();
+        RTP_LLM_CHECK_WITH_INFO(multirank_bypass || isSingleDeviceGenerationPrefillCudaGraphConfig(parallelism),
                                 "Generation prefill CUDA graph currently supports only single-device execution: "
                                 "world_size=%ld tp_size=%ld dp_size=%ld ep_size=%ld pp_size=%ld ffn_sp_size=%ld "
                                 "ffn_tp_size=%ld enable_sp=%d prefill_cp=%d ffn_disaggregate=%d",
