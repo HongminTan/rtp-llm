@@ -452,15 +452,7 @@ def silu_mul_fp8_quant_f32_scale(
     if M_total == 0:
         return output_q, output_scale
 
-    # Larger BLOCK_M tiles shrink the CTA count 16x (BLOCK_M=8 launched a
-    # grid of M_total/8 tiles — e.g. 32K CTAs over the DeepEP-LL capacity
-    # layout — where the per-CTA early-exit masked rows still cost ~88us of
-    # launch traffic at decode). BLOCK_M must divide rows_per_expert so
-    # tiles never straddle experts; 128 covers the grouped-GEMM alignment
-    # and the DeepEP capacity sizes used today.
-    BLOCK_M = 128 if masked_m is not None else 8
-    if masked_m is not None and rows_per_expert % BLOCK_M != 0:
-        BLOCK_M = 8
+    BLOCK_M = 8
     grid = (num_groups_per_row, (M_total + BLOCK_M - 1) // BLOCK_M)
     num_warps = max(4, group_size // 32)
     has_clamp = clamp_limit > 0
