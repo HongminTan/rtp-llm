@@ -81,6 +81,44 @@ def _masked_ws_reuse_enabled() -> bool:
     return os.environ.get("DSV4_MASKED_WS_REUSE", "0") == "1"
 
 
+def _static_eager_enabled() -> bool:
+    """Route eager (non-captured) EP forwards through the capacity-padded
+    static path (INBOX user note 2026-10-15 11:25: fix the eager prefill
+    collective-spin root cause with the _forward_ep_static recipe —
+    preallocated capacity buffers, equal-split all-to-alls, scatter_add,
+    zero host sync — on a variable-length-capable eager path)."""
+    return os.environ.get("DSV4_EP_STATIC_EAGER", "0") == "1"
+
+
+def _static_eager_cap_tokens() -> int:
+    """Dispatch capacity in tokens: the MoE chunk upper bound (prompts are
+    chunked to <= this many tokens upstream, so N*K <= cap always holds)."""
+    raw = os.environ.get("DSV4_EP_STATIC_EAGER_CAP_TOKENS")
+    if raw:
+        return int(raw)
+    raw = os.environ.get("DSV4_MOE_CHUNK_TOKENS")
+    if raw:
+        return int(raw)
+    return 16384
+
+
+_STATIC_EAGER_OVERFLOW: dict = {}
+
+
+def _static_eager_overflow_add(delta: torch.Tensor) -> None:
+    key = str(delta.device)
+    total = _STATIC_EAGER_OVERFLOW.get(key)
+    if total is None:
+        total = torch.zeros((), dtype=torch.int64, device=delta.device)
+        _STATIC_EAGER_OVERFLOW[key] = total
+    total.add_(delta)
+
+
+def _static_eager_overflow_check() -> int:
+    """Sum of per-expert capacity overflows seen so far (syncs once)."""
+    return int(sum(int(t.item()) for t in _STATIC_EAGER_OVERFLOW.values()))
+
+
 def _masked_ws_buffers(
     e_local: int, cap_m: int, D: int, device: torch.device
 ) -> tuple:
@@ -281,6 +319,12 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
                 # the capacity-padded equal-split path applies (no host
                 # syncs, constant shapes).
                 return self._forward_ep_static(x, weights, indices)
+            if _static_eager_enabled():
+                # Eager + opt-in: the capacity-padded equal-split path with a
+                # CONFIG-static global capacity (chunk upper bound), which
+                # keeps the shapes symmetric across heterogeneous-N ranks
+                # without any host sync (see _forward_ep_eager_static).
+                return self._forward_ep_eager_static(x, weights, indices)
             # Eager: dynamic splits (DP ranks may hold different token
             # counts, including empty batches).
             return self._forward_ep(x, weights, indices)
@@ -571,6 +615,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         x: torch.Tensor,
         weights: torch.Tensor,
         indices: torch.Tensor,
+        global_cap: "int | None" = None,
     ) -> torch.Tensor:
         """Capacity-padded sync-free EP forward (decode / graph capture).
 
@@ -583,6 +628,11 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         carry eid = -1). The expert-side compute runs on the masked grouped
         GEMMs (fixed ``[E, cap_m, .]`` allocation, device-side ``masked_m``),
         so only real rows compute while every shape stays constant.
+
+        ``global_cap`` (eager variant): use a config-static slot count
+        instead of this rank's ``N*K`` so heterogeneous-N ranks stay
+        shape-symmetric (see ``_forward_ep_eager_static``); ``None`` keeps
+        the capture path byte-identical to the historical behavior.
         """
         import torch.distributed as dist
 
@@ -594,7 +644,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         e_local = self._e_local
         expert_start = int(cfg.ep_rank) * e_local
         inter = cfg.moe_inter_dim
-        cap = N * K
+        cap = N * K if global_cap is None else int(global_cap)
         r_total = world * cap
         bf16 = torch.bfloat16
 
@@ -614,7 +664,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
             world, dtype=torch.int64, device=device
         ).scatter_add_(0, dest, torch.ones_like(dest))
         starts = torch.cumsum(counts, 0) - counts  # exclusive, per rank
-        pos = torch.arange(cap, device=device, dtype=torch.int64)
+        pos = torch.arange(N * K, device=device, dtype=torch.int64)
         within = pos - starts.index_select(0, dest_sorted)
         assign_idx = order  # original assignment index per sorted position
 
@@ -648,7 +698,16 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         )
 
         # ---- masked grouped layout: [E, cap_m, .], constant shapes ----
-        cap_m = align(cap * world, _GROUPED_ALIGNMENT)
+        # Capture path (global_cap is None): the historical worst-case-safe
+        # formula (cap is tiny at decode, so the 64x over-provision is free).
+        # Eager path: cap is the global chunk-bucket capacity, so scale the
+        # per-expert capacity to slack x the equal-split share instead (the
+        # historical formula would demand ~100 GB at a 16k-token chunk).
+        if global_cap is None:
+            cap_m = align(cap * world, _GROUPED_ALIGNMENT)
+        else:
+            slack = int(os.environ.get("DSV4_EP_STATIC_EAGER_SLACK", "2"))
+            cap_m = align(max(1, slack * cap * world // e_local), _GROUPED_ALIGNMENT)
         if _masked_ws_reuse_enabled():
             masked_in, masked_scale = _masked_ws_buffers(
                 e_local, cap_m, D, device
@@ -687,6 +746,20 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         ).scatter_add_(
             0, count_ids, torch.ones_like(count_ids)
         )[:e_local].to(torch.int32)
+        if global_cap is not None:
+            # Track per-expert capacity overflow device-side (zero host
+            # sync): an expert whose real count exceeds cap_m would already
+            # have been scattered out of bounds — the counter makes the
+            # corruption loud at the next natural sync point instead of
+            # silently producing garbage. Check via
+            # _static_eager_overflow_check() (or STRICT mode per layer).
+            _static_eager_overflow_add((masked_m > cap_m).sum())
+            if os.environ.get("DSV4_EP_STATIC_EAGER_STRICT", "0") == "1":
+                if _static_eager_overflow_check() > 0:
+                    raise RuntimeError(
+                        "static-eager EP overflow: per-expert recv count "
+                        "exceeded cap_m; raise DSV4_EP_STATIC_EAGER_SLACK"
+                    )
         expected_m = max(1, min(cap_m, r_total // max(e_local, 1)))
 
         # GEMM 1 (masked): gate+up
@@ -730,6 +803,37 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         assign_out.index_copy_(0, assign_idx, got.float())
         y = (assign_out.view(N, K, D) * flat_w.view(N, K, 1)).sum(dim=1)
         return y
+
+    def _forward_ep_eager_static(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Variable-length-capable static EP forward for eager prefill.
+
+        Same recipe as ``_forward_ep_static`` (capacity-padded buffers,
+        equal-split all-to-alls, scatter_add, zero host sync) but with a
+        CONFIG-static global capacity (the MoE chunk upper bound) so
+        heterogeneous-N ranks — e.g. a single 16k prompt on one DP rank
+        while the others are empty — stay shape-symmetric. Kills the
+        per-layer count-exchange D2H rendezvous and halves the collectives
+        (4 -> 2), which is the 72.2% NCCL-spin TTFT root cause
+        (team/perf-log.md R53.2; INBOX user note 2026-10-15 11:25).
+        Wire cost: idle ranks ship capacity-sized padding (~2x aggregate
+        transfer vs the dynamic path), bounded by the chunk bucket.
+        """
+        cap_tokens = _static_eager_cap_tokens()
+        N = x.shape[0]
+        if N > cap_tokens:
+            raise RuntimeError(
+                f"DSV4_EP_STATIC_EAGER: N={N} exceeds the capacity bucket "
+                f"{cap_tokens}; raise DSV4_EP_STATIC_EAGER_CAP_TOKENS"
+            )
+        K = indices.size(1)
+        return self._forward_ep_static(
+            x, weights, indices, global_cap=cap_tokens * K
+        )
 
     # ------------------------------------------------------------------
     # DeepEP low-latency EP (production decode + CUDA-graph pattern)
