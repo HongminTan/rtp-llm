@@ -99,6 +99,45 @@ def _allgather_ep_enabled() -> bool:
     return os.environ.get("DSV4_EP_ALLGATHER", "0") == "1"
 
 
+# ACCL-EP's intranode dispatch kernel has a compile-time switch over
+# ``num_topk`` that only covers {2, 4, 8, 16} (intranode.cu asserts false on
+# others; ported from dsv41 strategies/deepep.py). V4-Flash routes K=6, so
+# the normal-mode forward pads to 8 — see ``_pad_topk_for_deepep``.
+_DEEPEP_NORMAL_SUPPORTED_TOPK = (2, 4, 8, 16)
+
+
+def _pad_topk_for_deepep(
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad ``(indices, weights)`` to a DeepEP-supported topk width.
+
+    Padding slots carry the -1/0.0 sentinel pair: get_dispatch_layout drops
+    them from the rank/expert maps and ``recompute_topk_ids_sum_expert_count``
+    drops them from the local expert counts, so they never reach a GEMM.
+    Whether the pinned upstream wheel carries the same topk constraint is
+    unverified (team/perf-log.md R85), so the pad is unconditional — it is
+    a no-op for topk values the kernel already accepts.
+    """
+    n_act = indices.size(-1)
+    if n_act in _DEEPEP_NORMAL_SUPPORTED_TOPK:
+        return indices, weights
+    pad_to = next((k for k in _DEEPEP_NORMAL_SUPPORTED_TOPK if k > n_act), None)
+    if pad_to is None:
+        raise RuntimeError(
+            "DeepEP normal dispatch supports topk in "
+            f"{sorted(_DEEPEP_NORMAL_SUPPORTED_TOPK)}, got {n_act}"
+        )
+    N = indices.size(0)
+    pad_n = pad_to - n_act
+    pad_idx = torch.full((N, pad_n), -1, dtype=indices.dtype, device=indices.device)
+    pad_w = torch.zeros((N, pad_n), dtype=weights.dtype, device=weights.device)
+    return (
+        torch.cat([indices, pad_idx], dim=-1),
+        torch.cat([weights, pad_w], dim=-1),
+    )
+
+
 def _static_eager_min_tokens() -> int:
     """Only route prefill-sized forwards through the static-eager path.
 
@@ -395,6 +434,13 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
                 # purpose: the two are alternative eager transports and
                 # only one should ever be enabled.
                 return self._forward_ep_allgather(x, weights, indices)
+            if self._deepep_normal_enabled():
+                # Eager + opt-in: DeepEP NORMAL-mode dispatch/combine (the
+                # INBOX 2026-10-15 16:20 direction (a); NOT the dead
+                # low-latency line — normal mode was never tried on this
+                # lane). Third alternative eager transport; mutually
+                # exclusive with the two gates above in practice.
+                return self._forward_ep_deepep_normal(x, weights, indices)
             # Eager: dynamic splits (DP ranks may hold different token
             # counts, including empty batches).
             return self._forward_ep(x, weights, indices)
@@ -792,6 +838,165 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
             out, partial.to(torch.bfloat16).contiguous()
         )
         return out[:N].float()
+
+    # ------------------------------------------------------------------
+    # DeepEP NORMAL-mode EP (prefill transport; INBOX 2026-10-15 16:20 (a))
+    # ------------------------------------------------------------------
+
+    def _deepep_normal_enabled(self) -> bool:
+        """Resolve the DeepEP normal-mode binding once (env-gated).
+
+        The engine creates the normal buffer at startup when the server is
+        started with ``--use_deepep_moe 1 --use_deepep_low_latency 0
+        --use_deepep_internode 0`` (backend_manager -> init_deepep_wrapper;
+        with tp_size == 1 ``use_deepep_moe=1`` itself flips
+        ``use_all_gather`` off in server_config_setup, so no extra flag is
+        needed); this executor adopts it when ``DSV4_EP_DEEPEP_NORMAL=1``.
+        The binding is validated against this layer's geometry so a
+        mismatched buffer fails loudly instead of corrupting dispatch.
+        """
+        if getattr(self, "_deepep_normal", False) is not False:
+            return bool(self._deepep_normal)
+        if os.environ.get("DSV4_EP_DEEPEP_NORMAL", "0") != "1":
+            self._deepep_normal = False
+            return False
+        from rtp_llm.models_py.distributed.deepep_wrapper import (
+            DeepEPMode,
+            DeepEPWrapper,
+        )
+
+        wrapper = DeepEPWrapper.get_initialized_wrapper()
+        if wrapper is None:
+            raise RuntimeError(
+                "DSV4_EP_DEEPEP_NORMAL=1 requires the DeepEP normal buffer; "
+                "start the server with --use_deepep_moe 1 "
+                "--use_deepep_low_latency 0 --use_deepep_internode 0"
+            )
+        if wrapper.mode != DeepEPMode.NORMAL:
+            raise RuntimeError(
+                f"DSV4_EP_DEEPEP_NORMAL=1 but DeepEP wrapper mode is {wrapper.mode}"
+            )
+        cfg = self.cfg
+        if wrapper.hidden_size != cfg.dim:
+            raise RuntimeError(
+                f"DeepEP buffer hidden {wrapper.hidden_size} != layer dim {cfg.dim}"
+            )
+        if wrapper.num_experts != cfg.n_routed_experts:
+            raise RuntimeError(
+                f"DeepEP buffer experts {wrapper.num_experts} != "
+                f"layer experts {cfg.n_routed_experts}"
+            )
+        if wrapper.ep_size != int(cfg.ep_size):
+            raise RuntimeError(
+                f"DeepEP buffer ep_size {wrapper.ep_size} != layer ep_size "
+                f"{cfg.ep_size}"
+            )
+        self._deepep_normal = wrapper
+        return True
+
+    def _forward_ep_deepep_normal(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """DeepEP normal dispatch → stock ``_forward_local`` → combine.
+
+        The INBOX 2026-10-15 16:20 direction (a) transport: keep the FP4
+        grouped compute untouched, replace only dispatch/combine with
+        DeepEP's normal-mode kernels (device-side layout, one dispatch, one
+        combine — the same prefill pattern the framework's
+        DeepepNormalRouter family and dsv41's DeepEPStrategy use). Versus
+        ``_forward_ep``'s per-assignment all-to-alls + counts exchange +
+        host rendezvous, the expert routing happens inside the dispatch
+        kernel and no host-side argsort/bincount runs at all. This is NOT
+        the rejected low-latency line (DSV4_EP_DEEPEP_LL): that was the
+        fixed-capacity decode variant with the upstream dispatch bug;
+        normal mode was never run on this lane.
+
+        Numerics: DeepEP's combine is a WEIGHTLESS cross-rank addition, so
+        the router weights ride the dispatched payload and are applied
+        inline by ``_forward_local``'s ep_gather on the recv rows — the
+        same weighting the single-rank path already does. The fp32 partial
+        is rounded to BF16 once for the combine payload (the same wire
+        format class ``_forward_ep`` uses per assignment); no bit-parity
+        claim against the all-to-all path is made or needed
+        (output-semantics obligation only).
+
+        ``recv_topk_idx`` comes back in the LOCAL expert index space with
+        -1 rows for non-destined slots (dsv41 field note: force int64 +
+        contiguous — the ACCL tensor occasionally carries a non-standard
+        dtype). K=6 is padded to 8 for the intranode dispatch kernel's
+        topk switch; padded slots are -1/0.0 and drop out through the
+        sentinel contract.
+
+        Eager only: the dispatch layout and combine synchronize with the
+        host, so capture keeps taking ``_forward_ep_static``. Every rank
+        enters the collectives symmetrically, including empty local batches
+        (no early return on N == 0 — zero-row dispatches are well-formed).
+        """
+        cfg = self.cfg
+        N, D = x.shape
+        K = indices.size(1)
+        device = x.device
+
+        wrapper = self._deepep_normal
+        buffer = wrapper.buffer
+
+        topk_idx = indices.to(torch.int64).contiguous()
+        topk_w = weights.reshape(N, K).to(torch.float32).contiguous()
+        topk_idx, topk_w = _pad_topk_for_deepep(topk_idx, topk_w)
+
+        # 1. Device-side dispatch layout.
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            _,
+        ) = buffer.get_dispatch_layout(topk_idx, cfg.n_routed_experts)
+
+        # 2. Dispatch the BF16 token rows + topk scaffolding (bf16 branch:
+        # activation quant stays inside _forward_local, matching the
+        # DeepEPNormalRouter's non-fp8 _prepare_dispatch_input).
+        (
+            recv_x,
+            recv_topk_idx,
+            recv_topk_weights,
+            _num_recv_tokens_per_expert_list,
+            handle,
+            _,
+        ) = buffer.dispatch(
+            x.contiguous(),
+            None,
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            is_token_in_rank,
+            num_tokens_per_expert,
+            topk_idx,
+            topk_w,
+            expert_alignment=1,
+        )
+
+        # 3. Local compute over the recv rows, LOCAL expert ids as-is.
+        recv_idx = recv_topk_idx.to(torch.int64).contiguous()
+        M = recv_x.size(0)
+        if M > 0:
+            y_local = self._forward_local(
+                recv_x.contiguous(),
+                recv_topk_weights.to(torch.float32).contiguous(),
+                recv_idx,
+            )
+        else:
+            # No recv rows this rank — an empty fp32 partial keeps combine
+            # well-formed (dsv41 DeepEPStrategy's M == 0 guard).
+            y_local = torch.zeros(M, D, dtype=torch.float32, device=device)
+
+        # 4. Combine back to the source ranks (weightless addition; the
+        # per-assignment weights were already applied in ep_gather). The
+        # wire dtype must match the dispatched activation's.
+        y_combined, _, _ = buffer.combine(y_local.to(x.dtype), handle)
+        return y_combined.float()
 
     def _forward_ep_static(
         self,
