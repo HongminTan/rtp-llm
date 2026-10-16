@@ -1609,7 +1609,11 @@ py_test(
         "//rtp_llm:testlib",
         "//rtp_llm/test/perf_test:perf_test_lib",
     ],
-    data = ["//rtp_llm:sdk"],
+    data = [
+        "//rtp_llm:sdk",
+        "//3rdparty/remote_kv_cache_manager:remote_kv_cache_manager_server_bin",
+        "//rtp_llm/test/smoke:smoke_framework_srcs",
+    ],
     args = [
         "--model_type", "deepseek_v4",
         "--checkpoint_path", "/home/admin/dsv4_hmz/models/DeepSeek-V4-Flash-fp8",

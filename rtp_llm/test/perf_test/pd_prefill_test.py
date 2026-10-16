@@ -32,11 +32,17 @@ _PREFILL_DEVICES = [0, 1, 2, 3]
 _DECODE_DEVICES = [4, 5, 6, 7]
 
 # Role deltas appended to the common engine CLI built by the perf framework.
+# kvcm timeouts follow the suites_h20_oss remote-cache smoke precedent: the
+# 16k-token KV put/get between roles needs the extended 17s/20s windows.
 _PREFILL_ROLE_ARGS = (
     "--role_type PREFILL "
     "--enable_cuda_graph 0 "
     "--cp_rotate_method ALL_GATHER "
     "--enable_remote_cache true "
+    "--kvcm_put_timeout_ms 17000 "
+    "--kvcm_get_timeout_ms 17000 "
+    "--kvcm_get_broadcast_timeout 20000 "
+    "--kvcm_put_broadcast_timeout 20000 "
     f"--world_size {len(_PREFILL_DEVICES)}"
 )
 _DECODE_ROLE_ARGS = (
@@ -45,6 +51,10 @@ _DECODE_ROLE_ARGS = (
     "--decode_capture_config 1,2,4 "
     "--cp_rotate_method PREFILL_CP "
     "--enable_remote_cache true "
+    "--kvcm_put_timeout_ms 17000 "
+    "--kvcm_get_timeout_ms 17000 "
+    "--kvcm_get_broadcast_timeout 20000 "
+    "--kvcm_put_broadcast_timeout 20000 "
     "--tp_size 1 "
     "--dp_size 4 "
     f"--world_size {len(_DECODE_DEVICES)}"
@@ -90,6 +100,40 @@ class PdEngineServer:
         self._remaining_args = remaining_args
         self._prefill: Optional[MagaServerManager] = None
         self._decode: Optional[MagaServerManager] = None
+        self._kvcm: Optional[Any] = None
+
+    def _start_remote_kvcm_server(self, result_dir: str) -> Any:
+        # Replicates smoke case_runner._start_remote_kvcm_server(): the P/D KV
+        # handoff goes through the cache connector (StreamCacheResource::
+        # holdKVCacheForPDSep -> incrKVCacheRef(is_connector=true)), whose
+        # cross-instance transport is the kvcm server addressed via
+        # RECO_SERVER_ADDRESS.
+        from rtp_llm.test.smoke.remote_kvcm_server import RemoteKVCMServer
+
+        runfiles_root = os.path.join(
+            os.environ["TEST_SRCDIR"], os.environ["TEST_WORKSPACE"]
+        )
+        server_path = os.path.join(
+            runfiles_root, "3rdparty", "remote_kv_cache_manager"
+        )
+        if not os.path.isfile(
+            os.path.join(server_path, "bin", "kv_cache_manager_bin")
+        ):
+            raise FileNotFoundError(
+                "kv_cache_manager_bin is absent from Bazel runfiles"
+            )
+        kvcm_src_logs_path = os.path.join(os.environ["TEST_SRCDIR"], "rtp_llm/logs")
+        kvcm_dst_logs_path = os.path.join(result_dir, "kvcm_logs")
+        kvcm = RemoteKVCMServer(
+            server_path,
+            {"KVCM_LOG_LEVEL": "DEBUG"},
+            kvcm_src_logs_path,
+            kvcm_dst_logs_path,
+        )
+        if not kvcm.start_server():
+            kvcm.stop_server()
+            raise RuntimeError("remote kvcm server failed to start")
+        return kvcm
 
     def start(
         self,
@@ -109,6 +153,16 @@ class PdEngineServer:
 
         prefill_port = MagaServerManager.get_free_port()
         decode_port = MagaServerManager.get_free_port()
+        self._kvcm = self._start_remote_kvcm_server(self._args.result_dir)
+        reco_address = self._kvcm.address()
+
+        # .bazelrc test:cuda12_9 pins CC/CXX/CUDAHOSTCXX/NVCC_PREPEND_FLAGS to
+        # the CI image's gcc-toolset-12 path (absent on this host) and those
+        # override BUILD env; the single-server path relies on the
+        # _host_compiler_fallback shim (a9c096c64d) to restore /usr/bin/g++.
+        # Carry the same shim into the PD role envs — without it TileLang JIT
+        # during model init fails to find the host compiler (f1-04).
+        from rtp_llm.test.perf_test.server import _host_compiler_fallback
 
         common_env: Dict[str, Any] = {
             "FAKE_BALANCE_EXPERT": "1",
@@ -117,7 +171,9 @@ class PdEngineServer:
             ),
             "TORCH_CUDA_PROFILER_DIR": self._args.result_dir,
             "MODEL_SERVICE_CONFIG": _service_route_json(prefill_port, decode_port),
+            "RECO_SERVER_ADDRESS": reco_address,
         }
+        common_env.update(_host_compiler_fallback())
         if use_batch_decode_scheduler is not None:
             common_env["USE_BATCH_DECODE_SCHEDULER"] = (
                 "1" if use_batch_decode_scheduler else "0"
@@ -174,15 +230,19 @@ class PdEngineServer:
                 manager.print_process_log()
 
     def stop(self) -> None:
-        prefill, decode = self._prefill, self._decode
+        prefill, decode, kvcm = self._prefill, self._decode, self._kvcm
         self._prefill = None
         self._decode = None
+        self._kvcm = None
         # Stop the decode role first so the prefill role's remote calls fail
         # fast instead of hanging on a peer that is already gone.
         if decode is not None:
             decode.stop_server()
         if prefill is not None:
             prefill.stop_server()
+        if kvcm is not None:
+            kvcm.stop_server()
+            kvcm.copy_logs()
 
     @property
     def port(self) -> int:
