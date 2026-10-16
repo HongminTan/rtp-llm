@@ -257,21 +257,35 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         prepareGrpcNormalDeviceState(stream_groups);
     }
 
+    bool m1_consumed = false;
     if (m1_pre_launched_) {
         // M1-lite: the previous process() already gathered, synced, and
         // launched this step's forward (launchNextStepEarly) before its
         // dispatch tail. Consume the pending pair and skip straight to the
-        // sampler. (The launch site skips profiling-active steps, so at most
-        // a transition-edge step runs a degenerate profiler window here.)
+        // sampler — but only when the live stream set is exactly the set the
+        // forward was launched for (composition-safety guard (a)); otherwise
+        // discard the orphaned pair and fall through to the ordinary path.
         RTP_LLM_PROFILE_SCOPE("executor.m1_lite.consume_pre_launched");
-        model_input      = std::move(m1_pending_input_);
-        model_output     = std::move(m1_pending_output_);
-        m1_pre_launched_ = false;
-        if (profile_step_start_) {
-            profile_step_start_();
+        const bool composition_match =
+            m1_pre_launched_streams_.size() == streams.size()
+            && std::equal(m1_pre_launched_streams_.begin(), m1_pre_launched_streams_.end(), streams.begin());
+        if (composition_match) {
+            model_input  = std::move(m1_pending_input_);
+            model_output = std::move(m1_pending_output_);
+            m1_consumed  = true;
+            if (profile_step_start_) {
+                profile_step_start_();
+            }
+            buffer_holder_.release();
+        } else {
+            RTP_LLM_LOG_WARNING("[normal-m1-lite] pre-launched pair discarded: stream set changed");
+            m1_pending_input_  = GptModelInputs();
+            m1_pending_output_ = GptModelOutputs();
         }
-        buffer_holder_.release();
-    } else {
+        m1_pre_launched_streams_.clear();
+        m1_pre_launched_ = false;
+    }
+    if (!m1_consumed) {
         {
             RTP_LLM_PROFILE_SCOPE("executor.gather_model_input");
             int64_t start_time_us      = autil::TimeUtility::currentTimeInMicroSeconds();
@@ -413,9 +427,31 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     // dispatch's later D2H blocks on the launched graph's completion, which
     // is harmless: nothing host-side gates until the next sampler's
     // stream-state updates land in this dispatch.
+    //
+    // Composition-safety (R200 correction 3): the pre-launched forward is
+    // bound to THIS step's stream set. Two guards keep a composition change
+    // from corrupting the next step:
+    //   (b) near-finish valve — skip the launch when any stream is within 2
+    //       tokens of its length limit, so the batch the launched forward
+    //       assumes cannot dissolve before it is consumed. The EOS floor
+    //       (min_new_tokens) makes this sufficient for fixed-length decode
+    //       (perf targets set min=max); general serving additionally needs
+    //       the phase-3 release gating.
+    //   (a) consume-side set match — the next process() discards the pending
+    //       pair unless the live stream set is exactly the launched set.
     if (useM1Lite() && is_decode_only && !zero_token_batch && !profile_step_start_) {
         publishNormalDeviceState(stream_groups, sampler_output);
         bool can_launch = gatherCanUseDeviceState(stream_groups);
+        if (can_launch) {
+            for (const auto& stream : stream_groups.decodeStreams()) {
+                const auto*   cfg = stream->generateInput() ? stream->generateInput()->generate_config.get() : nullptr;
+                const int64_t max_new = cfg ? cfg->max_new_tokens : 0;
+                if (max_new > 0 && static_cast<int64_t>(stream->outputTokenLen()) + 2 >= max_new) {
+                    can_launch = false;
+                    break;
+                }
+            }
+        }
         if (can_launch && cache_manager_ != nullptr) {
             // KV-boundary conservative valve (R192 safety): the next gather
             // runs before this step's dispatch writes the stream state, so
@@ -436,6 +472,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         if (can_launch) {
             auto launch_status = launchNextStepEarly(stream_groups);
             if (launch_status.ok()) {
+                m1_pre_launched_streams_.assign(streams.begin(), streams.end());
                 m1_pre_launched_ = true;
             } else {
                 // Conservative fallback: the ordinary next-step path runs.

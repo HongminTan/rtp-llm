@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
@@ -138,6 +140,10 @@ private:
     bool            m1_pre_launched_ = false;
     GptModelInputs  m1_pending_input_;
     GptModelOutputs m1_pending_output_;
+    // The exact stream set the pre-launched forward was bound to
+    // (composition-safety guard (a): the consume discards the pending pair
+    // unless the live set matches element-wise).
+    std::vector<GenerateStreamPtr> m1_pre_launched_streams_;
 };
 
 }  // namespace rtp_llm
