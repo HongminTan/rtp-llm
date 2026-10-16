@@ -442,16 +442,38 @@ class Block(nn.Module):
             )
             # Framework RMSNorm wants 2D. Attention keeps the original 3D shape.
             bsz, q_len, dim_ = x_pre.shape
-            x_pre = self.attn_norm(x_pre.reshape(bsz * q_len, dim_)).view(
-                bsz, q_len, dim_
-            )
+            shared_input_quant = None
+            if (
+                not _dbg_layer
+                and q_len == 1
+                and self.attn.can_fuse_decode_attn_norm_input_quant(
+                    x_pre.reshape(bsz * q_len, dim_), self.attn_norm.weight.data
+                )
+            ):
+                # Fused decode norm+input-quant (C2a): one Triton kernel replaces
+                # the flashinfer RMSNorm + the attention-side wq_a quantize_input
+                # pair; the (fp8, scale) tuple feeds compute_qkv directly.
+                x_pre, shared_input_quant = (
+                    self.attn.decode_fused_attn_norm_input_quant(
+                        x_pre,
+                        self.attn_norm.weight.data,
+                        self.attn_norm.variance_epsilon,
+                    )
+                )
+            else:
+                x_pre = self.attn_norm(x_pre.reshape(bsz * q_len, dim_)).view(
+                    bsz, q_len, dim_
+                )
             if _dbg_layer:
                 _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_attn_in", x_pre)
             if attn_fn is not None:
                 attn_out = attn_fn(x_pre)
             else:
                 attn_out = self.attn.forward_decode(
-                    x_pre, attn_metadata, kv_cache=kv_cache
+                    x_pre,
+                    attn_metadata,
+                    kv_cache=kv_cache,
+                    shared_input_quant=shared_input_quant,
                 )
             if _dbg_layer:
                 _rt.record_if_level(

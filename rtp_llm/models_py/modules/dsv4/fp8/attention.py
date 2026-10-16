@@ -420,9 +420,7 @@ def _prepare_wo_a_stacked(
     ``deep_gemm.fp8_einsum(..., recipe=(1, 1, 128))`` expectations."""
     w_stk = weight_fp8.view(G, R, K).contiguous()
     scale_fp32 = scale_raw.float().view(G, R // 128, K // 128)
-    from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
-        is_deep_gemm_e8m0_used,
-    )
+    from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 
     if not is_deep_gemm_e8m0_used():
         # Hopper: fp8_einsum consumes FP32 block scales with the (1, 128,
@@ -467,8 +465,6 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
         "_s",
         quant_config=_V4_FP8_BLOCK_CFG,
     )
-
-
 
 
 def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):
@@ -2049,6 +2045,52 @@ class AttentionFP8(nn.Module):
             )
         return x_norm, (x_fp8, x_scale)
 
+    def can_fuse_decode_attn_norm_input_quant(
+        self, x: torch.Tensor, norm_weight: torch.Tensor
+    ) -> bool:
+        """Decode-side gate for the f32-scale fused norm+input-quant path.
+
+        Mirrors :meth:`can_fuse_prefill_attn_norm_input_quant` with the scale
+        domain inverted: the decode DeepGEMM linear family on an f32-scale
+        checkpoint consumes ``sgl_per_token_group_quant_fp8(...,
+        scale_ue8m0=False)`` layouts (trace-fingerprint SCALE_UE8M0=false), so
+        the f32 fused kernel is the matching variant here.
+        """
+        return (
+            self._can_reuse_qkv_input_quant()
+            and not getattr(self.wq_a, "scale_ue8m0", False)
+            and not getattr(self.wkv, "scale_ue8m0", False)
+            and x.dim() in (2, 3)
+            and x.shape[-1] == self.wq_a.K
+            and x.dtype == torch.bfloat16
+            and norm_weight.dtype == torch.bfloat16
+            and norm_weight.shape == (x.shape[-1],)
+        )
+
+    def decode_fused_attn_norm_input_quant(
+        self,
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        with record_function_range("dsv4.fp8.attn.qkv.fused_attn_norm_input_quant"):
+            from rtp_llm.models_py.modules.dsv4._fused_rmsnorm_fp8_quant_f32_triton import (
+                rmsnorm_fp8_quant_f32,
+            )
+
+            x_2d = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
+            x_norm, x_fp8, x_scale = rmsnorm_fp8_quant_f32(
+                x_2d,
+                norm_weight,
+                eps=norm_eps,
+                group_size=128,
+                clamp_eps=1.0e-4,
+                out_norm=x_2d,
+            )
+            if x.dim() != 2:
+                x_norm = x_norm.view(*x.shape)
+        return x_norm, (x_fp8, x_scale)
+
     def _lin_from_shared_quant(
         self,
         layer: nn.Module,
@@ -2099,10 +2141,7 @@ class AttentionFP8(nn.Module):
             # two small strided copies (pad-in / unpad-out). Bit-identical
             # to the loop on the per-group math (bench/probe_woa_grouped_vs_
             # loop.py, cap_m=64 pinned empirically; cap_m=1 is invalid).
-            if (
-                _wo_a_grouped_gemm_enabled()
-                and 1 <= M <= _WOA_GROUPED_M_MAX
-            ):
+            if _wo_a_grouped_gemm_enabled() and 1 <= M <= _WOA_GROUPED_M_MAX:
                 K = _K
                 a_m, a_sf, d_m = _wo_a_grouped_buffers(G, R, K, o_fp8.device)
                 # [M, G, K] -> [G, M, K] group-major pad-in (free for M == 1,
@@ -2147,17 +2186,21 @@ class AttentionFP8(nn.Module):
         x: torch.Tensor,  # [B, q_len, dim] bf16
         attn_metadata: "DSv4DecodeAttnMetadataFP8",  # type: ignore[name-defined]
         kv_cache: Optional[Any] = None,
+        shared_input_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """qwen3-style: ``kv_cache`` (framework KVCache handle) flows in
         as a kwarg. Stashed for the duration of this call so pool views
         resolve via ``self._pool_view(...)``; block tables for decode
         come from ``attn_metadata.pool_block_tables`` — stashed onto
         ``self._block_tables_by_type`` here so Compressor / Indexer pool
-        context resolution shares one code path with prefill."""
+        context resolution shares one code path with prefill.
+        ``shared_input_quant`` carries a block-side fused norm+quant result
+        (see :meth:`decode_fused_attn_norm_input_quant`); when given,
+        ``decode_compute_qkv`` skips its own input quant."""
         with bind_attn_cache(self, kv_cache, attn_metadata.pool_block_tables):
             self._set_compressor_pool_context()
             try:
-                return self._forward_decode_body(x, attn_metadata)
+                return self._forward_decode_body(x, attn_metadata, shared_input_quant)
             finally:
                 self._clear_compressor_pool_context()
 
@@ -2165,6 +2208,7 @@ class AttentionFP8(nn.Module):
         self,
         x: torch.Tensor,  # [B, 1, dim] bf16  (q_len=1 pure decode)
         attn_metadata: "DSv4DecodeAttnMetadataFP8",  # type: ignore[name-defined]
+        shared_input_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Decode attention body — thin dispatcher mirroring ``_forward_prefill``.
 
@@ -2193,7 +2237,9 @@ class AttentionFP8(nn.Module):
         position_ids = attn_metadata.position_ids[:T]  # [T] int32
 
         self._ensure_freqs_cis_bound()
-        qkv = decode_compute_qkv(self, x, position_ids)
+        qkv = decode_compute_qkv(
+            self, x, position_ids, shared_input_quant=shared_input_quant
+        )
         with suppress(Exception):
             from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
                 CSA_KV,

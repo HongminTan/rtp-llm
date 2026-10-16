@@ -11,7 +11,7 @@ keeps ``attention.py`` thin.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -41,11 +41,15 @@ def decode_compute_qkv(
     attn: "AttentionFP8",
     x: torch.Tensor,  # [B, S, dim] bf16
     position_ids: torch.Tensor,  # [T] int32 absolute position per token
+    shared_input_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> DecodeQKV:
     """Decode Q/KV path — RMSNorm + LoRA Q + KV linear + fused RMSNorm-RoPE.
 
     ``position_ids`` is flat over the token-major ``[B, S]`` layout. For
     normal decode ``S == 1``; target verify passes the full verify span.
+    ``shared_input_quant`` (optional) is a block-side fused
+    norm+input-quant result (``AttentionFP8.decode_fused_attn_norm_input_quant``);
+    when provided, the local ``wq_a.quantize_input`` is skipped.
     """
     rd = attn.rope_head_dim
     position_ids = position_ids.reshape(-1).to(
@@ -56,7 +60,10 @@ def decode_compute_qkv(
     # Quantize the shared bf16 input once and feed both wq_a/wkv GEMMs
     # (same pattern as the prefill qkv path): the two per-layer input
     # quants were bit-identical work duplicated on every decode step.
-    if attn._can_reuse_qkv_input_quant():
+    if shared_input_quant is not None:
+        q_a_out = attn._lin_from_shared_quant(attn.wq_a, shared_input_quant, x.shape)
+        kv_in = attn._lin_from_shared_quant(attn.wkv, shared_input_quant, x.shape)
+    elif attn._can_reuse_qkv_input_quant():
         shared_quant = attn.wq_a.quantize_input(x.reshape(-1, x.shape[-1]))
         q_a_out = attn._lin_from_shared_quant(attn.wq_a, shared_quant, x.shape)
         kv_in = attn._lin_from_shared_quant(attn.wkv, shared_quant, x.shape)
@@ -65,9 +72,7 @@ def decode_compute_qkv(
         kv_in = attn._lin(attn.wkv, x)
 
     # Q path
-    qr = attn._rmsnorm_weighted(
-        q_a_out, attn.q_norm
-    )  # [B, 1, q_lora_rank]
+    qr = attn._rmsnorm_weighted(q_a_out, attn.q_norm)  # [B, 1, q_lora_rank]
     q = attn._lin(attn.wq_b, qr).unflatten(
         -1, (attn.n_heads, attn.head_dim)
     )  # [B, S, H, D]
