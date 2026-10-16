@@ -1679,8 +1679,10 @@ py_test(
         "--input_len", "512,4096",
         "--partial", "1",
         "--decode_test_length", "30",
-        "--drift_duration", "1200",
-        "--drift_seed", "20261017",
+        # drift_duration / drift_seed / drift_fixed_wave are intentionally
+        # NOT baked: the driver pops them from argv (first match wins), so a
+        # baked value would shadow --test_arg overrides and leak the override
+        # to the engine (startup reject). Code defaults: 1200 / 20261017 / 0.
         "--num_measures", "1",
         "--seq_size_per_block", "256",
         "--max_seq_len", "8192",
