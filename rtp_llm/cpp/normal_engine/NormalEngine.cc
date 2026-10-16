@@ -17,6 +17,7 @@
 #include "rtp_llm/cpp/utils/DevicePin.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/utils/TorchCudaOom.h"
+#include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "autil/TimeUtility.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
 #include <c10/core/InferenceMode.h>
@@ -99,7 +100,7 @@ public:
         resource_context_.cache_manager = std::move(previous_cache_manager_);
     }
 
-    ScopedWarmUpCacheManagerBinding(const ScopedWarmUpCacheManagerBinding&) = delete;
+    ScopedWarmUpCacheManagerBinding(const ScopedWarmUpCacheManagerBinding&)            = delete;
     ScopedWarmUpCacheManagerBinding& operator=(const ScopedWarmUpCacheManagerBinding&) = delete;
 
 private:
@@ -346,7 +347,7 @@ absl::StatusOr<GenerateStreamPtr> NormalEngine::preRun(const std::shared_ptr<Gen
                                                        preRunMode                            mode) {
     c10::InferenceMode inference_guard(true);
 
-    auto stream = std::make_shared<NormalGenerateStream>(generate_input,
+    auto       stream       = std::make_shared<NormalGenerateStream>(generate_input,
                                                          model_config_,
                                                          runtime_config,
                                                          resource_context_,
@@ -545,7 +546,7 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
         ScopedWarmUpCacheManagerBinding cache_binding(resource_context_, cache_manager);
         THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::decode_warm_up));
     }
-    const auto max_consumed         = getGpuExecStatus().device_memory_status.max_consumed_bytes;
+    const auto max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
     rtp_llm::setTraceMemory(false);
     (void)executor_.reset(nullptr);
     cudaDeviceSynchronize();
@@ -899,6 +900,17 @@ absl::Status NormalEngine::step() try {
         }
     }
     for (int step_in_window = 0; step_in_window < multi_step_window; ++step_in_window) {
+        // #66 fix anchor (R240/r122): unconditional per-step shape consensus.
+        // Runs on EVERY window iteration of every step — including steady
+        // steps and fake-stream-only steps — so the trigger itself is
+        // identical on all ranks (r122 hard revision). The window start
+        // additionally unifies the batch shape before the first forward.
+        {
+            const int64_t consensus_bs = shapeConsensusAnchor(static_cast<int64_t>(streams.size()));
+            if (step_in_window == 0) {
+                padToConsensusBatch(streams, consensus_bs);
+            }
+        }
         if (step_in_window > 0) {
             bool any_done = false;
             for (const auto& stream : streams) {
@@ -993,6 +1005,66 @@ bool NormalEngine::shouldEarlyReturnEmptyBatch(bool streams_empty, int64_t tp_si
 
 bool NormalEngine::shouldAddMtpFakePrefill(bool has_prefill, bool use_batch_decode_scheduler, int64_t dp_size) {
     return !has_prefill && (!use_batch_decode_scheduler || dp_size > 1);
+}
+
+int64_t NormalEngine::shapeConsensusAnchor(int64_t local_bs) {
+    if (parallelism_config.dp_size <= 1) {
+        return local_bs;
+    }
+    // Lazy buffer on this rank's CUDA device; the engine loop thread is the
+    // same thread the executor runs torch on, so the device context is set.
+    if (!shape_consensus_buf_.defined()) {
+        shape_consensus_buf_ =
+            torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA).requires_grad(false));
+    }
+    // Rare fill (batch-composition change only): a device sync bounds the
+    // cross-stream ordering between this fill and the PG-side collective.
+    if (local_bs != shape_consensus_last_bs_) {
+        shape_consensus_buf_.fill_(local_bs);
+        torch::cuda::synchronize();
+        shape_consensus_last_bs_ = local_bs;
+    }
+    execAllReduce({shape_consensus_buf_, ReduceOp::Max, false, ParallelMode::DP});
+    // The completion wait IS the anchor: blocking here means every rank's
+    // k-th all-reduce has completed, clamping cross-rank host drift to ~one
+    // step (see header comment). execSyncCommunication waits the DP group's
+    // outstanding collectives on the host; the subsequent item() read is then
+    // coherent with the completed write.
+    execSyncCommunication(ParallelMode::DP, /*timeout=*/false);
+    const int64_t  consensus = shape_consensus_buf_.item<int64_t>();
+    const uint64_t calls     = shape_consensus_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (calls == 1 || calls % 1000 == 0) {
+        RTP_LLM_LOG_INFO("[shape-consensus] calls=%lu pads=%lu last_local_bs=%ld consensus=%ld",
+                         (unsigned long)calls,
+                         (unsigned long)shape_consensus_pads_.load(std::memory_order_relaxed),
+                         (long)local_bs,
+                         (long)consensus);
+    }
+    return consensus;
+}
+
+void NormalEngine::padToConsensusBatch(std::list<GenerateStreamPtr>& streams, int64_t consensus_bs) {
+    // Shape unification for decode-only batches: pad ranks whose local batch
+    // is below the consensus with fake streams so every rank replays the same
+    // graph shape this step. Mixed context/decode batches stay untouched
+    // (the prefill machinery owns those shapes; the anchor still ran).
+    if (consensus_bs <= (int64_t)streams.size() || streams.empty()) {
+        return;
+    }
+    for (const auto& stream : streams) {
+        if (stream->isContextStream()) {
+            return;
+        }
+    }
+    const int64_t pad = consensus_bs - static_cast<int64_t>(streams.size());
+    for (int64_t i = 0; i < pad; ++i) {
+        streams.emplace_back(createMinFakeStream(1));
+    }
+    shape_consensus_pads_.fetch_add(static_cast<uint64_t>(pad), std::memory_order_relaxed);
+    RTP_LLM_LOG_INFO("[shape-consensus] padded %ld fake stream(s): local=%zu consensus=%ld",
+                     (long)pad,
+                     streams.size() - pad,
+                     (long)consensus_bs);
 }
 
 void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {

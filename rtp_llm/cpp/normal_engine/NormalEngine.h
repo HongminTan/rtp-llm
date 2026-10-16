@@ -3,6 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include "ATen/core/TensorBody.h"
 #include "absl/status/status.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/engine_base/TorchProfiler.h"
@@ -73,6 +74,26 @@ private:
     static bool   shouldAddMtpFakePrefill(bool has_prefill, bool use_batch_decode_scheduler, int64_t dp_size);
     void          mayAddFakeStream(std::list<GenerateStreamPtr>& streams);
 
+    // #66 fix (R240/r122): unconditional per-step shape-consensus anchor.
+    // Called at the top of every engine step (window iteration) with
+    // dp_size > 1. Every rank contributes its local batch size to a
+    // Max all-reduce over the DP group and the host blocks until the
+    // k-th all-reduce completes on ALL ranks — the per-index matching
+    // clamps cross-rank host drift to ~one step, so a batch-composition
+    // transition can no longer desynchronize the engines' collective
+    // sequences (the H-A' wedge: ranks diverging between finishing and
+    // admitting, mismatching in-graph collective order forever).
+    // The call itself is unconditional per step (r122 hard revision):
+    // no rank-local "batch changed" gate — a conditional trigger would
+    // re-create the same divergence on the consensus collective.
+    // Returns the consensus (max) batch size; ranks below it pad with
+    // fake streams at the window start so every rank replays the same
+    // graph shape. Steady-state cost: one 1-element all-reduce + the
+    // completion wait (~tens of us); the fill only runs when the local
+    // batch size changes.
+    int64_t shapeConsensusAnchor(int64_t local_bs);
+    void    padToConsensusBatch(std::list<GenerateStreamPtr>& streams, int64_t consensus_bs);
+
     void initExecutor(const EngineInitParams& params, std::unique_ptr<ProposeModelEngineInitParams>& propose_params);
 
     bool isMTPEagle() override;
@@ -105,7 +126,14 @@ private:
     // breaks early when any stream finishes or errors so the state machine
     // re-runs on the next full schedule (the batch shape never changes
     // mid-window, so the graph replay stays stable).
-    int                                           multi_step_max_ = 0;
+    int multi_step_max_ = 0;
+    // shapeConsensusAnchor state (#66 fix): 1-element Max-all-reduce buffer
+    // (lazy CUDA int64) + the last locally-published bs (fills are rare —
+    // only on batch-composition changes) + telemetry counters.
+    torch::Tensor         shape_consensus_buf_;
+    int64_t               shape_consensus_last_bs_ = -1;
+    std::atomic<uint64_t> shape_consensus_calls_{0};
+    std::atomic<uint64_t> shape_consensus_pads_{0};
 };
 
 }  // namespace rtp_llm
