@@ -60,6 +60,33 @@ def _worker(rank: int, world_size: int, args) -> None:
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     device = torch.cuda.current_device()
 
+    # GPU-arrival-skew injection (R229.3): torch.cuda._sleep cycles
+    # calibrated to milliseconds at startup, then rank r delays its GRAPH
+    # ARRIVAL by r * pre_graph_work_ms of real GPU work on the same stream
+    # (host launch timestamps unchanged — this isolates the queue-residual
+    # component of the first-collective window from the host-launch skew the
+    # --skew-ms phase measures).
+    sleep_cycles_per_ms = 0
+    if args.pre_graph_work_ms > 0:
+        probe = 10_000_000
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        torch.cuda._sleep(probe)
+        torch.cuda.synchronize()
+        ms = (time.perf_counter() - t0) * 1000.0
+        sleep_cycles_per_ms = int(probe / ms) if ms > 0 else 0
+        if rank == 0:
+            print(
+                f"[pre-graph-work] calibrated: {sleep_cycles_per_ms} cycles/ms",
+                flush=True,
+            )
+
+    def inject_pre_graph_work() -> None:
+        if sleep_cycles_per_ms > 0:
+            cycles = rank * args.pre_graph_work_ms * sleep_cycles_per_ms
+            if cycles > 0:
+                torch.cuda._sleep(cycles)
+
     graphs = {}
     for variant, n_a2a in (("A", 1), ("B", 2)):
         graphs[variant] = _capture_graph(
@@ -132,6 +159,35 @@ def _worker(rank: int, world_size: int, args) -> None:
             flush=True,
         )
 
+    # GPU-arrival-skew phase (R229.3): rank r injects r * pre_graph_work_ms of
+    # REAL GPU work on the replay stream right before each graph launch —
+    # host launch timestamps stay aligned, the graph's GPU arrival is delayed.
+    # Cadence growth ~ (world-1) * pre_graph_work_ms = the window absorbs
+    # GPU-side arrival skew (queue-residual hypothesis); growth well below
+    # that = the window does not gate on arrival skew (CUPTI-inflation
+    # suspicion for the observed 2-3.5 ms rises). Instrument-free.
+    if args.pre_graph_work_ms > 0:
+        g = graphs["B"]
+        for _ in range(3):
+            inject_pre_graph_work()
+            g.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        t0 = time.time()
+        for i in range(args.replays):
+            inject_pre_graph_work()
+            g.replay()
+            if i + 1 < args.replays:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        dist.barrier()
+        total_ms = (time.time() - t0) / args.replays * 1000
+        print(
+            f"[pre-graph-work {args.pre_graph_work_ms}ms/rank-step] rank{rank}: "
+            f"cadence={total_ms:.3f} ms/replay",
+            flush=True,
+        )
+
     # NOTE: the original rank-0-only profiled-replay phase was structurally
     # deadlocked (rank0 launches a2a graphs alone while peers wait at the
     # barrier -> collective mismatch spin, GPU 100%). Two same-position hangs
@@ -198,6 +254,14 @@ def main() -> None:
     ap.add_argument("--prefix-kernels", type=int, default=100)
     ap.add_argument("--msg-elems", type=int, default=1024)
     ap.add_argument("--skew-ms", type=float, default=2.0)
+    ap.add_argument(
+        "--pre-graph-work-ms",
+        type=float,
+        default=0.0,
+        help="GPU-arrival-skew injection: rank r runs r*X ms of real GPU work "
+        "(torch.cuda._sleep) on the replay stream before each graph launch "
+        "(R229.3; 0 = off)",
+    )
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     world = min(4, torch.cuda.device_count())
