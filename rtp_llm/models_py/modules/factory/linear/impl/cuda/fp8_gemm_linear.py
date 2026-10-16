@@ -111,6 +111,24 @@ class CudaFp8GEMMLinear(LinearBase):
             self._deepgemm_linear, "cached_scales_max_len", 0
         )
 
+    def quantize_input(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Delegate to the wrapped DeepGEMM linear (shared-input-quant path).
+
+        The wrapper forwards ``K``/``scale_ue8m0``/cached-scale attrs, so
+        ``_can_reuse_qkv_input_quant``-style capability checks would pass while
+        these entry points were missing — leaving the shared-input-quant
+        mechanism dead at this boundary.
+        """
+        return self._deepgemm_linear.quantize_input(input)
+
+    def forward_quantized(
+        self,
+        input_fp8: torch.Tensor,
+        input_scales: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self._deepgemm_linear.forward_quantized(input_fp8, input_scales, out=out)
+
     def _should_use_flashinfer(self, input: torch.Tensor) -> bool:
         if self._flashinfer_linear is None:
             return False
