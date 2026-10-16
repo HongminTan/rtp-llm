@@ -1612,8 +1612,8 @@ py_test(
     data = ["//rtp_llm:sdk"],
     args = [
         "--model_type", "deepseek_v4",
-        "--checkpoint_path", "/home/admin/models/DeepSeek-V4-Flash-fp8",
-        "--tokenizer_path", "/home/admin/models/DeepSeek-V4-Flash-fp8",
+        "--checkpoint_path", "/home/admin/dsv4_hmz/models/DeepSeek-V4-Flash-fp8",
+        "--tokenizer_path", "/home/admin/dsv4_hmz/models/DeepSeek-V4-Flash-fp8",
         "--batch_size", "1",
         "--input_len", "16000",
         "--partial", "2",
