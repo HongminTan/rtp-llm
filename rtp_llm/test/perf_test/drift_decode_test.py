@@ -101,6 +101,11 @@ def main() -> str:
     args, remaining = parse_args()
     drift_duration = _pop_int(remaining, "drift_duration", 1200)
     drift_seed = _pop_int(remaining, "drift_seed", 20261017)
+    # Fixed wave size (0 = rng 1..4). The #66-family transition wedge
+    # triggers on partial waves (real+fake mixing, R231); a fixed full wave
+    # (4 on DP4) keeps the semantic gate focused on the multi-step path
+    # without that orthogonal defect contaminating the run.
+    drift_fixed_wave = _pop_int(remaining, "drift_fixed_wave", 0)
 
     engine_env_names = _apply_engine_env(args.engine_env)
     _apply_run_overrides(args)
@@ -198,7 +203,9 @@ def main() -> str:
                     next_semantic = time.time() + 180
                     continue
 
-                wave_size = rng.randint(1, 4)
+                wave_size = (
+                    drift_fixed_wave if drift_fixed_wave > 0 else rng.randint(1, 4)
+                )
                 wave_index += 1
                 prompts = [rng.choice(queries) for _ in range(wave_size)]
                 futures = [
