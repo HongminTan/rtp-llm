@@ -4,6 +4,7 @@
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include <atomic>
 #include <cstdlib>
 #include <algorithm>
 #include <limits>
@@ -23,6 +24,16 @@ using namespace std;
 namespace rtp_llm {
 
 namespace {
+
+// M1-lite diagnostic counters (R201): throttled log lines distinguish
+// "gate never passed" from "launched but zero effect" without any behavior
+// change. First hit and every 100th hit log one line.
+std::atomic<uint64_t> g_m1_lite_launched{0};
+std::atomic<uint64_t> g_m1_lite_consumed{0};
+std::atomic<uint64_t> g_m1_lite_discarded{0};
+std::atomic<uint64_t> g_m1_gate_skip_near_finish{0};
+std::atomic<uint64_t> g_m1_gate_skip_kv_boundary{0};
+std::atomic<uint64_t> g_m1_gate_skip_device_state{0};
 
 bool readEnvFlagOnce(const char* env_name, const char* log_tag, const char* label) {
     const char* env = std::getenv(env_name);
@@ -270,15 +281,23 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
             m1_pre_launched_streams_.size() == streams.size()
             && std::equal(m1_pre_launched_streams_.begin(), m1_pre_launched_streams_.end(), streams.begin());
         if (composition_match) {
-            model_input  = std::move(m1_pending_input_);
-            model_output = std::move(m1_pending_output_);
-            m1_consumed  = true;
+            model_input             = std::move(m1_pending_input_);
+            model_output            = std::move(m1_pending_output_);
+            m1_consumed             = true;
+            const uint64_t consumed = g_m1_lite_consumed.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (consumed == 1 || consumed % 100 == 0) {
+                RTP_LLM_LOG_INFO("[normal-m1-lite] consumed=%lu launched=%lu discarded=%lu",
+                                 (unsigned long)consumed,
+                                 (unsigned long)g_m1_lite_launched.load(std::memory_order_relaxed),
+                                 (unsigned long)g_m1_lite_discarded.load(std::memory_order_relaxed));
+            }
             if (profile_step_start_) {
                 profile_step_start_();
             }
             buffer_holder_.release();
         } else {
             RTP_LLM_LOG_WARNING("[normal-m1-lite] pre-launched pair discarded: stream set changed");
+            g_m1_lite_discarded.fetch_add(1, std::memory_order_relaxed);
             m1_pending_input_  = GptModelInputs();
             m1_pending_output_ = GptModelOutputs();
         }
@@ -442,12 +461,16 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     if (useM1Lite() && is_decode_only && !zero_token_batch && !profile_step_start_) {
         publishNormalDeviceState(stream_groups, sampler_output);
         bool can_launch = gatherCanUseDeviceState(stream_groups);
+        if (!can_launch) {
+            g_m1_gate_skip_device_state.fetch_add(1, std::memory_order_relaxed);
+        }
         if (can_launch) {
             for (const auto& stream : stream_groups.decodeStreams()) {
                 const auto*   cfg = stream->generateInput() ? stream->generateInput()->generate_config.get() : nullptr;
                 const int64_t max_new = cfg ? cfg->max_new_tokens : 0;
                 if (max_new > 0 && static_cast<int64_t>(stream->outputTokenLen()) + 2 >= max_new) {
                     can_launch = false;
+                    g_m1_gate_skip_near_finish.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
             }
@@ -464,6 +487,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                     const int next_seq = stream->getNormalAsyncDeviceState().next_real_seq_len;
                     if (next_seq > 0 && static_cast<size_t>(next_seq) % block <= 1) {
                         can_launch = false;
+                        g_m1_gate_skip_kv_boundary.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
                 }
@@ -473,7 +497,16 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
             auto launch_status = launchNextStepEarly(stream_groups);
             if (launch_status.ok()) {
                 m1_pre_launched_streams_.assign(streams.begin(), streams.end());
-                m1_pre_launched_ = true;
+                m1_pre_launched_        = true;
+                const uint64_t launched = g_m1_lite_launched.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (launched == 1 || launched % 100 == 0) {
+                    RTP_LLM_LOG_INFO("[normal-m1-lite] launched=%lu (gate skips: near_finish=%lu kv_boundary=%lu "
+                                     "device_state=%lu)",
+                                     (unsigned long)launched,
+                                     (unsigned long)g_m1_gate_skip_near_finish.load(std::memory_order_relaxed),
+                                     (unsigned long)g_m1_gate_skip_kv_boundary.load(std::memory_order_relaxed),
+                                     (unsigned long)g_m1_gate_skip_device_state.load(std::memory_order_relaxed));
+                }
             } else {
                 // Conservative fallback: the ordinary next-step path runs.
                 RTP_LLM_LOG_WARNING("[normal-m1-lite] early launch fell back: %s", launch_status.ToString().c_str());
