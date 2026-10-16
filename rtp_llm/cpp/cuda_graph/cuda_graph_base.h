@@ -24,26 +24,33 @@ enum class CudaGraphCheckMode : uint8_t {
 
 // Current state of CUDA graph execution (used when calling canRun/forward with graph runner)
 struct CudaGraphState {
-    int                              current_batch_size{1};
-    int                              current_seq_len{1};
-    int                              current_real_graph_bs{1};       // for decode
-    int                              current_real_graph_seq_len{1};  // for prefill
-    int                              seq_len_sum{0};
-    int                              real_request_count{0};
-    int                              real_token_count{0};
-    int                              graph_token_capacity{0};
-    int                              graph_request_capacity{0};
-    int                              captured_backend_batch_size{0};
+    int current_batch_size{1};
+    int current_seq_len{1};
+    int current_real_graph_bs{1};       // for decode
+    int current_real_graph_seq_len{1};  // for prefill
+    int seq_len_sum{0};
+    int real_request_count{0};
+    int real_token_count{0};
+    int graph_token_capacity{0};
+    int graph_request_capacity{0};
+    int captured_backend_batch_size{0};
+    // Channel-B multi-step (R205.1/R216): executor-side valve sets n > 1 to
+    // request an (bs, n) multi-step replay; the runner falls back to the
+    // single-step graph when that key was not captured. After forward, the
+    // replayed [n, bs] token buffer is parked here for the executor to
+    // consume (undefined for single-step).
+    int                              multistep_n{1};
+    torch::Tensor                    multistep_tokens;
     GenerationPrefillCudaGraphStatus generation_prefill_status{GenerationPrefillCudaGraphStatus::NOT_REQUESTED};
 };
 
 struct GraphParams {
-    bool             enable_cuda_graph                  = false;
-    bool             enable_cuda_graph_debug_mode       = false;
-    bool             is_prefill_cuda_graph_mode         = false;
-    bool             is_target_verify                   = false;
-    CudaGraphRole    role                               = CudaGraphRole::AUTO;
-    int              max_seq_len                        = 0;
+    bool             enable_cuda_graph            = false;
+    bool             enable_cuda_graph_debug_mode = false;
+    bool             is_prefill_cuda_graph_mode   = false;
+    bool             is_target_verify             = false;
+    CudaGraphRole    role                         = CudaGraphRole::AUTO;
+    int              max_seq_len                  = 0;
     int              num_tokens_per_bs      = 1;  // Number of tokens per batch (1 for decode, max_seq_len for prefill)
     size_t           max_context_batch_size = 128;
     std::size_t      hidden_size            = 0;
@@ -74,7 +81,6 @@ struct GraphParams {
     // setting them after capture leaves the graph bound to undefined tensors.
     torch::Tensor position_encoding;
     torch::Tensor token_type_embedding;
-
 };
 
 class GraphBase {

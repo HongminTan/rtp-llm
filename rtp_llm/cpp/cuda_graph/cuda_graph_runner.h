@@ -191,6 +191,20 @@ public:
     static int multistepGraphKey(int bs, int n) {
         return bs * 1000 + n;
     }
+    // The replay key for this state: the (bs, n) multi-step instance when the
+    // state requests n > 1 AND that instance was captured; the ordinary
+    // single-step key otherwise. Every per-replay prep/replay site must
+    // resolve through this so the metadata rewrite lands on the impl the
+    // replay actually runs.
+    int effectiveReplayKey(const CudaGraphState& state) const {
+        if (!is_prefill_cuda_graph_mode_ && state.multistep_n > 1) {
+            const int key = multistepGraphKey(state.current_real_graph_bs, state.multistep_n);
+            if (graph_instances_.count(key) > 0) {
+                return key;
+            }
+        }
+        return is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
+    }
     // Replay the (bs, n) multi-step graph and return its [n, bs] token buffer
     // (replay-stable storage; content refreshed by the captured copy kernel).
     torch::Tensor replayDecodeMultistep(int bs, int n);

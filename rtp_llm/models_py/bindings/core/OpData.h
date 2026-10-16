@@ -98,7 +98,12 @@ struct GptModelInputs {
     bool need_moe_gating        = false;
     bool warmup                 = false;
     bool skip_run               = false;
-    bool is_fake_stream         = false;
+    // Channel-B multi-step (R205.1/R216): executor-side valve requests an
+    // (bs, n) multi-step graph replay for this decode step. Pure C++ channel —
+    // every rank's valve evaluates the same stream states, so no TP sync is
+    // needed; the runner falls back to single-step when the key is absent.
+    int  multistep_n    = 1;
+    bool is_fake_stream = false;
 
     // Linear attention target verify should write draft tokens mamba states
     // to extra kv_cache blocks when normal inference only write last token mamba state.
@@ -126,6 +131,13 @@ struct GptModelOutputs {
     // this separate from all_hidden_states lets the executor distinguish a
     // real graph-instance output from the ordinary decoder hidden tensor.
     torch::Tensor mtp_target_hidden_states;
+
+    // Channel-B multi-step (R205.1/R216): [n, bs] greedy token ids produced
+    // by one multi-step graph replay. Defined only when the executor set
+    // GptModelInputs::multistep_n > 1 AND the runner replayed the (bs, n)
+    // graph — the sampler is then skipped and the dispatch loop consumes n
+    // tokens from this buffer. Undefined for ordinary single-step forwards.
+    torch::Tensor multistep_tokens;
 
     // A single request-visible status. `REPLAYED` means this forward actually
     // executed a captured generation-prefill CUDA Graph; every other non-default value is

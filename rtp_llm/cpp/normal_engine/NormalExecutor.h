@@ -77,6 +77,11 @@ protected:
     bool         useM1Lite() const;
     absl::Status launchNextStepEarly(const StreamGroups& stream_groups);
 
+    // Channel-B multi-step (R205.1/R216): per-step valve — returns the
+    // multi-step n to request from the graph runner (1 = single step).
+    // Deterministic across ranks (see NormalExecutor.cc for the invariant).
+    int multistepRequestN(const StreamGroups& stream_groups) const;
+
     // Stream-async dispatch. Records sampler_event on the main stream after
     // sampler_->forward, then forks the bookkeeping worker to wait on the
     // event and run dispatch + per-stream update off the main thread.

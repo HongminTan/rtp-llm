@@ -1127,8 +1127,12 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         torch::Tensor  hidden_states;
 
         // Cast the Python object to PyModelOutputs and extract hidden states
-        auto*      graph_runner = selectGraphRunner(py_model_inputs.attention_inputs);
-        auto&      graph_state  = selectGraphState(py_model_inputs.attention_inputs);
+        auto* graph_runner = selectGraphRunner(py_model_inputs.attention_inputs);
+        auto& graph_state  = selectGraphState(py_model_inputs.attention_inputs);
+        // Channel-B: carry the executor's multi-step request into the runner
+        // and clear any stale token buffer from a previous replay.
+        graph_state.multistep_n      = inputs.multistep_n;
+        graph_state.multistep_tokens = torch::Tensor();
         const bool is_generation_prefill_runner =
             graph_runner != nullptr && graph_runner == generation_prefill_graph_runner_.get();
         if (!capture_hidden_states && owns_generation_prefill_cuda_graph_ && has_context_request
@@ -1184,6 +1188,15 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         }
 
         cache_store_write_cycle.finish();
+
+        // Channel-B: a multi-step replay produced [n, bs] greedy tokens
+        // in-graph — the lm_head/sampler path is skipped entirely; the
+        // executor's dispatch loop consumes n tokens from this buffer.
+        if (graph_state.multistep_tokens.defined()) {
+            GptModelOutputs outputs;
+            outputs.multistep_tokens = graph_state.multistep_tokens;
+            return with_generation_prefill_cuda_graph_status(std::move(outputs));
+        }
 
         RTP_LLM_LOG_DEBUG("Python object instance forward method called successfully.");
         auto attach_mtp_target_hidden_states = [&py_model_outputs](GptModelOutputs outputs) {

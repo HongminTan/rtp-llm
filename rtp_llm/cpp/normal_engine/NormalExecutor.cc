@@ -32,6 +32,12 @@ std::atomic<uint64_t> g_m1_lite_launched{0};
 std::atomic<uint64_t> g_m1_lite_consumed{0};
 std::atomic<uint64_t> g_m1_lite_discarded{0};
 std::atomic<uint64_t> g_m1_gate_skip_near_finish{0};
+// Channel-B multi-step gate telemetry (R205.1/R216): gate skips by reason.
+std::atomic<uint64_t> g_ms_gate_skip_context{0};
+std::atomic<uint64_t> g_ms_gate_skip_greedy{0};
+std::atomic<uint64_t> g_ms_gate_skip_near_finish{0};
+std::atomic<uint64_t> g_ms_gate_skip_kv_boundary{0};
+std::atomic<uint64_t> g_ms_gate_skip_async{0};
 std::atomic<uint64_t> g_m1_gate_skip_kv_boundary{0};
 std::atomic<uint64_t> g_m1_gate_skip_device_state{0};
 
@@ -373,6 +379,8 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                 const auto role = is_propose_ ? ModelInputsModelRole::DRAFT : ModelInputsModelRole::NORMAL;
                 model_inputs_logger_->log(model_input, role, model_->model_id_);
             }
+            // Channel-B: request a multi-step replay when the valve passes.
+            model_input.multistep_n             = multistepRequestN(stream_groups);
             model_output                        = std::move(model_->forward(model_input));
             executor_collector.model_forward_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         }
@@ -407,7 +415,12 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     // Gather selects the execution mode from non-errored streams in model order.
     // Use that same decision: streams.front() may already have failed or be reordered.
     const bool zero_token_batch = model_input.skip_lm_head;
-    if (!zero_token_batch) {
+    // Channel-B: a multi-step replay produced [n, bs] greedy tokens in-graph;
+    // the sampler is skipped entirely and the dispatch loop below consumes n
+    // tokens (R209.1 packing: 7 multi-step replays + residual single steps
+    // on the 30-token carrier).
+    const bool multistep = model_output.multistep_tokens.defined();
+    if (!zero_token_batch && !multistep) {
         RTP_LLM_PROFILE_SCOPE("executor.sampler_forward");
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
 
@@ -461,7 +474,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     // NOTE: profile_step_start_ is wired permanently at construction (its
     // callback no-ops when profiling is inactive), so it must NOT gate this
     // block — the R201 diagnostic run proved the gate was permanently closed.
-    if (useM1Lite() && is_decode_only && !zero_token_batch) {
+    if (useM1Lite() && is_decode_only && !zero_token_batch && !multistep) {
         publishNormalDeviceState(stream_groups, sampler_output);
         bool can_launch = gatherCanUseDeviceState(stream_groups);
         if (!can_launch) {
@@ -537,7 +550,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     if (metrics_reporter_ && tp_rank_ == 0) {
         token_counts_by_priority = stream_groups.tokenCountsByPriority();
     }
-    if (useStreamAsync() && is_decode_only && !zero_token_batch) {
+    if (useStreamAsync() && is_decode_only && !zero_token_batch && !multistep) {
         RTP_LLM_PROFILE_SCOPE("executor.dispatch_output(stream_async)");
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
 
@@ -565,8 +578,39 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     {
         RTP_LLM_PROFILE_SCOPE("executor.dispatch_output");
         int64_t      start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        absl::Status result;
-        if (zero_token_batch) {
+        absl::Status result        = absl::OkStatus();
+        // Channel-B N-token dispatch (R205.1 point 4): one multi-step replay
+        // carries n logical decode steps. Each step feeds the ordinary
+        // dispatcher with a per-step token slice; finish detection runs per
+        // token so an EOS mid-window ends the stream (remaining graph tokens
+        // are wasted by design, R205.2). Carrier scope: the min=max greedy
+        // form never EOSes mid-window (R205.2), so the loop normally runs to
+        // n; the early exit is the general-serving guard.
+        if (multistep) {
+            const auto& ms_tokens = model_output.multistep_tokens;  // [n, bs] int64
+            const int   n_steps   = static_cast<int>(ms_tokens.size(0));
+            for (int i = 0; i < n_steps; ++i) {
+                SamplerOutput step_output;
+                step_output.token_ids = ms_tokens.select(0, i).to(torch::kInt32).unsqueeze(1).contiguous();  // [bs, 1]
+                step_output.success   = torch::ones(
+                    {ms_tokens.size(1)}, torch::TensorOptions().dtype(torch::kBool).device(ms_tokens.device()));
+                MergedOutput merge_outputs{model_output, std::move(step_output)};
+                result = batch_stream_processor_->dispatch(stream_groups, merge_outputs);
+                if (!result.ok()) {
+                    break;
+                }
+                bool any_running = false;
+                for (const auto& stream : stream_groups.decodeStreams()) {
+                    if (!stream->isFinished()) {
+                        any_running = true;
+                        break;
+                    }
+                }
+                if (!any_running) {
+                    break;
+                }
+            }
+        } else if (zero_token_batch) {
             cudaSyncAndCheck();
             result = batch_stream_processor_->dispatchPrefillOnly(stream_groups,
                                                                   model_output.generation_prefill_cuda_graph_status);
@@ -597,6 +641,61 @@ bool NormalExecutor::useM1Lite() const {
     // next-step gather would need the D2H'd stream state, which the reorder
     // has deliberately not waited for.
     return enabled && useDeviceInput();
+}
+
+int NormalExecutor::multistepRequestN(const StreamGroups& stream_groups) const {
+    // Channel-B multi-step valve (R205.1/R216/R209.1). Deterministic function
+    // of replicated stream state — every rank must evaluate the same value or
+    // the graph shapes diverge (the #66 wedge class), so NO rank-local
+    // timing/rng input may enter this predicate. The runner falls back to the
+    // single-step graph when the (bs, n) instance is absent.
+    static const int n = []() {
+        const char* env = std::getenv("RTP_LLM_MULTI_STEP");
+        int         v   = env ? std::atoi(env) : 1;
+        if (v < 1 || v > 8) {
+            return 1;
+        }
+        return v;
+    }();
+    if (n <= 1) {
+        return 1;
+    }
+    if (useStreamAsync()) {
+        // Minimal arm: the N-token dispatch loop below is sync-only; stream
+        // async stays on single steps.
+        g_ms_gate_skip_async.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+    if (stream_groups.totalContextBatchSize() != 0 || stream_groups.totalDecodeBatchSize() == 0) {
+        g_ms_gate_skip_context.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+    const size_t block = cache_manager_ ? cache_manager_->cacheConfig().seq_size_per_block : 0;
+    for (const auto& stream : stream_groups.decodeStreams()) {
+        const auto*   cfg     = stream->generateInput() ? stream->generateInput()->generate_config.get() : nullptr;
+        const int64_t max_new = cfg ? cfg->max_new_tokens : 0;
+        // Greedy-only by design (R216: in-graph argmax head).
+        if (cfg == nullptr || cfg->temperature != 0.0f) {
+            g_ms_gate_skip_greedy.fetch_add(1, std::memory_order_relaxed);
+            return 1;
+        }
+        // Near-finish valve: no token past max_new (the carrier's min=max
+        // greedy form has no EOS surface, R205.2).
+        if (max_new > 0 && static_cast<int64_t>(stream->outputTokenLen()) + n > max_new) {
+            g_ms_gate_skip_near_finish.fetch_add(1, std::memory_order_relaxed);
+            return 1;
+        }
+        // KV-boundary valve: the in-graph paged slot advance is +1 within a
+        // block, so the whole window must fit in the current block.
+        if (block > 0) {
+            const int64_t seq = stream->seqLength();
+            if (seq > 0 && static_cast<size_t>(seq % block) + static_cast<size_t>(n) > block) {
+                g_ms_gate_skip_kv_boundary.fetch_add(1, std::memory_order_relaxed);
+                return 1;
+            }
+        }
+    }
+    return n;
 }
 
 absl::Status NormalExecutor::launchNextStepEarly(const StreamGroups& stream_groups) {

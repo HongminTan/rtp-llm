@@ -23,6 +23,11 @@ using namespace torch_ext;
 namespace rtp_llm {
 
 namespace {
+// Channel-B activation telemetry: multi-step replays and single-step
+// fallbacks when the executor requested n > 1 (throttled log in forward()).
+std::atomic<uint64_t> g_multistep_replays{0};
+std::atomic<uint64_t> g_multistep_fallback{0};
+
 int64_t expandedCaptureBlockTableWidth(const GroupBase& group, size_t physical) {
     const size_t expansion =
         group.policy.group_type == CacheGroupType::FULL ? std::max<size_t>(1, group.kernelBlocksPerKvBlock()) : 1;
@@ -335,10 +340,12 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
 
 void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputData");
-    const size_t graph_idx =
-        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
-    auto&     py_model_inputs = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
-    const int token_num       = is_prefill_cuda_graph_mode_ ? state.current_seq_len : inputs.input_ids.size(0);
+    // Channel-B: a pending multi-step request prepares the (bs, n) instance's
+    // buffers so the per-replay metadata rewrite targets the impl the replay
+    // will run.
+    const size_t graph_idx       = effectiveReplayKey(state);
+    auto&        py_model_inputs = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
+    const int    token_num       = is_prefill_cuda_graph_mode_ ? state.current_seq_len : inputs.input_ids.size(0);
 
     RTP_LLM_CHECK_WITH_INFO(token_num <= py_model_inputs.input_ids.numel(),
                             "input_ids exceed selected CUDA graph capacity: %d > %ld",
@@ -479,12 +486,13 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     } completion_guard{prepared_attention_inputs_,
                        isGenerationPrefillCudaGraph() ? &generation_prefill_prepare_event_ : nullptr};
 
-    const size_t graph_idx =
-        is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
-    auto&      py_model_inputs_ = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
-    auto       attn_pyobj       = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
-    const bool has_tagged_cache = !inputs.attention_inputs_by_tag.empty();
-    const int  selected_graph_batch_size =
+    // Channel-B: mirror the multi-step key selection so attention metadata
+    // prep also lands on the instance the replay will run.
+    const size_t graph_idx        = effectiveReplayKey(state);
+    auto&        py_model_inputs_ = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
+    auto         attn_pyobj       = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
+    const bool   has_tagged_cache = !inputs.attention_inputs_by_tag.empty();
+    const int    selected_graph_batch_size =
         is_prefill_cuda_graph_mode_ ? static_cast<int>(max_bs_) : state.current_real_graph_bs;
     const bool has_padded_rows = state.current_batch_size < selected_graph_batch_size;
 
@@ -1179,15 +1187,39 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
             outputs.mtp_target_hidden_states = mem_hold.mtp_target_hidden_states_.slice(0, 0, state.current_seq_len);
         }
     } else {
+        // Channel-B: honor a multi-step request when the (bs, n) instance was
+        // captured; otherwise replay the plain single-step graph (throttled
+        // fallback counter below).
+        const int  replay_key       = effectiveReplayKey(state);
+        const bool multistep_replay = replay_key != state.current_real_graph_bs;
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
-            replayDecode(state.current_real_graph_bs);
+            replayGraph(replay_key);
+        }
+        if (multistep_replay) {
+            state.multistep_tokens = graph_instances_[replay_key].mem_hold_.multistep_tokens_;
+            const uint64_t replays = g_multistep_replays.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (replays == 1 || replays % 100 == 0) {
+                RTP_LLM_LOG_INFO("[multi-step] replays=%lu (fallbacks=%lu)",
+                                 (unsigned long)replays,
+                                 (unsigned long)g_multistep_fallback.load(std::memory_order_relaxed));
+            }
+        } else {
+            if (state.multistep_n > 1) {
+                const uint64_t fell_back = g_multistep_fallback.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (fell_back == 1 || fell_back % 100 == 0) {
+                    RTP_LLM_LOG_INFO("[multi-step] replay fallback to single-step: key (bs=%d n=%d) not captured, "
+                                     "fell_back=%lu",
+                                     state.current_real_graph_bs,
+                                     state.multistep_n,
+                                     (unsigned long)fell_back);
+                }
+            }
+            state.multistep_tokens = torch::Tensor();
         }
         outputs.hidden_states =
-            graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
-                0, 0, state.seq_len_sum);
-        const auto& mtp_target_hidden_states =
-            graph_instances_[state.current_real_graph_bs].mem_hold_.mtp_target_hidden_states_;
+            graph_instances_[replay_key].mem_hold_.decoder_layer_hidden_states_.slice(0, 0, state.seq_len_sum);
+        const auto& mtp_target_hidden_states = graph_instances_[replay_key].mem_hold_.mtp_target_hidden_states_;
         if (mtp_target_hidden_states.defined()) {
             outputs.mtp_target_hidden_states = mtp_target_hidden_states.slice(0, 0, state.seq_len_sum);
         }
