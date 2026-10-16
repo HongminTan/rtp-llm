@@ -193,6 +193,14 @@ class PdEngineServer:
     def log_file_path(self) -> Optional[str]:
         return self._prefill.log_file_path if self._prefill else None
 
+    @staticmethod
+    def propagate_engine_env(remaining_args: List[str]) -> None:
+        # batch_decode_test.main() calls this on the server class before any
+        # instance exists; keep the single-server env propagation semantics.
+        from rtp_llm.test.perf_test.server import EngineServer
+
+        EngineServer.propagate_engine_env(remaining_args)
+
 
 def main() -> str:
     from rtp_llm.test.perf_test import batch_decode_test
