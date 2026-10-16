@@ -108,7 +108,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     cum_log_probs_ = torch::zeros({(int64_t)init_batch_size}, torch::kFloat32);
 
     is_context_stream_ = std::make_shared<std::atomic<bool>>(true);
-    generate_status_    = std::make_shared<GenerateStateMachine>(stream_cache_resource_);
+    generate_status_   = std::make_shared<GenerateStateMachine>(stream_cache_resource_);
     sub_generate_status_.reserve(maxBatchSize());
     sub_generate_status_.clear();
     resizeSubGenerateStatus(init_batch_size);
@@ -889,7 +889,19 @@ bool GenerateStream::needsAsyncBookkeepingJoinForKvReservation() const {
     // wait on an MTP-only cache snapshot.  MTP publishes the state before it
     // claims the async worker, making a non-zero epoch a stable mode marker.
     if (state.epoch == 0) {
-        return false;
+        // Normal decode with stream-async bookkeeping in flight: the worker
+        // thread owns the completion decision (finished_ / GenerateDone) and
+        // the deferred KV release, but the scheduler reads stream state in
+        // moveToNext with no happens-before edge in between.  During a batch
+        // shape switch that decoupling lets ranks diverge between finishing
+        // and admitting at the same step (one replays a fake-stream graph,
+        // the others the new-batch graph), mismatching the in-graph NCCL
+        // shapes (wedge family #66, R168).  Join here — before mutex_, per
+        // the established pattern above — so the scheduler observes the
+        // worker's completion writes before evaluating state transitions.
+        // Sync runs are unaffected: pending is always zero, the wait is
+        // unreachable (R214.3.1).
+        return true;
     }
     if (!hasMtpCacheSnapshot(state) || state.next_seq_len_upper_bound <= 0 || stream_cache_resource_ == nullptr) {
         return true;
