@@ -83,7 +83,7 @@ def _worker(rank: int, world_size: int, args) -> None:
 
     def inject_pre_graph_work() -> None:
         if sleep_cycles_per_ms > 0:
-            cycles = rank * args.pre_graph_work_ms * sleep_cycles_per_ms
+            cycles = int(rank * args.pre_graph_work_ms * sleep_cycles_per_ms)
             if cycles > 0:
                 torch.cuda._sleep(cycles)
 
