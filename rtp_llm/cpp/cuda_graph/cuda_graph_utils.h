@@ -70,9 +70,14 @@ public:
     }
 
 public:
-    py::object               attn_pyobj_{py::none()};
-    at::Tensor               decoder_layer_hidden_states_;
-    at::Tensor               mtp_target_hidden_states_;
+    py::object attn_pyobj_{py::none()};
+    at::Tensor decoder_layer_hidden_states_;
+    at::Tensor mtp_target_hidden_states_;
+    // Channel-B multi-step capture (R205.1/R216): [n, bs] greedy token ids
+    // produced by one multi-step graph body. The in-capture copy into this
+    // buffer is what each replay refreshes (same plumbing as the hidden
+    // states above). Undefined for single-step instances.
+    at::Tensor               multistep_tokens_;
     torch_ext::PyModelInputs py_model_inputs_;
 };
 

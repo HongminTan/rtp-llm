@@ -53,6 +53,7 @@ from rtp_llm.models_py.modules.dsv4.decode.forward import (
     build_paged_pool_specs,
     forward_decode,
 )
+from rtp_llm.models_py.modules.dsv4.decode.multistep import forward_decode_multistep
 from rtp_llm.models_py.modules.dsv4.kv_cache_utils import primary_attention_inputs
 from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
 from rtp_llm.models_py.modules.dsv4.transformer import V4Args, V4Transformer
@@ -1366,6 +1367,36 @@ class DeepSeekV4Model(GptModelBase):
             f"valid={self.v4._mtp_last_hidden_valid_tokens}"
         )
         return buf[:requested]
+
+    def forward_multistep(
+        self, inputs: PyModelInputs, fmha_impl: Any = None, n_steps: int = 4
+    ) -> torch.Tensor:
+        """Channel-B multi-step capture body (R205.1/R216): chain ``n_steps``
+        decode steps inside ONE CUDA-graph replay — per-step metadata shift
+        plus the greedy head run in-graph (see
+        :mod:`rtp_llm.models_py.modules.dsv4.decode.multistep`).
+
+        Called only by the graph runner's multi-step capture entry
+        (RTP_LLM_MULTI_STEP > 1). Greedy-only by design; KV-boundary and
+        near-finish eligibility are enforced executor-side before a
+        multi-step replay is selected.
+        """
+        if self.kv_cache is None:
+            raise RuntimeError(
+                "forward_multistep requires kv_cache (not available during warmup)"
+            )
+        if fmha_impl is None or not hasattr(fmha_impl, "metadata"):
+            raise RuntimeError(
+                "forward_multistep requires a decode fmha_impl with persistent metadata"
+            )
+        return forward_decode_multistep(
+            self.v4,
+            self.kv_cache,
+            self._v4_args,
+            inputs,
+            fmha_impl,
+            n_steps=n_steps,
+        )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         """qwen3-style dispatcher — per-arm orchestration lives in the

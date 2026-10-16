@@ -1990,6 +1990,62 @@ void CudaGraphRunner::replayGraph(int key) {
     }
 }
 
+// Capture one (bs, n) multi-step instance (channel B). Mirrors
+// captureOneGraphInstance's session discipline (warmup x2, dirty guard,
+// finish_capture_session owned by the captureDecode loop) but the body is
+// the python multi-step method and the output plumbing is the [n, bs] token
+// buffer (the in-capture copy into the hold buffer is the kernel each replay
+// refreshes).
+void CudaGraphRunner::captureDecodeMultistepOneBatchSize(int bs, int n) {
+    const int key = multistepGraphKey(bs, n);
+
+    auto inputs     = graph_instances_[key].mem_hold_.py_model_inputs_;
+    auto attn_pyobj = graph_instances_[key].mem_hold_.attn_pyobj_;
+
+    RTP_LLM_LOG_INFO("WarmUp for multi-step (bs %d n %d) start.", bs, n);
+    try {
+        ScopedEnvFlag cuda_graph_warmup("RTP_LLM_CUDA_GRAPH_WARMUP_FORWARD", "1");
+        py_multistep_method_(inputs, attn_pyobj, n);
+        py_multistep_method_(inputs, attn_pyobj, n);
+    } catch (const py::error_already_set& e) {
+        RTP_LLM_LOG_ERROR("WarmUp multi-step forward failed for bs %d n %d: %s", bs, n, e.what());
+        throw;
+    }
+    RTP_LLM_LOG_INFO("WarmUp for multi-step (bs %d n %d) successfully.", bs, n);
+
+    {
+        cuda_graph::graphDeviceSynchronize();
+        CudaGraphStreamLife stream_life(capture_stream_);
+        auto&               graph = graph_instances_[key].graph_;
+        RTP_LLM_LOG_INFO("Capture for multi-step (bs %d n %d) begin.", bs, n);
+        torch::Tensor tokens;
+        {
+            capture_session_may_be_dirty_.store(true, std::memory_order_release);
+            cuda_graph::graphCaptureBegin(graph, shared_graph_pool_);
+            cuda_graph::GraphNcclCaptureContext capture_ctx;
+            CudaGraphCaptureGuard               capture_guard(&capture_ctx);
+            try {
+                auto py_tokens_obj = py_multistep_method_(inputs, attn_pyobj, n);
+                tokens             = py_tokens_obj.cast<torch::Tensor>();
+            } catch (const py::error_already_set& e) {
+                RTP_LLM_LOG_ERROR("Capture multi-step forward failed for bs %d n %d: %s", bs, n, e.what());
+                throw;
+            }
+            RTP_LLM_CHECK_WITH_INFO(tokens.dim() == 2 && tokens.size(0) == n && tokens.size(1) == bs,
+                                    "multi-step body returned [%ld x %ld], expected [%d x %d]",
+                                    static_cast<long>(tokens.size(0)),
+                                    static_cast<long>(tokens.size(1)),
+                                    n,
+                                    bs);
+            // In-capture output plumbing (same contract as the hidden-states
+            // copy in captureOneGraphInstance below): the copy kernel is part
+            // of the graph, so every replay refreshes the hold buffer.
+            graph_instances_[key].mem_hold_.multistep_tokens_.copy_(tokens);
+            graph.capture_end();
+        }
+    }
+}
+
 void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
     auto inputs = graph_instances_[key].mem_hold_.py_model_inputs_;
 

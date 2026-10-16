@@ -116,8 +116,13 @@ public:
         }
         py_attn_pyobj_method_ = py_instance_.attr("prepare_fmha_impl");
         py_forward_method_    = py_instance_.attr(forward_method_name);
-        options_cuda_int32_   = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false);
-        options_cpu_int32_    = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).requires_grad(false);
+        // Multi-step body: resolved only for plain decode graphs on models
+        // that expose it; stays py::none() otherwise (capture gate).
+        if (!is_prefill_cuda_graph_mode_ && num_tokens_per_bs_ == 1 && py::hasattr(py_instance_, "forward_multistep")) {
+            py_multistep_method_ = py_instance_.attr("forward_multistep");
+        }
+        options_cuda_int32_ = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false);
+        options_cpu_int32_  = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).requires_grad(false);
         options_cuda_float_ = torch::TensorOptions().dtype(model_data_type_).device(torch::kCUDA).requires_grad(false);
         RTP_LLM_LOG_INFO("Initialize CudaGraphRunner with parameters below: \n \
             enable_cuda_graph_: %d, max_bs_: %d, enable_cuda_graph_debug_mode_: %d, max_seq_len_: %d, max_kernel_block_table_width_: %lld, \
@@ -157,6 +162,7 @@ public:
     void           captureDecode();
     void           capturePrefill();
     void           captureDecodeOneBatchSize(int bs);
+    void           captureDecodeMultistepOneBatchSize(int bs, int n);
     void           capturePrefillOneSeqLen(int seq_len);
     void           prepareInputs(const PyModelInputs& inputs, CudaGraphState& state);
     void           prepareInputData(const PyModelInputs& inputs, CudaGraphState& state);
@@ -173,6 +179,21 @@ public:
     int            getCurrentRealGraphSize(const CudaGraphState& state) const;
     PyModelOutputs forward(const PyModelInputs& inputs, CudaGraphState& state) override;
     void           initCapture() override;
+
+    // ---- Channel-B multi-step capture (R205.1/R216) ----
+    // N decode steps chained inside ONE graph body (python forward_multistep:
+    // per-step metadata shift + greedy head run in-graph). Env
+    // RTP_LLM_MULTI_STEP selects N (default 1 = off, range [1,8]); the model
+    // instance must expose "forward_multistep". Graph key encodes (bs, N):
+    // single-step keys stay plain bs, multi-step keys are bs*1000+N, so the
+    // per-bs single-step graph remains available for residual steps.
+    int        multiStepN() const;
+    static int multistepGraphKey(int bs, int n) {
+        return bs * 1000 + n;
+    }
+    // Replay the (bs, n) multi-step graph and return its [n, bs] token buffer
+    // (replay-stable storage; content refreshed by the captured copy kernel).
+    torch::Tensor replayDecodeMultistep(int bs, int n);
 
     bool captureSessionMayBeDirty() const override {
         return capture_session_may_be_dirty_.load(std::memory_order_acquire);
@@ -230,11 +251,13 @@ private:
                                   size_t&               copy_numel) const;
     bool
     canReplaySelectedGraph(const PyModelInputs& inputs, const CudaGraphState& state, CudaGraphCheckMode mode) const;
-    void                    initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs);
-    void                    initCaptureBertEmbeddingInputs(PyModelInputs& inputs, int max_bs, int max_num_token);
-    void                    initCaptureAttentionInputsPost();
-    py::object              py_forward_method_;
-    py::object              py_attn_pyobj_method_;
+    void       initCaptureAttentionInputs(PyModelInputs& inputs, int max_bs, int num_tokens_per_bs);
+    void       initCaptureBertEmbeddingInputs(PyModelInputs& inputs, int max_bs, int max_num_token);
+    void       initCaptureAttentionInputsPost();
+    py::object py_forward_method_;
+    py::object py_attn_pyobj_method_;
+    // Channel-B multi-step capture entry (python "forward_multistep" or none).
+    py::object              py_multistep_method_{py::none()};
     bool                    enable_cuda_graph_{false};
     bool                    is_prefill_cuda_graph_mode_{false};
     bool                    is_target_verify_{false};
