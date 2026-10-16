@@ -267,3 +267,17 @@ py_test(
     srcs = ["test_grouped_fp8_ep_padding.py"],
     deps = _DSV4_TEST_DEPS,
 )
+
+# cu129 local carrier for test_fused_rmsnorm_fp8_quant_f32: the dsv4_py_test
+# macro pins the cuda13/sm100 platform (target_compatible_with), so the cu129
+# lane cannot run it locally. This plain py_test carries the same src with the
+# same import closure (_DSV4_TEST_DEPS); test-only carrier per pitfall #52
+# (equivalence note: zero runtime-path delta, additive target only).
+py_test(
+    name = "test_fused_rmsnorm_fp8_quant_f32_cu129",
+    srcs = ["test_fused_rmsnorm_fp8_quant_f32.py"],
+    main = "test_fused_rmsnorm_fp8_quant_f32.py",
+    deps = _DSV4_TEST_DEPS + ["//rtp_llm:jit_cache_env"],
+    size = "large",
+    tags = ["cu129_local_carrier", "exclusive"],
+)
