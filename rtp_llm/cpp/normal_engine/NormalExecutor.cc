@@ -458,11 +458,22 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     //       the phase-3 release gating.
     //   (a) consume-side set match — the next process() discards the pending
     //       pair unless the live stream set is exactly the launched set.
-    if (useM1Lite() && is_decode_only && !zero_token_batch && !profile_step_start_) {
+    // NOTE: profile_step_start_ is wired permanently at construction (its
+    // callback no-ops when profiling is inactive), so it must NOT gate this
+    // block — the R201 diagnostic run proved the gate was permanently closed.
+    if (useM1Lite() && is_decode_only && !zero_token_batch) {
         publishNormalDeviceState(stream_groups, sampler_output);
         bool can_launch = gatherCanUseDeviceState(stream_groups);
         if (!can_launch) {
-            g_m1_gate_skip_device_state.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t skipped = g_m1_gate_skip_device_state.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (skipped == 1 || skipped % 100 == 0) {
+                RTP_LLM_LOG_INFO(
+                    "[normal-m1-lite] gate skip: device_state skipped=%lu launched=%lu near_finish=%lu kv_boundary=%lu",
+                    (unsigned long)skipped,
+                    (unsigned long)g_m1_lite_launched.load(std::memory_order_relaxed),
+                    (unsigned long)g_m1_gate_skip_near_finish.load(std::memory_order_relaxed),
+                    (unsigned long)g_m1_gate_skip_kv_boundary.load(std::memory_order_relaxed));
+            }
         }
         if (can_launch) {
             for (const auto& stream : stream_groups.decodeStreams()) {
@@ -472,6 +483,14 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                     can_launch = false;
                     g_m1_gate_skip_near_finish.fetch_add(1, std::memory_order_relaxed);
                     break;
+                }
+            }
+            if (!can_launch) {
+                const uint64_t skipped = g_m1_gate_skip_near_finish.load(std::memory_order_relaxed);
+                if (skipped == 1 || skipped % 100 == 0) {
+                    RTP_LLM_LOG_INFO("[normal-m1-lite] gate skip: near_finish skipped=%lu launched=%lu",
+                                     (unsigned long)skipped,
+                                     (unsigned long)g_m1_lite_launched.load(std::memory_order_relaxed));
                 }
             }
         }
