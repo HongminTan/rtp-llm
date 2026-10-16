@@ -132,18 +132,11 @@ def _worker(rank: int, world_size: int, args) -> None:
             flush=True,
         )
 
-    if rank == 0:
-        from torch.profiler import ProfilerActivity, profile
-
-        g = graphs["B"]
-        with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
-            for _ in range(16):
-                g.replay()
-            torch.cuda.synchronize()
-        trace_path = os.path.join(args.output_dir, "a2a_bench_rank0.json")
-        prof.export_chrome_trace(trace_path)
-        print("trace saved:", trace_path, flush=True)
-        _analyze_trace(trace_path)
+    # NOTE: the original rank-0-only profiled-replay phase was structurally
+    # deadlocked (rank0 launches a2a graphs alone while peers wait at the
+    # barrier -> collective mismatch spin, GPU 100%). Two same-position hangs
+    # (a2a-bench-04, a2a-skew-01) closed that design. Profiling, if ever
+    # needed again, must run as a fourth synchronized phase on all ranks.
     dist.barrier()
     dist.destroy_process_group()
 
