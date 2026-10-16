@@ -36,7 +36,7 @@ _PREFILL_ROLE_ARGS = (
     "--role_type PREFILL "
     "--enable_cuda_graph 0 "
     "--cp_rotate_method ALL_GATHER "
-    "--enable_remote_cache "
+    "--enable_remote_cache true "
     f"--world_size {len(_PREFILL_DEVICES)}"
 )
 _DECODE_ROLE_ARGS = (
@@ -44,7 +44,7 @@ _DECODE_ROLE_ARGS = (
     "--enable_cuda_graph 1 "
     "--decode_capture_config 1,2,4 "
     "--cp_rotate_method PREFILL_CP "
-    "--enable_remote_cache "
+    "--enable_remote_cache true "
     "--tp_size 1 "
     "--dp_size 4 "
     f"--world_size {len(_DECODE_DEVICES)}"
