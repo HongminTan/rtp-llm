@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 #include "absl/status/status.h"
@@ -61,6 +62,20 @@ private:
     absl::Status   processContextStreams(GptModelInputs&     model_input,
                                          const StreamGroups& stream_groups,
                                          TensorHolder&       host_holder) const;
+
+    // R172 ladder cut: reuse the pinned host buffer set when the model-input
+    // shape signature repeats (steady decode steps). Two slots per signature
+    // alternate so a rewritten slot is two steps away from its last async H2D
+    // enqueue — the copy sits at the head of the stream queue ahead of the
+    // previous graph replay, so it has long drained by then (same one-extra-
+    // round argument as the executor's buffer_holder_ window). gather() runs
+    // on the single engine-loop thread per rank; no locking.
+    struct BufferCacheEntry {
+        std::vector<int64_t>          signature;
+        std::array<GptModelInputs, 2> slots;
+    };
+    mutable std::vector<BufferCacheEntry> buffer_cache_;
+    mutable uint64_t                      buffer_cache_clock_ = 0;
 
     NormalModelInputGathererConfig config_;
 };

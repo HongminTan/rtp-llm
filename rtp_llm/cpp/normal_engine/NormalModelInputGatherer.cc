@@ -394,52 +394,102 @@ GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamG
                     stream_groups.contextStreams().end(),
                     [](const auto& stream) { return stream->generateInput()->custom_output_token_position >= 0; });
 
-    static const auto pinned_i32  = torch::TensorOptions(torch::kInt32).pinned_memory(true);
-    static const auto pinned_i64  = torch::TensorOptions(torch::kInt64).pinned_memory(true);
-    static const auto pinned_bool = torch::TensorOptions(torch::kBool).pinned_memory(true);
+    // R172 ladder cut: pinned host buffers are reused when the model-input
+    // shape signature repeats (steady decode steps), eliminating the per-step
+    // allocation ladder (torch::empty/zeros/full TensorImpl creation). Two
+    // slots per signature alternate; see NormalModelInputGatherer.h for the
+    // H2D-drain ordering argument. Only the sparse-filled zero tables and the
+    // per-call scalars/trace_ids are refreshed on a hit.
+    const std::vector<int64_t> buffer_signature = {
+        (int64_t)current_tokens_size,
+        (int64_t)total_batch_size,
+        (int64_t)total_decode_batch_size,
+        (int64_t)total_context_batch_size,
+        (int64_t)total_block_copy_num,
+        (int64_t)max_blocks_num,
+        (int64_t)kernel_width,
+        (int64_t)max_cache_keys_num,
+        (int64_t)multimodal_features_len,
+        (int64_t)has_multimodal_input,
+        (int64_t)need_cal_position_id,
+        (int64_t)needs_custom_output_indexes,
+    };
+    BufferCacheEntry* cache_entry = nullptr;
+    for (auto& candidate : buffer_cache_) {
+        if (candidate.signature == buffer_signature) {
+            cache_entry = &candidate;
+            break;
+        }
+    }
+    if (cache_entry == nullptr) {
+        if (buffer_cache_.size() >= 8) {
+            buffer_cache_.erase(buffer_cache_.begin());
+        }
+        buffer_cache_.push_back(BufferCacheEntry{buffer_signature, {}});
+        cache_entry = &buffer_cache_.back();
+    }
+    GptModelInputs& slot = cache_entry->slots[(buffer_cache_clock_++) & 1ULL];
+    GptModelInputs  model_input;
+    if (slot.combo_tokens.defined()) {
+        if (slot.kv_cache_kernel_block_id.defined()) {
+            slot.kv_cache_kernel_block_id.zero_();
+        }
+        if (slot.kv_cache_block_id.defined()) {
+            slot.kv_cache_block_id.zero_();
+        }
+        if (slot.cache_keys.defined()) {
+            slot.cache_keys.zero_();
+        }
+        slot.trace_ids.clear();
+        model_input = slot;
+    } else {
+        static const auto pinned_i32  = torch::TensorOptions(torch::kInt32).pinned_memory(true);
+        static const auto pinned_i64  = torch::TensorOptions(torch::kInt64).pinned_memory(true);
+        static const auto pinned_bool = torch::TensorOptions(torch::kBool).pinned_memory(true);
 
-    GptModelInputs model_input;
-    model_input.combo_tokens = torch::empty({(int64_t)current_tokens_size}, pinned_i32);
-    if (config_.has_engram) {
-        model_input.engram_token_windows = torch::full({(int64_t)current_tokens_size, 4}, -1, pinned_i32);
-    }
-    model_input.input_lengths    = torch::empty({(int64_t)total_batch_size}, pinned_i32);
-    model_input.sequence_lengths = torch::empty({(int64_t)total_decode_batch_size}, pinned_i32);
-    model_input.prefix_lengths   = torch::empty({(int64_t)total_context_batch_size}, pinned_i32);
-    if (needs_custom_output_indexes) {
-        model_input.custom_output_indexes = torch::empty({(int64_t)total_context_batch_size}, pinned_i64);
-    }
-    model_input.request_id            = torch::empty({(int64_t)total_context_batch_size}, pinned_i64);
-    model_input.request_pd_separation = torch::empty({(int64_t)total_context_batch_size}, pinned_bool);
+        model_input.combo_tokens = torch::empty({(int64_t)current_tokens_size}, pinned_i32);
+        if (config_.has_engram) {
+            model_input.engram_token_windows = torch::full({(int64_t)current_tokens_size, 4}, -1, pinned_i32);
+        }
+        model_input.input_lengths    = torch::empty({(int64_t)total_batch_size}, pinned_i32);
+        model_input.sequence_lengths = torch::empty({(int64_t)total_decode_batch_size}, pinned_i32);
+        model_input.prefix_lengths   = torch::empty({(int64_t)total_context_batch_size}, pinned_i32);
+        if (needs_custom_output_indexes) {
+            model_input.custom_output_indexes = torch::empty({(int64_t)total_context_batch_size}, pinned_i64);
+        }
+        model_input.request_id            = torch::empty({(int64_t)total_context_batch_size}, pinned_i64);
+        model_input.request_pd_separation = torch::empty({(int64_t)total_context_batch_size}, pinned_bool);
 
-    if (max_blocks_num || kernel_width) {
-        model_input.kv_cache_kernel_block_id = torch::zeros(
-            {(int64_t)config_.kv_cache_group_nums, (int64_t)total_batch_size, (int64_t)kernel_width}, pinned_i32);
-        model_input.kv_cache_block_id = torch::zeros(
-            {(int64_t)config_.kv_cache_group_nums, (int64_t)total_batch_size, (int64_t)max_blocks_num}, pinned_i32);
-    }
-    if (max_blocks_num || kernel_width || max_cache_keys_num) {
-        // CP-sharded group block tables can be narrower than the global cache-key
-        // namespace. Keep cache_keys independently sized so PD writer and reader
-        // derive identical keys from the complete token sequence.
-        model_input.cache_keys =
-            torch::zeros({(int64_t)total_context_batch_size, (int64_t)max_cache_keys_num}, pinned_i64);
-    }
-    if (config_.kv_cache_group_nums > 0) {
-        model_input.kv_cache_group_types = torch::empty({(int64_t)config_.kv_cache_group_nums}, pinned_i32);
-    }
-    if (total_block_copy_num > 0) {
-        model_input.kv_cache_update_mapping = torch::empty({(int64_t)total_block_copy_num, 3}, pinned_i32);
-    }
+        if (max_blocks_num || kernel_width) {
+            model_input.kv_cache_kernel_block_id = torch::zeros(
+                {(int64_t)config_.kv_cache_group_nums, (int64_t)total_batch_size, (int64_t)kernel_width}, pinned_i32);
+            model_input.kv_cache_block_id = torch::zeros(
+                {(int64_t)config_.kv_cache_group_nums, (int64_t)total_batch_size, (int64_t)max_blocks_num}, pinned_i32);
+        }
+        if (max_blocks_num || kernel_width || max_cache_keys_num) {
+            // CP-sharded group block tables can be narrower than the global cache-key
+            // namespace. Keep cache_keys independently sized so PD writer and reader
+            // derive identical keys from the complete token sequence.
+            model_input.cache_keys =
+                torch::zeros({(int64_t)total_context_batch_size, (int64_t)max_cache_keys_num}, pinned_i64);
+        }
+        if (config_.kv_cache_group_nums > 0) {
+            model_input.kv_cache_group_types = torch::empty({(int64_t)config_.kv_cache_group_nums}, pinned_i32);
+        }
+        if (total_block_copy_num > 0) {
+            model_input.kv_cache_update_mapping = torch::empty({(int64_t)total_block_copy_num, 3}, pinned_i32);
+        }
 
-    if (need_cal_position_id) {
-        model_input.combo_position_ids =
-            torch::empty({(int64_t)(current_tokens_size * config_.position_id_len_factor)}, pinned_i32);
-    }
-    if (has_multimodal_input) {
-        model_input.text_tokens_mask  = torch::empty({(int64_t)current_tokens_size}, pinned_i32);
-        model_input.mm_features_locs  = torch::empty({(int64_t)multimodal_features_len}, pinned_i32);
-        model_input.mm_features_spans = torch::empty({(int64_t)multimodal_features_len, 3}, pinned_i64);
+        if (need_cal_position_id) {
+            model_input.combo_position_ids =
+                torch::empty({(int64_t)(current_tokens_size * config_.position_id_len_factor)}, pinned_i32);
+        }
+        if (has_multimodal_input) {
+            model_input.text_tokens_mask  = torch::empty({(int64_t)current_tokens_size}, pinned_i32);
+            model_input.mm_features_locs  = torch::empty({(int64_t)multimodal_features_len}, pinned_i32);
+            model_input.mm_features_spans = torch::empty({(int64_t)multimodal_features_len, 3}, pinned_i64);
+        }
+        slot = model_input;
     }
 
     model_input.kv_block_stride_bytes     = config_.block_stride_bytes;
