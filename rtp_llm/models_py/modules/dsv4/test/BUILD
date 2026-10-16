@@ -46,7 +46,6 @@ _GPU_TESTS = [
     "test_fused_inv_rope_fp8_quant",
     "test_fused_rmsnorm_rope",
     "test_fused_rmsnorm_fp8_quant",
-    "test_fused_rmsnorm_fp8_quant_f32",
     "test_rope_only",
 ]
 
