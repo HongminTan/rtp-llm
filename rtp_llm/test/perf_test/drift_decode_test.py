@@ -72,6 +72,12 @@ def _semantic_check(port: int) -> bool:
     req = {
         "prompt": SEMANTIC_PROMPT,
         "top_k": 1,
+        # Explicit greedy (r117 #86 second instance): this request bypasses
+        # the shared worker, so the e68eac74e2 gen_config fix does not reach
+        # it — without temperature 0.0 the channel-B greedy gate stays closed
+        # for the spot-check and the semantic judgment runs on the
+        # single-step path (hollow guarantee).
+        "temperature": 0.0,
         "generate_config": {
             "max_new_tokens": SEMANTIC_MAX_TOKENS,
             "min_new_tokens": SEMANTIC_MAX_TOKENS,
