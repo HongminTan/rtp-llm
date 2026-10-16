@@ -99,6 +99,39 @@ def _worker(rank: int, world_size: int, args) -> None:
                 f"[{variant}] with 1ms host sleep: {gap_ms:.3f} ms/replay", flush=True
             )
 
+    # Skew phase (R189 diagnostic): per-rank pre-launch delay = rank * skew_ms.
+    # If the engine's first-collective window is absorbed inter-rank launch skew,
+    # the per-replay cadence should grow by ~ (world-1) * skew_ms (the last rank
+    # gates every replay), and rank 0's replay() call duration should approach
+    # the full skew spread (its graph stalls at the first a2a waiting for the
+    # late ranks). Measured without the profiler (the R187.3 CUPTI x tight a2a
+    # hang face).
+    if args.skew_ms > 0:
+        g = graphs["B"]
+        for _ in range(3):
+            time.sleep(rank * args.skew_ms / 1000.0)
+            g.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        launch_durs = []
+        t0 = time.time()
+        for i in range(args.replays):
+            time.sleep(rank * args.skew_ms / 1000.0)
+            t1 = time.time()
+            g.replay()
+            launch_durs.append((time.time() - t1) * 1000)
+            if i + 1 < args.replays:
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        dist.barrier()
+        total_ms = (time.time() - t0) / args.replays * 1000
+        durs = sorted(launch_durs)
+        print(
+            f"[skew {args.skew_ms}ms/step] rank{rank}: cadence={total_ms:.3f} ms/replay "
+            f"replay() dur med={durs[len(durs)//2]:.3f} min={durs[0]:.3f} max={durs[-1]:.3f}",
+            flush=True,
+        )
+
     if rank == 0:
         from torch.profiler import ProfilerActivity, profile
 
@@ -171,6 +204,7 @@ def main() -> None:
     ap.add_argument("--replays", type=int, default=32)
     ap.add_argument("--prefix-kernels", type=int, default=100)
     ap.add_argument("--msg-elems", type=int, default=1024)
+    ap.add_argument("--skew-ms", type=float, default=2.0)
     args = ap.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     world = min(4, torch.cuda.device_count())
