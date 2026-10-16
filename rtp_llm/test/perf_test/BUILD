@@ -1654,3 +1654,60 @@ py_test(
     tags = ["manual", "H20_CU13"],
     exec_properties = {"gpu": "H20_CU13"},
 )
+
+# #66 drift arm (R222, perf-log R222 design card): long free-flow phase-drift
+# decode load on the same engine form as the four-point carrier. Replaces the
+# fixed grid with a drifting generator (wave 1-4, gaps, idle windows, semantic
+# spot-checks). Async dual-flag env comes from the launch card (--test_env);
+# nothing here bakes it so the same target stays reusable for sync arms.
+py_test(
+    name = "v4_flash_dp4_decode_drift_sm90_h20_perf",
+    main = "drift_decode_test.py",
+    srcs = ["drift_decode_test.py"],
+    timeout = "eternal",
+    deps = [
+        "//rtp_llm:pyodps",
+        "//rtp_llm:testlib",
+        "//rtp_llm/test/perf_test:perf_test_lib",
+    ],
+    data = ["//rtp_llm:sdk"],
+    args = [
+        "--model_type", "deepseek_v4",
+        "--checkpoint_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--tokenizer_path", "/home/admin/models/DeepSeek-V4-Flash",
+        "--batch_size", "4",
+        "--input_len", "512,4096",
+        "--partial", "1",
+        "--decode_test_length", "30",
+        "--drift_duration", "1200",
+        "--drift_seed", "20261017",
+        "--num_measures", "1",
+        "--seq_size_per_block", "256",
+        "--max_seq_len", "8192",
+        "--tp_size", "1",
+        "--dp_size", "4",
+        "--ep_size", "4",
+        "--world_size", "4",
+        "--act_type", "BF16",
+        "--fp8_kv_cache", "1",
+        "--load_method", "fastsafetensors",
+        "--moe_strategy", "grouped_fp4_sm90_ep",
+        "--enable_cuda_graph", "1",
+        "--max_context_batch_size", "128",
+        "--reserver_runtime_mem_mb", "16384",
+        "--dsv4_fixed_pool_blocks", "512",
+    ],
+    env = {
+        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.6",
+        "DSV4_MASKED_WS_REUSE": "1",
+        "DSV4_WOA_GROUPED_GEMM": "1",
+        "DSV4_MHC_PRE_GEMM_BACKEND": "tilelang_splitk",
+        "WORLD_SIZE": "4",
+        "DSV4_TRAP_INVALID_KV_ACCESS": "0",
+        "FASTSAFETENSORS_NOGDS": "1",
+        "CC": "/usr/bin/gcc",
+        "CXX": "/usr/bin/g++",
+    },
+    size = "large",
+    tags = ["cu129_local_carrier", "exclusive"],
+)
