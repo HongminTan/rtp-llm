@@ -64,6 +64,17 @@ protected:
     // covers sampled token and seq_len for batch-1 decode.
     bool useDropBroadSync() const;
 
+    // M1-lite launch-early (R192 M1, bs1-decode staging): publish the
+    // device-side state from this step's sampler output and launch the next
+    // graph replay BEFORE this step's dispatch host tail. Launch timing moves
+    // from "each rank's host-chain end" to the sampler completion point (the
+    // graphs' lockstep window), absorbing the inter-rank launch skew the
+    // first in-graph collective otherwise pays (R190.1). Requires
+    // RTP_LLM_DEVICE_INPUT=1 (the existing batch-1 device-state gather path);
+    // RTP_LLM_M1_LITE gates the reorder itself and defaults to off.
+    bool         useM1Lite() const;
+    absl::Status launchNextStepEarly(const StreamGroups& stream_groups);
+
     // Stream-async dispatch. Records sampler_event on the main stream after
     // sampler_->forward, then forks the bookkeeping worker to wait on the
     // event and run dispatch + per-stream update off the main thread.
@@ -120,6 +131,13 @@ private:
     // Keeps async copy source tensors alive across release points. NormalExecutor
     // uses this for model-input H2D staging and sampler-input staging.
     TensorHolder buffer_holder_;
+
+    // M1-lite pre-launch state: set when the previous process() launched this
+    // step's forward before its dispatch tail. The next process() consumes the
+    // pending input/output and skips its own gather/sync/forward.
+    bool            m1_pre_launched_ = false;
+    GptModelInputs  m1_pending_input_;
+    GptModelOutputs m1_pending_output_;
 };
 
 }  // namespace rtp_llm

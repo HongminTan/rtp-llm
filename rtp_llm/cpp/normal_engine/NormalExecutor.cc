@@ -24,7 +24,6 @@ namespace rtp_llm {
 
 namespace {
 
-
 bool readEnvFlagOnce(const char* env_name, const char* log_tag, const char* label) {
     const char* env = std::getenv(env_name);
     const bool  on  = (env != nullptr && std::string(env) == "1");
@@ -152,7 +151,7 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
         role_type_,
         warm_up_,
         params.model_config_.hidden_state_capture_layer_ids);
-    model_init_params.hidden_state_capture_dtype     = params.model_config_.hidden_state_capture_dtype;
+    model_init_params.hidden_state_capture_dtype = params.model_config_.hidden_state_capture_dtype;
 #if USING_CUDA || USING_ROCM
     if (params.hw_kernel_config.enable_cuda_graph && model_init_params.kv_cache_layer_layout.has_value()) {
         const auto& model_cache_config =
@@ -258,75 +257,92 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         prepareGrpcNormalDeviceState(stream_groups);
     }
 
-    {
-        RTP_LLM_PROFILE_SCOPE("executor.gather_model_input");
-        int64_t start_time_us      = autil::TimeUtility::currentTimeInMicroSeconds();
-        auto    model_input_status = batch_stream_processor_->gatherModelInput(stream_groups, buffer_holder_);
-        RETURN_IF_STATUS_OR_ERROR(model_input_status);
-        model_input                              = std::move(model_input_status.value());
-        executor_collector.gather_model_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
-    }
-    {
-        RTP_LLM_PROFILE_SCOPE("executor.tp_sync_input");
-        int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
+    if (m1_pre_launched_) {
+        // M1-lite: the previous process() already gathered, synced, and
+        // launched this step's forward (launchNextStepEarly) before its
+        // dispatch tail. Consume the pending pair and skip straight to the
+        // sampler. (The launch site skips profiling-active steps, so at most
+        // a transition-edge step runs a degenerate profiler window here.)
+        RTP_LLM_PROFILE_SCOPE("executor.m1_lite.consume_pre_launched");
+        model_input      = std::move(m1_pending_input_);
+        model_output     = std::move(m1_pending_output_);
+        m1_pre_launched_ = false;
+        if (profile_step_start_) {
+            profile_step_start_();
+        }
+        buffer_holder_.release();
+    } else {
+        {
+            RTP_LLM_PROFILE_SCOPE("executor.gather_model_input");
+            int64_t start_time_us      = autil::TimeUtility::currentTimeInMicroSeconds();
+            auto    model_input_status = batch_stream_processor_->gatherModelInput(stream_groups, buffer_holder_);
+            RETURN_IF_STATUS_OR_ERROR(model_input_status);
+            model_input                              = std::move(model_input_status.value());
+            executor_collector.gather_model_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        }
+        {
+            RTP_LLM_PROFILE_SCOPE("executor.tp_sync_input");
+            int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+            model_input.skip_run  = streams.empty() && !enable_ffn_disaggregate_;
 
-        // Move metadata to CUDA before tpSyncModelInputs so broadcasts use the
-        // GPU packed-buffer path instead of CPU execBroadcastCpu/unpack loops.
-        ensureModelInputsOnCuda(model_input, "process.before_tp_sync");
+            // Move metadata to CUDA before tpSyncModelInputs so broadcasts use the
+            // GPU packed-buffer path instead of CPU execBroadcastCpu/unpack loops.
+            ensureModelInputsOnCuda(model_input, "process.before_tp_sync");
 
-        tpSyncModelInputs(model_input, parallelism_config_);
-        if (model_input.skip_run) {
-            return absl::OkStatus();
+            tpSyncModelInputs(model_input, parallelism_config_);
+            if (model_input.skip_run) {
+                return absl::OkStatus();
+            }
+
+            // Post-sync guard for fields not covered by the root device bitmap
+            // (notably sequence_lengths_plus_1) before model_->forward.
+            ensureModelInputsOnCuda(model_input, "process.after_tp_sync");
+
+            executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         }
 
-        // Post-sync guard for fields not covered by the root device bitmap
-        // (notably sequence_lengths_plus_1) before model_->forward.
-        ensureModelInputsOnCuda(model_input, "process.after_tp_sync");
-
-        executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
-    }
-
-    if (profile_step_start_) {
-        profile_step_start_();
-    }
-
-    // make sure last model input is released before forward
-    // TensorHolder release point (NormalExecutor): after current TP sync has
-    // consumed model-input H2D staging, advance the one-extra-round hold window
-    // for model-input sources and previous sampler-input host tensors.
-    buffer_holder_.release();
-    // PyWrappedModel TensorHolder release point for the previous model forward.
-    model_->releaseBuffers();
-
-    {
-        // update kv cache
-        if (model_input.kv_cache_update_mapping.defined() && model_input.kv_cache_update_mapping.numel() > 0) {
-            RTP_LLM_PROFILE_SCOPE("executor.kv_cache_update");
-            RTP_LLM_CHECK_WITH_INFO(static_cast<bool>(cache_manager_), "cache update mapping requires a cache manager");
-            cache_manager_->blockBatchCopyForForward(model_input.kv_cache_update_mapping,
-                                                     model_input.kv_cache_group_tags);
+        if (profile_step_start_) {
+            profile_step_start_();
         }
-    }
-    {
-        bool force = tp_rank_ == 0 && enable_detail_log_;
-        if (force) {
-            RTP_LLM_LOG_INFO("model_input: %s", model_input.debugString(force).c_str());
-        } else {
-            RTP_LLM_LOG_TRACE("model_input: %s", model_input.debugString(force).c_str());
+
+        // make sure last model input is released before forward
+        // TensorHolder release point (NormalExecutor): after current TP sync has
+        // consumed model-input H2D staging, advance the one-extra-round hold window
+        // for model-input sources and previous sampler-input host tensors.
+        buffer_holder_.release();
+        // PyWrappedModel TensorHolder release point for the previous model forward.
+        model_->releaseBuffers();
+
+        {
+            // update kv cache
+            if (model_input.kv_cache_update_mapping.defined() && model_input.kv_cache_update_mapping.numel() > 0) {
+                RTP_LLM_PROFILE_SCOPE("executor.kv_cache_update");
+                RTP_LLM_CHECK_WITH_INFO(static_cast<bool>(cache_manager_),
+                                        "cache update mapping requires a cache manager");
+                cache_manager_->blockBatchCopyForForward(model_input.kv_cache_update_mapping,
+                                                         model_input.kv_cache_group_tags);
+            }
         }
-        RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.model_forward(ctx_batch=%zu,gen_batch=%zu,tokens=%zu,max_seq=%zu)",
-                                      stream_groups.totalContextBatchSize(),
-                                      stream_groups.totalDecodeBatchSize(),
-                                      stream_groups.modelExecuteTokenSize(),
-                                      stream_groups.maxSeqLen());
-        int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        if (model_inputs_logger_) {
-            const auto role = is_propose_ ? ModelInputsModelRole::DRAFT : ModelInputsModelRole::NORMAL;
-            model_inputs_logger_->log(model_input, role, model_->model_id_);
+        {
+            bool force = tp_rank_ == 0 && enable_detail_log_;
+            if (force) {
+                RTP_LLM_LOG_INFO("model_input: %s", model_input.debugString(force).c_str());
+            } else {
+                RTP_LLM_LOG_TRACE("model_input: %s", model_input.debugString(force).c_str());
+            }
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.model_forward(ctx_batch=%zu,gen_batch=%zu,tokens=%zu,max_seq=%zu)",
+                                          stream_groups.totalContextBatchSize(),
+                                          stream_groups.totalDecodeBatchSize(),
+                                          stream_groups.modelExecuteTokenSize(),
+                                          stream_groups.maxSeqLen());
+            int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+            if (model_inputs_logger_) {
+                const auto role = is_propose_ ? ModelInputsModelRole::DRAFT : ModelInputsModelRole::NORMAL;
+                model_inputs_logger_->log(model_input, role, model_->model_id_);
+            }
+            model_output                        = std::move(model_->forward(model_input));
+            executor_collector.model_forward_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         }
-        model_output                        = std::move(model_->forward(model_input));
-        executor_collector.model_forward_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
     if (expert_balancer_) {
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
@@ -386,6 +402,48 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
     // the next iteration can overlap forward prep with worker D2H/update work.
     // Prefill gets no overlap benefit and would only add worker startup cost.
     const bool is_decode_only = stream_groups.totalContextBatchSize() == 0 && stream_groups.totalDecodeBatchSize() > 0;
+
+    // M1-lite launch-early (R192 M1, bs1-decode staging; RTP_LLM_M1_LITE
+    // default off): with the sampler's GPU work enqueued, publish the
+    // device-side state from this step's sampler output and launch the next
+    // step's forward BEFORE this step's dispatch host tail. Launch timing
+    // moves from "each rank's host-chain end" to the sampler completion
+    // point — the graphs' lockstep window — absorbing the inter-rank launch
+    // skew the first in-graph collective otherwise pays (R190.1). The
+    // dispatch's later D2H blocks on the launched graph's completion, which
+    // is harmless: nothing host-side gates until the next sampler's
+    // stream-state updates land in this dispatch.
+    if (useM1Lite() && is_decode_only && !zero_token_batch && !profile_step_start_) {
+        publishNormalDeviceState(stream_groups, sampler_output);
+        bool can_launch = gatherCanUseDeviceState(stream_groups);
+        if (can_launch && cache_manager_ != nullptr) {
+            // KV-boundary conservative valve (R192 safety): the next gather
+            // runs before this step's dispatch writes the stream state, so
+            // its kv-table copy would read the pre-allocation vector. Skip
+            // the pre-launch around block boundaries (the ordinary path
+            // handles them); the cost is ~2 steps per block period.
+            const size_t block = cache_manager_->cacheConfig().seq_size_per_block;
+            if (block > 0) {
+                for (const auto& stream : stream_groups.decodeStreams()) {
+                    const int next_seq = stream->getNormalAsyncDeviceState().next_real_seq_len;
+                    if (next_seq > 0 && static_cast<size_t>(next_seq) % block <= 1) {
+                        can_launch = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (can_launch) {
+            auto launch_status = launchNextStepEarly(stream_groups);
+            if (launch_status.ok()) {
+                m1_pre_launched_ = true;
+            } else {
+                // Conservative fallback: the ordinary next-step path runs.
+                RTP_LLM_LOG_WARNING("[normal-m1-lite] early launch fell back: %s", launch_status.ToString().c_str());
+            }
+        }
+    }
+
     StreamGroups::TokenCountsByPriority token_counts_by_priority;
     if (metrics_reporter_ && tp_rank_ == 0) {
         token_counts_by_priority = stream_groups.tokenCountsByPriority();
@@ -442,6 +500,42 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         }
         return result;
     }
+}
+
+bool NormalExecutor::useM1Lite() const {
+    static const bool enabled = []() { return readEnvFlagOnce("RTP_LLM_M1_LITE", "normal-m1-lite", "useM1Lite"); }();
+    // The device-state gather path is a hard prerequisite: without it the
+    // next-step gather would need the D2H'd stream state, which the reorder
+    // has deliberately not waited for.
+    return enabled && useDeviceInput();
+}
+
+absl::Status NormalExecutor::launchNextStepEarly(const StreamGroups& stream_groups) {
+    // Same-composition pre-commit (R192 M1): the next step runs these exact
+    // streams. Composition changes surface at the next schedule() and take
+    // effect one step later via the m1 gate re-evaluation — the fallback is
+    // the ordinary path, never a mixed batch.
+    RTP_LLM_PROFILE_SCOPE("executor.m1_lite.launch_next_step_early");
+    auto gather_status = batch_stream_processor_->gatherModelInput(stream_groups, buffer_holder_);
+    RETURN_IF_STATUS_OR_ERROR(gather_status);
+    GptModelInputs next_input = std::move(gather_status.value());
+    next_input.skip_run       = false;
+
+    // Move metadata to CUDA before the replay so broadcasts use the GPU path.
+    ensureModelInputsOnCuda(next_input, "process.m1_lite_next");
+    tpSyncModelInputs(next_input, parallelism_config_);
+
+    // KV update must precede the forward, mirroring the ordinary path.
+    if (next_input.kv_cache_update_mapping.defined() && next_input.kv_cache_update_mapping.numel() > 0) {
+        RTP_LLM_PROFILE_SCOPE("executor.m1_lite.kv_cache_update");
+        RTP_LLM_CHECK_WITH_INFO(static_cast<bool>(cache_manager_), "cache update mapping requires a cache manager");
+        cache_manager_->blockBatchCopyForForward(next_input.kv_cache_update_mapping, next_input.kv_cache_group_tags);
+    }
+
+    model_->releaseBuffers();
+    m1_pending_output_ = std::move(model_->forward(next_input));
+    m1_pending_input_  = std::move(next_input);
+    return absl::OkStatus();
 }
 
 void NormalExecutor::reportMetrics(const StreamGroups&                        stream_groups,
