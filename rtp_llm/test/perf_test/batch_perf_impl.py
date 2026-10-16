@@ -22,9 +22,7 @@ def _effective_profile_steps(is_decode: bool, decode_test_length: int) -> int:
     return min(decode_test_length, profile_steps) if is_decode else 1
 
 
-def _wait_for_trace_flush(
-    log_path: str, offset: int, budget_s: int
-) -> int:
+def _wait_for_trace_flush(log_path: str, offset: int, budget_s: int) -> int:
     """Wait for the engine's async trace save to complete.
 
     The save worker exports each profiled window on a background thread
@@ -55,9 +53,7 @@ def _wait_for_trace_flush(
         except OSError:
             pass
         time.sleep(0.25)
-    logging.warning(
-        "[PERF_PROFILE_FLUSH] timed out after %ss; continuing", budget_s
-    )
+    logging.warning("[PERF_PROFILE_FLUSH] timed out after %ss; continuing", budget_s)
     return offset
 
 
@@ -75,6 +71,12 @@ def _curl_server_single_worker(
     gen_config: Dict[str, Any] = {
         "max_new_tokens": decode_test_length if is_decode else 1,
         "min_new_tokens": decode_test_length if is_decode else 1,
+        # Explicit greedy: the channel-B multi-step valve requires
+        # temperature == 0 (the in-graph head is argmax). Without this the
+        # server default (1.0) keeps the valve permanently closed — pitfall
+        # #86 (replays=0, msb-drift-semantic-01). All perf/drift arms set it
+        # so arm-vs-baseline pairing stays internally consistent.
+        "temperature": 0.0,
         "force_sp_accept": True,
     }
     req: Dict[str, Any] = {
