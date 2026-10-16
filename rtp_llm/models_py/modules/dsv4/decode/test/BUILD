@@ -12,6 +12,18 @@ py_test(
 )
 
 py_test(
+    name = "test_multistep",
+    srcs = ["test_multistep.py"],
+    deps = [
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm/models_py:dsv4_decode_cpu",
+    ],
+    tags = [
+        "open_skip",
+    ],
+)
+
+py_test(
     name = "indexer_decode_test",
     srcs = ["indexer_decode_test.py"],
     deps = py_test_deps,

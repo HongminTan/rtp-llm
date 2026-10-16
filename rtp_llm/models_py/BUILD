@@ -24,6 +24,7 @@ py_library(
         "modules/dsv4/decode/__init__.py",
         "modules/dsv4/decode/decode_attn_metadata.py",
         "modules/dsv4/decode/kv_write_decode_op.py",
+        "modules/dsv4/decode/multistep.py",
         "modules/dsv4/fp8/__init__.py",
         "modules/dsv4/fp8/decode/__init__.py",
         "modules/dsv4/fp8/decode/pool_slot_mapping.py",
