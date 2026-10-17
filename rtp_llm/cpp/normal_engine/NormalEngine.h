@@ -91,7 +91,9 @@ private:
     // graph shape. Steady-state cost: one 1-element all-reduce + the
     // completion wait (~tens of us); the fill only runs when the local
     // batch size changes.
-    int64_t shapeConsensusAnchor(int64_t local_bs);
+    // Returns (consensus_phase << 32) | consensus_bs (R251: phase = 1 when
+    // any rank's batch contains a context/prefill stream this step).
+    int64_t shapeConsensusAnchor(int64_t local_bs, bool local_has_prefill);
     void    padToConsensusBatch(std::list<GenerateStreamPtr>& streams, int64_t consensus_bs);
 
     void initExecutor(const EngineInitParams& params, std::unique_ptr<ProposeModelEngineInitParams>& propose_params);
@@ -131,9 +133,11 @@ private:
     // (lazy CUDA int64) + the last locally-published bs (fills are rare —
     // only on batch-composition changes) + telemetry counters.
     torch::Tensor         shape_consensus_buf_;
-    int64_t               shape_consensus_last_bs_ = -1;
+    int64_t               shape_consensus_last_bs_    = -1;
+    int64_t               shape_consensus_last_phase_ = -1;
     std::atomic<uint64_t> shape_consensus_calls_{0};
     std::atomic<uint64_t> shape_consensus_pads_{0};
+    std::atomic<uint64_t> shape_consensus_phase_pads_{0};
 };
 
 }  // namespace rtp_llm

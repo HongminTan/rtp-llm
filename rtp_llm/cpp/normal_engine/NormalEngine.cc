@@ -904,11 +904,39 @@ absl::Status NormalEngine::step() try {
         // Runs on EVERY window iteration of every step — including steady
         // steps and fake-stream-only steps — so the trigger itself is
         // identical on all ranks (r122 hard revision). The window start
-        // additionally unifies the batch shape before the first forward.
+        // additionally unifies the batch shape and the PHASE before the
+        // first forward (#66 v2, R251): when any rank is prefilling this
+        // step, every pure-decode rank injects a 1-token fake context stream
+        // so its batch routes through the prefill path — the DeepEP eager
+        // dispatch collective family then matches across ranks (the H-A'/H-C
+        // wedge: ranks diverging between prefill-phase and decode-phase
+        // collective sets at partial-wave admission windows).
         {
-            const int64_t consensus_bs = shapeConsensusAnchor(static_cast<int64_t>(streams.size()));
+            bool local_has_prefill = false;
+            for (const auto& stream : streams) {
+                if (stream->isContextStream()) {
+                    local_has_prefill = true;
+                    break;
+                }
+            }
+            const int64_t consensus    = shapeConsensusAnchor(static_cast<int64_t>(streams.size()), local_has_prefill);
+            const int64_t consensus_bs = consensus & 0xFFFFFFFF;
+            const int64_t consensus_phase = consensus >> 32;
             if (step_in_window == 0) {
                 padToConsensusBatch(streams, consensus_bs);
+                if (consensus_phase > 0 && !local_has_prefill) {
+                    // Phase alignment (R251.1): a fresh fake stream's first
+                    // step is a 1-token prefill, so adding it routes this
+                    // batch through the prefill executor path this step.
+                    // The stream finishes (max_new_tokens=1) and leaves the
+                    // batch at the next schedule; steady decode-only steps
+                    // (consensus phase == 0) take this branch never.
+                    streams.emplace_back(createMinFakeStream(1));
+                    shape_consensus_phase_pads_.fetch_add(1, std::memory_order_relaxed);
+                    RTP_LLM_LOG_INFO("[shape-consensus] phase pad: local decode-only batch joined prefill phase "
+                                     "(consensus bs=%ld)",
+                                     (long)consensus_bs);
+                }
             }
         }
         if (step_in_window > 0) {
@@ -1007,22 +1035,28 @@ bool NormalEngine::shouldAddMtpFakePrefill(bool has_prefill, bool use_batch_deco
     return !has_prefill && (!use_batch_decode_scheduler || dp_size > 1);
 }
 
-int64_t NormalEngine::shapeConsensusAnchor(int64_t local_bs) {
+int64_t NormalEngine::shapeConsensusAnchor(int64_t local_bs, bool local_has_prefill) {
     if (parallelism_config.dp_size <= 1) {
         return local_bs;
     }
     // Lazy buffer on this rank's CUDA device; the engine loop thread is the
     // same thread the executor runs torch on, so the device context is set.
+    // Element 0 = local batch size, element 1 = phase (1 when this rank's
+    // batch contains a context/prefill stream). Max over both propagates the
+    // largest batch and the presence of ANY rank's prefill (#66 v2, R251).
     if (!shape_consensus_buf_.defined()) {
         shape_consensus_buf_ =
-            torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA).requires_grad(false));
+            torch::zeros({2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA).requires_grad(false));
     }
-    // Rare fill (batch-composition change only): a device sync bounds the
-    // cross-stream ordering between this fill and the PG-side collective.
-    if (local_bs != shape_consensus_last_bs_) {
-        shape_consensus_buf_.fill_(local_bs);
+    // Rare fill (batch-composition or phase change only): a device sync bounds
+    // the cross-stream ordering between this fill and the PG-side collective.
+    const int64_t local_phase = local_has_prefill ? 1 : 0;
+    if (local_bs != shape_consensus_last_bs_ || local_phase != shape_consensus_last_phase_) {
+        shape_consensus_buf_[0].fill_(local_bs);
+        shape_consensus_buf_[1].fill_(local_phase);
         torch::cuda::synchronize();
-        shape_consensus_last_bs_ = local_bs;
+        shape_consensus_last_bs_    = local_bs;
+        shape_consensus_last_phase_ = local_phase;
     }
     execAllReduce({shape_consensus_buf_, ReduceOp::Max, false, ParallelMode::DP});
     // The completion wait IS the anchor: blocking here means every rank's
@@ -1031,16 +1065,21 @@ int64_t NormalEngine::shapeConsensusAnchor(int64_t local_bs) {
     // outstanding collectives on the host; the subsequent item() read is then
     // coherent with the completed write.
     execSyncCommunication(ParallelMode::DP, /*timeout=*/false);
-    const int64_t  consensus = shape_consensus_buf_.item<int64_t>();
-    const uint64_t calls     = shape_consensus_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t  consensus_bs    = shape_consensus_buf_[0].item<int64_t>();
+    const int64_t  consensus_phase = shape_consensus_buf_[1].item<int64_t>();
+    const uint64_t calls           = shape_consensus_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (calls == 1 || calls % 1000 == 0) {
-        RTP_LLM_LOG_INFO("[shape-consensus] calls=%lu pads=%lu last_local_bs=%ld consensus=%ld",
+        RTP_LLM_LOG_INFO("[shape-consensus] calls=%lu pads=%lu phase_pads=%lu last_local=(bs=%ld,phase=%ld) "
+                         "consensus=(bs=%ld,phase=%ld)",
                          (unsigned long)calls,
                          (unsigned long)shape_consensus_pads_.load(std::memory_order_relaxed),
+                         (unsigned long)shape_consensus_phase_pads_.load(std::memory_order_relaxed),
                          (long)local_bs,
-                         (long)consensus);
+                         (long)local_phase,
+                         (long)consensus_bs,
+                         (long)consensus_phase);
     }
-    return consensus;
+    return (consensus_phase << 32) | (consensus_bs & 0xFFFFFFFF);
 }
 
 void NormalEngine::padToConsensusBatch(std::list<GenerateStreamPtr>& streams, int64_t consensus_bs) {
