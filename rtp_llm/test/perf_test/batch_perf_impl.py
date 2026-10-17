@@ -130,6 +130,12 @@ def _curl_server_batch_worker(
     generate_config: Optional[Dict[str, Any]] = None,
     profile_trace_name: str = "",
 ) -> List[ResponseInfo]:
+    # PERF_PROFILE_DISABLE=1 (R253 diagnostic variant): drop the timeline
+    # request so the StepWindowProfiler (Kineto/CUPTI) never opens a window —
+    # the N=8 ladder crashed deterministically inside the second profiled
+    # window, and this gate isolates the profiler from the multi-step graphs.
+    if profile and os.environ.get("PERF_PROFILE_DISABLE", "") == "1":
+        profile = False
     """Concurrently send requests, each with its own query string."""
     with ThreadPoolExecutor(max_workers=len(request_indices)) as executor:
         futures = []
@@ -192,6 +198,10 @@ class BatchPerfImpl(object):
         self.wait_time = wait_time
         self.decode_test_length = decode_test_length
         self.profile = profile
+        # PERF_PROFILE_DISABLE=1 (R253): also disarm the pre-arm path so no
+        # /start_profile request goes out — complements the worker-level gate.
+        if self.profile and os.environ.get("PERF_PROFILE_DISABLE", "") == "1":
+            self.profile = False
         # Byte offset into the server log past the last "profiler trace
         # saved" line; the caller threads it across instances so
         # consecutive search steps only scan new log content.
