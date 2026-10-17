@@ -88,11 +88,13 @@ private:
     // re-create the same divergence on the consensus collective.
     // Returns the consensus (max) batch size; ranks below it pad with
     // fake streams at the window start so every rank replays the same
-    // graph shape. Steady-state cost: one 1-element all-reduce + the
+    // graph shape. Steady-state cost: one 3-element all-reduce + the
     // completion wait (~tens of us); the fill only runs when the local
-    // batch size changes.
-    // Returns (consensus_phase << 32) | consensus_bs (R251: phase = 1 when
-    // any rank's batch contains a context/prefill stream this step).
+    // batch composition (bs / phase / has-real) changes.
+    // Returns (consensus_has_real << 41) | (consensus_phase << 40) |
+    // consensus_bs (R251: phase = 1 when any rank's batch contains a
+    // context/prefill stream this step; R287/v3.1: has_real = 1 when any
+    // rank's batch holds a non-fake stream — the global-idle skip premise).
     int64_t shapeConsensusAnchor(int64_t local_bs, bool local_has_prefill, bool local_has_real);
     void    padToConsensusBatch(std::list<GenerateStreamPtr>& streams, int64_t consensus_bs);
 
@@ -129,9 +131,11 @@ private:
     // re-runs on the next full schedule (the batch shape never changes
     // mid-window, so the graph replay stays stable).
     int multi_step_max_ = 0;
-    // shapeConsensusAnchor state (#66 fix): 1-element Max-all-reduce buffer
-    // (lazy CUDA int64) + the last locally-published bs (fills are rare —
-    // only on batch-composition changes) + telemetry counters.
+    // shapeConsensusAnchor state (#66 fix): 3-element Max-all-reduce buffer
+    // [bs, phase, has-real] (lazy CUDA int64) + the last locally-published
+    // values (fills are rare — only on composition changes) + telemetry
+    // counters (v3.1.1: skips counter doubles as the skip-branch activation
+    // fingerprint).
     torch::Tensor         shape_consensus_buf_;
     int64_t               shape_consensus_last_bs_       = -1;
     int64_t               shape_consensus_last_phase_    = -1;

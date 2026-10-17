@@ -6,6 +6,7 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
+#include "rtp_llm/cpp/engine_base/schedulers/SchedulerUtils.h"
 #include "rtp_llm/cpp/engine_base/schedulers/PDFusionRatioScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerUtils.h"
@@ -961,6 +962,17 @@ absl::Status NormalEngine::step() try {
                                      "(fake idle burn removed, anchor heartbeat preserved)",
                                      (unsigned long)skips);
                 }
+                // Pacing (v3.1.1, pitfall #88 / perf-log R298): the ~20 ms step
+                // cadence was previously provided IMPLICITLY by the fake-stream
+                // forward this skip removed; without explicit pacing the
+                // scheduler wait's predicate (running_streams_.size() > 0, a
+                // stale fake stream) is already satisfied and the loop spins
+                // at the anchor-all-reduce rate, turning the heartbeat itself
+                // into the burn source (~250 Hz / 40-57% GPU busy measured).
+                // Sleep the shared kStepLockInterval so the skip rounds keep
+                // the v3 lockstep cadence (identical constant on every rank —
+                // not a rank-divergent backoff).
+                std::this_thread::sleep_for(kStepLockInterval);
                 return absl::OkStatus();
             }
         }

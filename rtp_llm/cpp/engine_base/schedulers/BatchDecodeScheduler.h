@@ -237,7 +237,9 @@ public:
         // window burns one fake step per ~20-25 ms on all ranks; correctness
         // over idle efficiency. NO unilateral adaptive backoff: rank-divergent
         // backoff would reopen the desync window.
-        constexpr auto kStepLockInterval = std::chrono::milliseconds(20);
+        // v3.1.1 (R298): the interval is now the shared kStepLockInterval
+        // (SchedulerUtils.h) — the scheduler wait and the engine's global-idle
+        // skip sleep must keep one source of truth.
         cond_.wait_for(lock, kStepLockInterval, [this] {
             return waiting_streams_.size() >= batch_size_ || running_streams_.size() > 0
                    || !loading_cache_streams_.empty() || (draining_mixed_modes_ && !waiting_streams_.empty());
