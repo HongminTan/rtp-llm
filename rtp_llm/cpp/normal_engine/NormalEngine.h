@@ -51,7 +51,11 @@ private:
     void                            initScheduler();
     std::shared_ptr<GenerateStream> createStream(const std::shared_ptr<GenerateInput>& input);
     bool                            validateStreamForScheduling(const GenerateStreamPtr& stream) const;
-    std::shared_ptr<GenerateStream> createMinFakeStream(int32_t max_new_tokens);
+    // prefill=true keeps the stream context-born (first step = 1-token
+    // prefill forward; R322/r164 option (a), the qwen35-vl 43bf42027d design).
+    // Default false = the historical decode-born behavior (PDFUSION/DECODE
+    // update branch runs).
+    std::shared_ptr<GenerateStream> createMinFakeStream(int32_t max_new_tokens, bool prefill = false);
     WarmUpResult                    warmUp(const EngineInitParams& params);
     WarmUpResult                    prefillWarmUp(const EngineInitParams& params);
     WarmUpResult                    decodeWarmUp(const EngineInitParams& params);

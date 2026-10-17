@@ -557,7 +557,7 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
 #endif
 }
 
-std::shared_ptr<GenerateStream> NormalEngine::createMinFakeStream(int32_t max_new_tokens) {
+std::shared_ptr<GenerateStream> NormalEngine::createMinFakeStream(int32_t max_new_tokens, bool prefill) {
     RTP_LLM_LOG_DEBUG("create min fake query");
     auto fake_input                             = makeFakeInput(1);
     fake_input->generate_config->max_new_tokens = max_new_tokens;
@@ -566,7 +566,17 @@ std::shared_ptr<GenerateStream> NormalEngine::createMinFakeStream(int32_t max_ne
     stream->setIsFakeStream(true);
     stream->setMetricsReporter(nullptr);
     stream->fakeInitKVBlock();
-    if (pd_sep_config.role_type == RoleType::PDFUSION || pd_sep_config.role_type == RoleType::DECODE) {
+    // prefill=true (R322/r164, the qwen35-vl 43bf42027d design): keep the
+    // stream context-born — skip the PDFUSION/DECODE update branch so the
+    // stream's first step is a 1-token prefill forward and the hosting batch
+    // routes through the prefill executor path. This is what the v2 phase pad
+    // requires to actually align the collective families: a decode-born pad
+    // stream leaves the batch on the decode (graph replay) path while a
+    // prefilling peer enters the eager dynamic a2a path — the cross-type
+    // mismatch that wedged fifo-confirm-02 (perf-log R320, R293's finding's
+    // demonstrated consequence). prefill=false (default) keeps the historical
+    // decode-born behavior for every existing call site.
+    if (!prefill && (pd_sep_config.role_type == RoleType::PDFUSION || pd_sep_config.role_type == RoleType::DECODE)) {
         auto new_tokens = torch::zeros({1, 1}, torch::kInt32);
 
         StreamUpdateInfo update_info{new_tokens,
@@ -931,15 +941,17 @@ absl::Status NormalEngine::step() try {
             if (step_in_window == 0) {
                 padToConsensusBatch(streams, consensus_bs);
                 if (consensus_phase > 0 && !local_has_prefill) {
-                    // Phase alignment (R251.1; narrative corrected by R293/R294):
-                    // inject a fresh fake stream so this batch's shape joins the
-                    // prefill-phase consensus. On the PDFUSION form the injected
-                    // stream is decode-born (the createMinFakeStream update
-                    // branch) and the kBatchDecode scheduler converts every
-                    // admitted stream anyway, so the pad is inert there; it keeps
-                    // its shape-alignment role for forms where streams keep their
-                    // context phase.
-                    streams.emplace_back(createMinFakeStream(1));
+                    // Phase alignment (R251.1; R322/r164 option (a), narrative
+                    // corrected by R293/R294): inject a fresh CONTEXT-born fake
+                    // stream (prefill=true) so this batch's shape joins the
+                    // prefill-phase consensus AND routes through the prefill
+                    // executor path — the eager dynamic a2a family then matches
+                    // the prefilling peer's, closing the cross-type mismatch
+                    // that wedged fifo-confirm-02 (perf-log R320). On the
+                    // kBatchDecode form the pad never fires (no rank ever
+                    // reports a context stream there, R294), so that form's
+                    // behavior is untouched.
+                    streams.emplace_back(createMinFakeStream(1, /*prefill=*/true));
                     shape_consensus_phase_pads_.fetch_add(1, std::memory_order_relaxed);
                     RTP_LLM_LOG_INFO("[shape-consensus] phase pad: local decode-only batch joined prefill phase "
                                      "(consensus bs=%ld)",
