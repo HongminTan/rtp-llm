@@ -449,14 +449,20 @@ TEST_F(NormalEngineTest, testPrefillWarmUpUsesCachelessSingleInput) {
     EXPECT_TRUE(saw_cacheless_warmup);
 }
 
-TEST_F(NormalEngineTest, testFakeStreamJoinsAsContextAndOnlyFillsEmptyBatch) {
-    // R289 absorption (r151): lock the natural-alignment invariant the whole
-    // v1/v2/v3 #66 fix stack depends on — a fresh fake stream's first step is
-    // a prefill (context stream), so an idle rank's batch routes through the
-    // prefill executor path and pairs the eager dispatch collectives with any
-    // prefilling peer (perf-log R278.2). mayAddFakeStream only ever fills an
-    // empty batch. Ported from the qwen35-vl regression (43bf42027d) with our
-    // non-parameterized semantics.
+TEST_F(NormalEngineTest, testFakeStreamIsDecodeBornAndOnlyFillsEmptyBatch) {
+    // R293 characterization (r154): pin the CURRENT PDFUSION-form behavior.
+    // createMinFakeStream takes the PDFUSION/DECODE update branch
+    // (NormalEngine.cc:565-586), so a fresh fake stream is decode-born:
+    // isContextStream() is false and the stream counts as a decode row.
+    // Under the kBatchDecode scheduler the same force-conversion
+    // (setIsContextStream(false) + moveToNext(), BatchDecodeScheduler.h:
+    // 218-221) also applies to every real admitted stream — the divergence
+    // analysis (former R278.2 "fake first step is prefill" narrative,
+    // falsified on the carrier) is in perf-log R293/R294. Making fake
+    // streams context-born instead is a DEFERRED runtime decision (a
+    // behavioral change on the v3-verified stack) that requires its own
+    // launch card; this test only locks today's semantics. mayAddFakeStream
+    // only ever fills an empty batch.
     auto engine = createMockEngine(CustomConfig{});
     ASSERT_TRUE(engine->stop().ok());
 
@@ -465,11 +471,11 @@ TEST_F(NormalEngineTest, testFakeStreamJoinsAsContextAndOnlyFillsEmptyBatch) {
     ASSERT_EQ(streams.size(), 1u);
     const auto& fake = streams.front();
     EXPECT_TRUE(fake->isFakeStream());
-    EXPECT_TRUE(fake->isContextStream());
+    EXPECT_FALSE(fake->isContextStream());
     EXPECT_EQ(fake->currentExecuteTokenSize(), 1);
     StreamGroups groups(streams);
-    EXPECT_EQ(groups.totalContextBatchSize(), 1u);
-    EXPECT_EQ(groups.totalDecodeBatchSize(), 0u);
+    EXPECT_EQ(groups.totalContextBatchSize(), 0u);
+    EXPECT_EQ(groups.totalDecodeBatchSize(), 1u);
 
     // A non-empty batch is never appended to; the existing stream survives.
     engine->mayAddFakeStream(streams);
