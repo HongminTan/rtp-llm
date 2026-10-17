@@ -338,6 +338,65 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
     prepareAttentionInputs(inputs, state, /*skip_forward_event_sync=*/true);
 }
 
+// R285 arm-2 instrument (test-only, revert after the run): dump per-replay-row
+// attention metadata — input_lengths, sequence_lengths_plus_1, and the block
+// table's first column — for the primary table and every tagged pool table,
+// to adjudicate the padding-row / stale-length-accounting hypothesis for the
+// drift-arm semantic corruption (perf-log R281.2(c), R284). Env
+// RTP_LLM_DUMP_ATTN_META=N (default 0 = silent); auto-silences after N dump
+// calls. One host pull per table per call — bounded cost.
+void CudaGraphRunner::dumpAttnMeta(const char* tag, int key, const CudaGraphState& state) {
+    static const int64_t budget = [] {
+        const char* env = std::getenv("RTP_LLM_DUMP_ATTN_META");
+        return env ? std::atoll(env) : 0;
+    }();
+    static std::atomic<int64_t> calls{0};
+    if (budget <= 0) {
+        return;
+    }
+    const int64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > budget) {
+        return;
+    }
+    const auto& model_inputs = graph_instances_[key].mem_hold_.py_model_inputs_;
+    auto        dump_table   = [&](const char* table_name, const auto& attn) {
+        const auto& bt_dev = attn.kv_cache_kernel_block_id_device;
+        if (!bt_dev.defined() || bt_dev.dim() != 2 || bt_dev.size(0) <= 0) {
+            return;
+        }
+        const torch::Tensor bt0 = bt_dev.select(1, 0).to(torch::kInt64).cpu();
+        torch::Tensor       ilen;
+        torch::Tensor       slen;
+        if (attn.input_lengths_device.defined() && attn.input_lengths_device.numel() > 0) {
+            ilen = attn.input_lengths_device.to(torch::kInt64).cpu();
+        }
+        if (attn.sequence_lengths_plus_1_device.defined() && attn.sequence_lengths_plus_1_device.numel() > 0) {
+            slen = attn.sequence_lengths_plus_1_device.to(torch::kInt64).cpu();
+        }
+        const int rows = static_cast<int>(bt0.numel());
+        for (int r = 0; r < rows; ++r) {
+            RTP_LLM_LOG_INFO("[dump-attn-meta %ld/%ld] %s tbl=%s row=%d/%d live_bs=%d key_bs=%d ilen=%ld slen_p1=%ld "
+                                      "bt0=%ld seq_sum=%ld",
+                             (long)n,
+                             (long)budget,
+                             tag,
+                             table_name,
+                             r,
+                             rows,
+                             state.current_batch_size,
+                             state.current_real_graph_bs,
+                             ilen.defined() ? (long)ilen[r].item<int64_t>() : -1L,
+                             slen.defined() ? (long)slen[r].item<int64_t>() : -1L,
+                             (long)bt0[r].item<int64_t>(),
+                             (long)state.seq_len_sum);
+        }
+    };
+    dump_table("primary", model_inputs.attention_inputs);
+    for (const auto& [tbl_tag, attn] : model_inputs.attention_inputs_by_tag) {
+        dump_table(tbl_tag.c_str(), attn);
+    }
+}
+
 void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputData");
     // Channel-B: a pending multi-step request prepares the (bs, n) instance's
@@ -1194,6 +1253,7 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
         const bool multistep_replay = replay_key != state.current_real_graph_bs;
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
+            dumpAttnMeta("forward", replay_key, state);
             replayGraph(replay_key);
         }
         if (multistep_replay) {

@@ -209,6 +209,12 @@ public:
     // (replay-stable storage; content refreshed by the captured copy kernel).
     torch::Tensor replayDecodeMultistep(int bs, int n);
 
+    // R285 arm-2 instrument (test-only, revert after the run): dump the
+    // first N replays' per-row attention metadata (lengths + block-table
+    // column 0, primary and tagged tables). Env RTP_LLM_DUMP_ATTN_META=N,
+    // default 0 = silent; auto-silences after N calls.
+    void dumpAttnMeta(const char* tag, int key, const CudaGraphState& state);
+
     bool captureSessionMayBeDirty() const override {
         return capture_session_may_be_dirty_.load(std::memory_order_acquire);
     }
