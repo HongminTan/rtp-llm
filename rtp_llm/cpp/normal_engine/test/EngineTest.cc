@@ -12,6 +12,7 @@
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include "rtp_llm/cpp/models/models_weight/W.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
+#include "rtp_llm/cpp/engine_base/stream/StreamGroups.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/SchedulerUtils.h"
 #include "rtp_llm/cpp/normal_engine/test/MockEngine.h"
@@ -286,14 +287,14 @@ TEST_F(NormalEngineTest, testDecodeWarmupUsesWarmupCacheTopology) {
 
 TEST_F(NormalEngineTest, testCacheManagerInitFailureDoesNotPublishPartialState) {
     ModelConfig model;
-    model.num_layers                   = 1;
-    model.attn_config.head_num         = 1;
-    model.attn_config.kv_head_num      = 1;
-    model.attn_config.size_per_head    = 1;
+    model.num_layers                          = 1;
+    model.attn_config.head_num                = 1;
+    model.attn_config.kv_head_num             = 1;
+    model.attn_config.size_per_head           = 1;
     model.attn_config.tokens_per_block        = 1;
     model.attn_config.kernel_tokens_per_block = 1;
-    model.kv_cache_spec_descs          = {{{"default", KVCacheSpecType::MultiHeadAttention}}};
-    const auto config                  = CacheConfigCreator::createWarmupConfig(model, {});
+    model.kv_cache_spec_descs                 = {{{"default", KVCacheSpecType::MultiHeadAttention}}};
+    const auto config                         = CacheConfigCreator::createWarmupConfig(model, {});
 
     auto            previous  = std::make_shared<KVCacheManager>(config, /*warmup=*/true);
     auto            candidate = std::make_shared<KVCacheManager>(config, /*warmup=*/true);
@@ -446,6 +447,34 @@ TEST_F(NormalEngineTest, testPrefillWarmUpUsesCachelessSingleInput) {
     auto engine = std::make_shared<NormalEngine>(params, nullptr);
 
     EXPECT_TRUE(saw_cacheless_warmup);
+}
+
+TEST_F(NormalEngineTest, testFakeStreamJoinsAsContextAndOnlyFillsEmptyBatch) {
+    // R289 absorption (r151): lock the natural-alignment invariant the whole
+    // v1/v2/v3 #66 fix stack depends on — a fresh fake stream's first step is
+    // a prefill (context stream), so an idle rank's batch routes through the
+    // prefill executor path and pairs the eager dispatch collectives with any
+    // prefilling peer (perf-log R278.2). mayAddFakeStream only ever fills an
+    // empty batch. Ported from the qwen35-vl regression (43bf42027d) with our
+    // non-parameterized semantics.
+    auto engine = createMockEngine(CustomConfig{});
+    ASSERT_TRUE(engine->stop().ok());
+
+    std::list<GenerateStreamPtr> streams;
+    engine->mayAddFakeStream(streams);
+    ASSERT_EQ(streams.size(), 1u);
+    const auto& fake = streams.front();
+    EXPECT_TRUE(fake->isFakeStream());
+    EXPECT_TRUE(fake->isContextStream());
+    EXPECT_EQ(fake->currentExecuteTokenSize(), 1);
+    StreamGroups groups(streams);
+    EXPECT_EQ(groups.totalContextBatchSize(), 1u);
+    EXPECT_EQ(groups.totalDecodeBatchSize(), 0u);
+
+    // A non-empty batch is never appended to; the existing stream survives.
+    engine->mayAddFakeStream(streams);
+    ASSERT_EQ(streams.size(), 1u);
+    EXPECT_EQ(streams.front(), fake);
 }
 
 TEST_F(NormalEngineTest, testFp8KVCache) {
