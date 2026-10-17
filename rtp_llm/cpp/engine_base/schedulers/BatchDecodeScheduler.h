@@ -225,7 +225,20 @@ public:
 
     absl::StatusOr<std::list<GenerateStreamPtr>> schedule() override {
         std::unique_lock<std::mutex> lock(lock_);
-        cond_.wait_for(lock, std::chrono::seconds(30), [this] {
+        // Step-frequency lock (#66 v3, R258/R259): the wait is bounded to a
+        // short interval so an idle rank still returns (empty batch -> the
+        // engine's mayAddFakeStream fills a 1-token fake stream -> the
+        // per-step collectives keep running at the lockstep cadence). The
+        // old 30 s wait let idle ranks stop stepping for tens of seconds
+        // while peers kept advancing — every per-step collective sequence
+        // (a2a, the shape-consensus anchor) then paired up at mismatched
+        // indices and the engines waited on each other forever (the drift
+        // wedge family, R224-R258). Known cost (r132 condition 2): the idle
+        // window burns one fake step per ~20-25 ms on all ranks; correctness
+        // over idle efficiency. NO unilateral adaptive backoff: rank-divergent
+        // backoff would reopen the desync window.
+        constexpr auto kStepLockInterval = std::chrono::milliseconds(20);
+        cond_.wait_for(lock, kStepLockInterval, [this] {
             return waiting_streams_.size() >= batch_size_ || running_streams_.size() > 0
                    || !loading_cache_streams_.empty() || (draining_mixed_modes_ && !waiting_streams_.empty());
         });
@@ -279,7 +292,7 @@ private:
     std::list<GenerateStreamPtr> running_streams_;
     uint32_t                     batch_size_;
     bool                         reorder_request_;
-    uint32_t                     current_step_ = 0;
+    uint32_t                     current_step_         = 0;
     bool                         draining_mixed_modes_ = false;
 
     std::shared_ptr<KVCacheManager> cache_manager_;
