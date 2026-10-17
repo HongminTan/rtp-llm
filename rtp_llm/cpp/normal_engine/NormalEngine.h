@@ -132,10 +132,12 @@ private:
     // mid-window, so the graph replay stays stable).
     int multi_step_max_ = 0;
     // shapeConsensusAnchor state (#66 fix): 3-element Max-all-reduce buffer
-    // [bs, phase, has-real] (lazy CUDA int64) + the last locally-published
-    // values (fills are rare — only on composition changes) + telemetry
-    // counters (v3.1.1: skips counter doubles as the skip-branch activation
-    // fingerprint).
+    // [bs, phase, has-real] (lazy CUDA int64) + the last READ-BACK consensus
+    // values (v3.1.2: the fill comparator's source — the all-reduce is
+    // in-place, so comparing locals against the last consensus makes the
+    // fill self-correcting against stale Max residues, pitfall #89; the -1
+    // sentinels force the first call to fill) + telemetry counters (v3.1.1:
+    // skips counter doubles as the skip-branch activation fingerprint).
     torch::Tensor         shape_consensus_buf_;
     int64_t               shape_consensus_last_bs_       = -1;
     int64_t               shape_consensus_last_phase_    = -1;

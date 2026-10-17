@@ -1088,8 +1088,20 @@ int64_t NormalEngine::shapeConsensusAnchor(int64_t local_bs, bool local_has_pref
         shape_consensus_buf_ =
             torch::zeros({3}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA).requires_grad(false));
     }
-    // Rare fill (batch-composition or phase change only): a device sync bounds
-    // the cross-stream ordering between this fill and the PG-side collective.
+    // Rare fill, self-correcting variant (v3.1.2, R302 / pitfall #89): the
+    // all-reduce is in-place, so after every round the buffer holds the Max
+    // result, not this rank's contribution. A rank whose local values did not
+    // change would otherwise keep contributing the stale Max result — for
+    // has_real that latched 1 forever after the first real work and
+    // permanently blocked the global-idle skip; for bs it over-padded idle
+    // rounds after every larger wave (consensus stuck at the wave's bs).
+    // Comparing the locals against the LAST READ-BACK CONSENSUS (not the
+    // last published locals) makes the fill self-correcting: when a Max
+    // residue differs from this rank's local state, the next round re-fills
+    // the local values and the consensus converges within one round; in
+    // steady state (local == consensus) no fill runs and the rare-fill
+    // economics are preserved. The device sync bounds the cross-stream
+    // ordering between this fill and the PG-side collective.
     const int64_t local_phase        = local_has_prefill ? 1 : 0;
     const int64_t local_has_real_bit = local_has_real ? 1 : 0;
     if (local_bs != shape_consensus_last_bs_ || local_phase != shape_consensus_last_phase_
@@ -1098,9 +1110,6 @@ int64_t NormalEngine::shapeConsensusAnchor(int64_t local_bs, bool local_has_pref
         shape_consensus_buf_[1].fill_(local_phase);
         shape_consensus_buf_[2].fill_(local_has_real_bit);
         torch::cuda::synchronize();
-        shape_consensus_last_bs_       = local_bs;
-        shape_consensus_last_phase_    = local_phase;
-        shape_consensus_last_has_real_ = local_has_real_bit;
     }
     execAllReduce({shape_consensus_buf_, ReduceOp::Max, false, ParallelMode::DP});
     // The completion wait IS the anchor: blocking here means every rank's
@@ -1109,10 +1118,17 @@ int64_t NormalEngine::shapeConsensusAnchor(int64_t local_bs, bool local_has_pref
     // outstanding collectives on the host; the subsequent item() read is then
     // coherent with the completed write.
     execSyncCommunication(ParallelMode::DP, /*timeout=*/false);
-    const int64_t  consensus_bs       = shape_consensus_buf_[0].item<int64_t>();
-    const int64_t  consensus_phase    = shape_consensus_buf_[1].item<int64_t>();
-    const int64_t  consensus_has_real = shape_consensus_buf_[2].item<int64_t>();
-    const uint64_t calls              = shape_consensus_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const int64_t consensus_bs       = shape_consensus_buf_[0].item<int64_t>();
+    const int64_t consensus_phase    = shape_consensus_buf_[1].item<int64_t>();
+    const int64_t consensus_has_real = shape_consensus_buf_[2].item<int64_t>();
+    // v3.1.2: the trackers now hold the READ-BACK CONSENSUS (the fill
+    // comparator's source, see the fill comment above). The -1 sentinels
+    // force the first call to fill unconditionally, so the trackers are
+    // always written before they are compared.
+    shape_consensus_last_bs_       = consensus_bs;
+    shape_consensus_last_phase_    = consensus_phase;
+    shape_consensus_last_has_real_ = consensus_has_real;
+    const uint64_t calls           = shape_consensus_calls_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (calls == 1 || calls % 1000 == 0) {
         RTP_LLM_LOG_INFO("[shape-consensus] calls=%lu pads=%lu phase_pads=%lu skips=%lu "
                          "last_local=(bs=%ld,phase=%ld,has_real=%ld) consensus=(bs=%ld,phase=%ld,has_real=%ld)",
