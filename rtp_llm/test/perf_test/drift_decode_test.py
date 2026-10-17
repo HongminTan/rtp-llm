@@ -112,6 +112,9 @@ def main() -> str:
     # (4 on DP4) keeps the semantic gate focused on the multi-step path
     # without that orthogonal defect contaminating the run.
     drift_fixed_wave = _pop_int(remaining, "drift_fixed_wave", 0)
+    # Initial idle window (R135 arm (a)): seconds of zero-wave idle at load
+    # start; semantic probes continue on their schedule. 0 = off.
+    drift_initial_idle_s = _pop_int(remaining, "drift_initial_idle_s", 0)
 
     engine_env_names = _apply_engine_env(args.engine_env)
     _apply_run_overrides(args)
@@ -169,13 +172,15 @@ def main() -> str:
             raise RuntimeError("no input queries built for drift load")
 
         logging.info(
-            "[drift] start: duration=%ds seed=%d queries=%d",
+            "[drift] start: duration=%ds seed=%d queries=%d initial_idle_s=%d",
             drift_duration,
             drift_seed,
             len(queries),
+            drift_initial_idle_s,
         )
-        end_time = time.time() + drift_duration
-        next_gap = time.time() + rng.uniform(90, 150)
+        load_start_time = time.time()
+        end_time = load_start_time + drift_duration
+        next_gap = load_start_time + rng.uniform(90, 150)
         next_semantic = time.time() + 30
         wave_index = 0
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -207,6 +212,17 @@ def main() -> str:
                         }
                     )
                     next_semantic = time.time() + 180
+                    continue
+
+                # Initial idle window (R263/R135 discriminator arm (a)): no
+                # waves for the first --drift_initial_idle_s seconds — the
+                # engine sits in pure idle fake-stream stepping while the
+                # semantic probes run as usual. Probes in this window decide
+                # whether fake-step state alone is sufficient to corrupt
+                # responses (H-2) or the wave load / routing interplay is
+                # required (H-1/H-3).
+                if now < load_start_time + drift_initial_idle_s:
+                    time.sleep(1.0)
                     continue
 
                 wave_size = (
