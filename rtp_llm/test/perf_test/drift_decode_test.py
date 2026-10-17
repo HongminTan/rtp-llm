@@ -99,6 +99,42 @@ def _semantic_check(port: int) -> bool:
         return False
 
 
+def _semantic_check_chat(port: int) -> bool:
+    """R271 dual-endpoint probe (reviewer r139): the same greedy France
+    question through the /v1/chat/completions frontend path (the smoke's
+    route), sent alongside the raw probe each window. chat-pass x raw-fail
+    pins the corruption to the raw path's response assembly; both-fail
+    points at server-side state; both-pass at timing. Failure text is
+    logged for the fixed-residue fingerprint (a 4th same-text occurrence
+    would be direct evidence)."""
+    import requests
+
+    req = {
+        "messages": [{"role": "user", "content": SEMANTIC_PROMPT}],
+        "temperature": 0.0,
+        "top_p": 0.0,
+        "top_k": 1,
+        "max_tokens": SEMANTIC_MAX_TOKENS,
+    }
+    try:
+        response = requests.post(
+            f"http://127.0.0.1:{port}/v1/chat/completions", json=req, timeout=300
+        )
+        if response.status_code != 200:
+            logging.warning("[drift] chat check HTTP %d", response.status_code)
+            return False
+        data = response.json()
+        choices = data.get("choices") or []
+        text = choices[0].get("message", {}).get("content", "") if choices else ""
+        if SEMANTIC_NEEDLE not in text:
+            logging.warning("[drift] chat check lost needle: %r", text[:120])
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("[drift] chat check exception: %s", exc)
+        return False
+
+
 def main() -> str:
     from rtp_llm.config.log_config import setup_logging
 
@@ -209,6 +245,16 @@ def main() -> str:
                             "t": round(now, 1),
                             "event": "semantic",
                             "passed": bool(passed),
+                        }
+                    )
+                    # R271 dual-endpoint probe (r139): the chat route right
+                    # after the raw probe, same window, recorded separately.
+                    chat_passed = _semantic_check_chat(server.port)
+                    events.append(
+                        {
+                            "t": round(now, 1),
+                            "event": "semantic_chat",
+                            "passed": bool(chat_passed),
                         }
                     )
                     next_semantic = time.time() + 180
