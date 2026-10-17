@@ -338,27 +338,6 @@ void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState&
     prepareAttentionInputs(inputs, state, /*skip_forward_event_sync=*/true);
 }
 
-// R275 instrument (reviewer r143, test-only): dump the first N forward
-// calls' replay key + input token to adjudicate the graph-key-misalignment
-// hypothesis ((b) in perf-log R274/R275). Env RTP_LLM_DUMP_FIRST_STEPS=N
-// (default 0 = silent); auto-silences after N calls. D2H reads of the first
-// element only — bounded cost. Revert after the discriminator run.
-void CudaGraphRunner::dumpFirstSteps(const char* tag, int key, int bs, int token0) {
-    static const int64_t budget = [] {
-        const char* env = std::getenv("RTP_LLM_DUMP_FIRST_STEPS");
-        return env ? std::atoll(env) : 0;
-    }();
-    static std::atomic<int64_t> calls{0};
-    if (budget <= 0) {
-        return;
-    }
-    const int64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n > budget) {
-        return;
-    }
-    RTP_LLM_LOG_INFO("[dump-first-steps %ld/%ld] %s key=%d bs=%d tok0=%d", (long)n, (long)budget, tag, key, bs, token0);
-}
-
 void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputData");
     // Channel-B: a pending multi-step request prepares the (bs, n) instance's
@@ -373,10 +352,6 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
                             token_num,
                             py_model_inputs.input_ids.numel());
     optimizedCopyAsync(inputs.input_ids, py_model_inputs.input_ids, token_num * sizeof(int));
-    dumpFirstSteps("prepare",
-                   static_cast<int>(graph_idx),
-                   state.current_real_graph_bs,
-                   inputs.input_ids.numel() > 0 ? inputs.input_ids[0].item<int>() : -1);
     if (engram_window_size_ > 0) {
         RTP_LLM_CHECK_WITH_INFO(inputs.engram_token_windows.defined() && inputs.engram_token_windows.dim() == 2
                                     && inputs.engram_token_windows.size(0) == token_num
@@ -1219,12 +1194,6 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
         const bool multistep_replay = replay_key != state.current_real_graph_bs;
         {
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
-            dumpFirstSteps("forward",
-                           static_cast<int>(replay_key),
-                           state.current_real_graph_bs,
-                           graph_instances_[replay_key].mem_hold_.py_model_inputs_.input_ids.numel() > 0 ?
-                               graph_instances_[replay_key].mem_hold_.py_model_inputs_.input_ids[0].item<int>() :
-                               -1);
             replayGraph(replay_key);
         }
         if (multistep_replay) {

@@ -209,10 +209,6 @@ public:
     // (replay-stable storage; content refreshed by the captured copy kernel).
     torch::Tensor replayDecodeMultistep(int bs, int n);
 
-    // R275 instrument (reviewer r143, test-only, revert after the run): dump
-    // the first N calls' replay key + input token. Env-gated, auto-silent.
-    void dumpFirstSteps(const char* fmt, int key, int bs, int token0);
-
     bool captureSessionMayBeDirty() const override {
         return capture_session_may_be_dirty_.load(std::memory_order_acquire);
     }
