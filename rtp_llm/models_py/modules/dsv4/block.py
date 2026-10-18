@@ -398,6 +398,49 @@ class Block(nn.Module):
         _, _, _, ffn_hc_post = self._prefill_fast_hc_impls()
         return ffn_hc_post(ffn_out, residual, post, comb)
 
+    def _fused_boundary_enabled(self) -> bool:
+        """P8 fused post+pre boundary gate (default off, R461 port)."""
+        import os
+
+        return os.environ.get("DSV4_MHC_FUSED_POST_PRE", "0") == "1"
+
+    def _fused_attn_post_ffn_pre(
+        self,
+        attn_out: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ):
+        """Fused attn-HC post + ffn-HC pre boundary (decode, T <= 32).
+
+        Returns (residual_cur, x_pre, post, comb): ``residual_cur`` is the
+        attn post output; the other three are the ffn-HC pre outputs that
+        the unfused path would get from ``self.ffn_hc.pre(residual_cur)``.
+        Falls back to the unfused pair on any availability miss.
+        """
+        from rtp_llm.models_py.modules.dsv4.hc.mhc_tilelang import tk_mhc_fused_post_pre
+
+        out = tk_mhc_fused_post_pre(
+            attn_out,
+            residual,
+            post,
+            comb,
+            self.ffn_hc.fn,
+            self.ffn_hc.scale,
+            self.ffn_hc.base,
+            norm_eps=self.ffn_hc.norm_eps,
+            pre_eps=self.ffn_hc.hc_eps,
+            sinkhorn_eps=self.ffn_hc.hc_eps,
+            sinkhorn_iters=self.ffn_hc.hc_sinkhorn_iters,
+            hc_mult=self.ffn_hc.hc_mult,
+        )
+        if out is None:
+            # Availability miss (gate): unfused pair, same contracts.
+            residual_cur = self.attn_hc.post(attn_out, residual, post, comb)
+            x_pre, post2, comb2 = self.ffn_hc.pre(residual_cur)
+            return residual_cur, x_pre, post2, comb2
+        return out
+
     def forward_decode(
         self,
         x: torch.Tensor,  # [B, 1, hc, dim]
@@ -424,6 +467,7 @@ class Block(nn.Module):
             and mega_adapter is not None
             and mega_adapter.supports_decode_shape(x, attn_metadata)
         )
+        _fused_ffn_pre = False
         if use_mega_attention:
             # Fused HC/norm intermediates are not exposed by Mega. The shared
             # residual record below remains available; DSV4_MEGA=0 restores
@@ -457,16 +501,27 @@ class Block(nn.Module):
                 _rt.record_if_level(
                     2, f"L{self.layer_id:02d}_decode_attn_out", attn_out
                 )
-            x = self.attn_hc.post(attn_out, residual, post, comb)
+            if self._fused_boundary_enabled():
+                x, x_pre, post, comb = self._fused_attn_post_ffn_pre(
+                    attn_out, residual, post, comb
+                )
+                _fused_ffn_pre = True
+            else:
+                x = self.attn_hc.post(attn_out, residual, post, comb)
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_attn_residual", x)
 
-        # FFN path — MoE has no per-step state, reuse existing forward
-        residual = x
-        x_pre, post, comb = self.ffn_hc.pre(
-            x,
-            dbg_tag=f"L{self.layer_id:02d}_decode_ffn_hc_pre" if _dbg_layer else None,
-        )
+        # FFN path — MoE has no per-step state, reuse existing forward.
+        # The fused boundary already produced the ffn-HC pre outputs above
+        # (non-mega branch only); every other flow takes the unfused pair.
+        if not _fused_ffn_pre:
+            residual = x
+            x_pre, post, comb = self.ffn_hc.pre(
+                x,
+                dbg_tag=(
+                    f"L{self.layer_id:02d}_decode_ffn_hc_pre" if _dbg_layer else None
+                ),
+            )
         bsz, q_len, dim_ = x_pre.shape
         x_pre = self.ffn_norm(x_pre.reshape(bsz * q_len, dim_)).view(bsz, q_len, dim_)
         if _dbg_layer:

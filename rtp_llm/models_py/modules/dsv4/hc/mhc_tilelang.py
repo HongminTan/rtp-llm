@@ -301,3 +301,78 @@ def tk_mhc_head(
         raise RuntimeError(
             "TileLang mhc_head failed: " + _shape_ctx(residual, hc_mult=hc_mult)
         ) from e
+
+
+def tk_mhc_fused_post_pre_enabled() -> bool:
+    """Env gate for the fused post+pre boundary (default off, R461 port)."""
+    return os.environ.get("DSV4_MHC_FUSED_POST_PRE", "0") == "1"
+
+
+def tk_mhc_fused_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    next_fn: torch.Tensor,
+    next_scale: torch.Tensor,
+    next_base: torch.Tensor,
+    *,
+    norm_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    sinkhorn_iters: int,
+    hc_mult: int = 4,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Fused ``post(this unit) -> pre(next unit)`` boundary (R461 port).
+
+    ``x``/``residual``/``post``/``comb`` are THIS unit's post inputs (same
+    contract as ``tk_mhc_post``); ``next_fn``/``next_scale``/``next_base``
+    are the NEXT HC unit's weights. Returns
+    ``(residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur)`` —
+    ``residual_cur`` is this unit's post output, the other three are the
+    next unit's pre outputs (same contract as ``tk_mhc_pre`` minus the
+    residual read).
+
+    Returns ``None`` only when the residual fails ``_can_use_tk`` gates.
+    Only small token counts are served (the vendored op asserts the
+    threshold); runtime failures propagate as ``RuntimeError`` chained via
+    ``from e`` — same failure-mode discipline as ``tk_mhc_post``.
+    """
+    if not _can_use_tk(residual, hc_mult):
+        return None
+    if x.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "TileLang fused mHC post+pre requires a bfloat16 sublayer output "
+            f"x; got x.dtype={x.dtype}, x.shape={tuple(x.shape)}. This is "
+            "an upstream dtype bug — fix the producer rather than treating "
+            "it as a TileLang fallback. "
+            f"{_shape_ctx(residual, hc_mult=hc_mult)}"
+        )
+    try:
+        # importlib for the digit-leading dotted path (same reason as _import_tk).
+        import importlib
+
+        _fused = importlib.import_module(
+            "rtp_llm.models_py.3rdparty.tile_kernels.modeling.mhc.functional"
+        ).mhc_fused_post_pre
+
+        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = _fused(
+            x,
+            residual,
+            post,
+            comb,
+            next_fn,
+            next_scale,
+            next_base,
+            rms_eps=norm_eps,
+            mhc_pre_eps=pre_eps,
+            mhc_sinkhorn_eps=sinkhorn_eps,
+            mhc_post_mult_value=2.0,  # REF uses 2*sigmoid(...) for post
+            sinkhorn_repeat=sinkhorn_iters,
+        )
+        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+    except Exception as e:
+        raise RuntimeError(
+            "TileLang fused mHC post+pre failed: "
+            + _shape_ctx(residual, hc_mult=hc_mult)
+        ) from e

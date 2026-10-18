@@ -54,6 +54,31 @@ _GPU_TESTS = [
     for name in _CP_HELPER_TESTS
 ]
 
+# P8 fused mHC boundary compile gate (R465.5 ①): plain py_test so it runs
+# under the cuda12_9 lane (dsv4_py_test targets the cuda13/sm100 platform).
+# Config-class gate: zero GPU launch, tilelang JIT construction only.
+py_test(
+    name = "test_mhc_fused_boundary_gate",
+    srcs = ["test_mhc_fused_boundary_gate.py"],
+    deps = _MODEL_TEST_DEPS,
+    tags = [
+        "open_skip",
+    ],
+)
+
+# P8 fused mHC post+pre numerical parity gate (R466.3 / r253 指令三①, R326
+# three-gate mold): fused boundary vs the unfused mhc_post + mhc_pre pair on
+# identical decode-shape inputs. Launches the TileLang kernels on one lane-A
+# GPU; run through the leg-launcher config-gate variant.
+py_test(
+    name = "test_mhc_fused_post_pre_parity",
+    srcs = ["test_mhc_fused_post_pre_parity.py"],
+    deps = _MODEL_TEST_DEPS,
+    tags = [
+        "open_skip",
+    ],
+)
+
 [
     dsv4_py_test(
         name = name,
