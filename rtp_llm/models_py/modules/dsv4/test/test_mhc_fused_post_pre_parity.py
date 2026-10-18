@@ -119,6 +119,10 @@ class FusedPostPreParityTest(unittest.TestCase):
         # differ, so a couple of bf16 ulps at the max magnitude is the bound.
         d1 = (residual_cur.float() - residual_ref.float()).abs().max().item()
         m1 = residual_ref.float().abs().max().item()
+        print(
+            f"[parity] T={num_tokens} H={hidden} gate1 residual "
+            f"max|d|={d1:.3e} max|ref|={m1:.3e}"
+        )
         self.assertLess(
             d1,
             max(2 * 0.0078 * m1, 1e-3),
@@ -129,6 +133,10 @@ class FusedPostPreParityTest(unittest.TestCase):
         # tf32-vs-fp32 fn and reduction order in the GEMM partials.
         d2p = (post_cur_f - post_ref_f).abs().max().item()
         d2c = (comb_cur_f - comb_ref_f).abs().max().item()
+        print(
+            f"[parity] T={num_tokens} H={hidden} gate2 post_mix max|d|={d2p:.3e} "
+            f"comb_mix max|d|={d2c:.3e}"
+        )
         self.assertLess(d2p, 5e-3, f"post_mix gate: max|d|={d2p:.3e}")
         self.assertLess(d2c, 1e-2, f"comb_mix gate: max|d|={d2c:.3e}")
 
@@ -136,10 +144,54 @@ class FusedPostPreParityTest(unittest.TestCase):
         # plus one bf16 quantization step.
         d3 = (layer_cur.float() - layer_ref.float()).abs().max().item()
         m3 = layer_ref.float().abs().max().item()
+        print(
+            f"[parity] T={num_tokens} H={hidden} gate3 layer_input "
+            f"max|d|={d3:.3e} max|ref|={m3:.3e}"
+        )
         self.assertLess(
             d3,
             max(3 * 0.0078 * m3, 1e-2),
             f"layer_input gate: max|d|={d3:.3e} vs max|ref|={m3:.3e}",
+        )
+
+    def test_fused_kernel_execution_fingerprint(self):
+        # r254 gate-validity closure #1: prove the fused TileLang kernel
+        # actually launches in this carrier (kernel-name level), and that the
+        # reference arm launches its own kernels -- both arms really run.
+        from torch.profiler import ProfilerActivity, profile
+
+        functional = _functional()
+        inputs = _make_inputs(4, 7168, seed=3001)
+
+        with torch.no_grad():
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                _run_fused(functional, *inputs)
+            fused_names = {
+                e.name for e in prof.events() if "CUDA" in str(e.device_type)
+            }
+        fused_hit = [n for n in fused_names if "_mhc_fused_post_pre_fma" in n]
+        big_fuse_hit = [n for n in fused_names if "mhc_pre_big_fuse" in n]
+        print(f"[fingerprint] fused-path kernel names: {sorted(fused_hit)}")
+        self.assertTrue(
+            fused_hit,
+            "fused arm did not launch _mhc_fused_post_pre_fma_kernel "
+            f"(profiled kernel names: {sorted(fused_names)[:20]})",
+        )
+        self.assertTrue(
+            big_fuse_hit,
+            "fused arm did not launch mhc_pre_big_fuse_kernel",
+        )
+
+        with torch.no_grad():
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                _run_unfused(functional, *inputs)
+            ref_names = {e.name for e in prof.events() if "CUDA" in str(e.device_type)}
+        post_hit = [n for n in ref_names if "_mhc_post_fwd" in n]
+        print(f"[fingerprint] reference-path kernel names: {sorted(post_hit)}")
+        self.assertTrue(
+            post_hit,
+            "reference arm did not launch _mhc_post_fwd_kernel "
+            f"(profiled kernel names: {sorted(ref_names)[:20]})",
         )
 
     def test_parity_hidden512(self):
