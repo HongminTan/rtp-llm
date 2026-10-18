@@ -429,15 +429,24 @@ def silu_mul_fp8_quant_f32_scale(
         assert gate_up.dim() == 3, f"expected 3D, got {gate_up.shape}"
         _, rows_per_expert, N = gate_up.shape
         M_total = gate_up.shape[0] * rows_per_expert
-        assert rows_per_expert % 8 == 0, (
-            f"rows_per_expert ({rows_per_expert}) must be a multiple of BLOCK_M (8)"
-        )
+        # BLOCK_M is widened to rows_per_expert (when 128-aligned) in the
+        # masked branch so the grid shrinks from one tile per 8 capacity rows
+        # to one tile per expert: ~26 launch waves of almost-empty blocks
+        # (the row predicate already skips their traffic) collapse to ~2.
+        if rows_per_expert % 128 == 0:
+            block_m = 128
+        else:
+            assert rows_per_expert % 8 == 0, (
+                f"rows_per_expert ({rows_per_expert}) must be a multiple of "
+                "128 (dense capacity path) or 8 (fallback)"
+            )
+            block_m = 8
         masked_m = masked_m.to(torch.int32)
 
     N_2 = N // 2
-    assert N_2 % group_size == 0, (
-        f"inter ({N_2}) must be a multiple of group_size ({group_size})"
-    )
+    assert (
+        N_2 % group_size == 0
+    ), f"inter ({N_2}) must be a multiple of group_size ({group_size})"
 
     fp8_dtype = torch.float8_e4m3fn
     finfo = torch.finfo(fp8_dtype)
@@ -452,7 +461,7 @@ def silu_mul_fp8_quant_f32_scale(
     if M_total == 0:
         return output_q, output_scale
 
-    BLOCK_M = 8
+    BLOCK_M = block_m if masked_m is not None else 8
     grid = (num_groups_per_row, (M_total + BLOCK_M - 1) // BLOCK_M)
     num_warps = max(4, group_size // 32)
     has_clamp = clamp_limit > 0
@@ -600,7 +609,12 @@ def _per_token_group_quant_f32_scale_masked_kernel(
 
     n_offset = pid_g * GROUP_SIZE
 
-    x_ptrs = input_ptr + (m_offset + offs_m[:, None]) * input_stride_m + n_offset + offs_n[None, :]
+    x_ptrs = (
+        input_ptr
+        + (m_offset + offs_m[:, None]) * input_stride_m
+        + n_offset
+        + offs_n[None, :]
+    )
     x = tl.load(x_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
 
     # Per-(row, group) absmax -> plain FP8 scale (row-major, matching the
@@ -609,7 +623,12 @@ def _per_token_group_quant_f32_scale_masked_kernel(
     scale = tl.maximum(absmax / fp8_max, eps)
 
     y_q = tl.clamp(x / scale[:, None], fp8_min, fp8_max)
-    q_ptrs = output_q_ptr + (m_offset + offs_m[:, None]) * output_q_stride_m + n_offset + offs_n[None, :]
+    q_ptrs = (
+        output_q_ptr
+        + (m_offset + offs_m[:, None]) * output_q_stride_m
+        + n_offset
+        + offs_n[None, :]
+    )
     tl.store(q_ptrs, y_q.to(output_q_ptr.dtype.element_ty), mask=row_mask[:, None])
 
     scale_ptrs = (
@@ -648,9 +667,9 @@ def per_token_group_quant_f32_scale_masked(
         assert x.dim() == 3, f"expected 3D, got {x.shape}"
         _, rows_per_expert, D = x.shape
         M_total = x.shape[0] * rows_per_expert
-        assert rows_per_expert % 256 == 0, (
-            f"rows_per_expert ({rows_per_expert}) must be a multiple of BLOCK_M (256)"
-        )
+        assert (
+            rows_per_expert % 256 == 0
+        ), f"rows_per_expert ({rows_per_expert}) must be a multiple of BLOCK_M (256)"
         masked_m = masked_m.to(torch.int32)
 
     assert D % group_size == 0
@@ -658,7 +677,9 @@ def per_token_group_quant_f32_scale_masked(
     fp8_dtype = torch.float8_e4m3fn
     finfo = torch.finfo(fp8_dtype)
     out_q = torch.empty(x.shape, dtype=fp8_dtype, device=x.device)
-    out_s = torch.empty(x.shape[:-1] + (num_groups,), dtype=torch.float32, device=x.device)
+    out_s = torch.empty(
+        x.shape[:-1] + (num_groups,), dtype=torch.float32, device=x.device
+    )
     if M_total == 0:
         return out_q, out_s
 
