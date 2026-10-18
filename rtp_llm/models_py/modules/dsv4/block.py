@@ -413,11 +413,20 @@ class Block(nn.Module):
     ):
         """Fused attn-HC post + ffn-HC pre boundary (decode, T <= 32).
 
-        Returns (residual_cur, x_pre, post, comb): ``residual_cur`` is the
-        attn post output; the other three are the ffn-HC pre outputs that
-        the unfused path would get from ``self.ffn_hc.pre(residual_cur)``.
-        Falls back to the unfused pair on any availability miss.
+        Returns (residual_cur, post, comb, x_pre) in the wrapper's order:
+        ``residual_cur`` is the attn post output; ``post``/``comb``/``x_pre``
+        are the ffn-HC pre outputs the unfused path would get from
+        ``self.ffn_hc.pre(residual_cur)``. Falls back to the unfused pair on
+        any availability miss or token-count overflow (the vendored FMA op
+        serves num_tokens <= 32 only; graph capture at larger batch sizes
+        takes this fallback too).
         """
+        # The vendored op asserts num_tokens <= 32 (SGLang's own split);
+        # decode batches / graph captures beyond that stay unfused.
+        if residual.shape[:-2].numel() > 32:
+            residual_cur = self.attn_hc.post(attn_out, residual, post, comb)
+            x_pre, post2, comb2 = self.ffn_hc.pre(residual_cur)
+            return residual_cur, post2, comb2, x_pre
         from rtp_llm.models_py.modules.dsv4.hc.mhc_tilelang import tk_mhc_fused_post_pre
 
         out = tk_mhc_fused_post_pre(
@@ -438,7 +447,7 @@ class Block(nn.Module):
             # Availability miss (gate): unfused pair, same contracts.
             residual_cur = self.attn_hc.post(attn_out, residual, post, comb)
             x_pre, post2, comb2 = self.ffn_hc.pre(residual_cur)
-            return residual_cur, x_pre, post2, comb2
+            return residual_cur, post2, comb2, x_pre
         return out
 
     def forward_decode(
@@ -502,7 +511,7 @@ class Block(nn.Module):
                     2, f"L{self.layer_id:02d}_decode_attn_out", attn_out
                 )
             if self._fused_boundary_enabled():
-                x, x_pre, post, comb = self._fused_attn_post_ffn_pre(
+                x, post, comb, x_pre = self._fused_attn_post_ffn_pre(
                     attn_out, residual, post, comb
                 )
                 _fused_ffn_pre = True
