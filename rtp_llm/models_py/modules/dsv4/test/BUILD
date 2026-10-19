@@ -79,6 +79,19 @@ py_test(
     ],
 )
 
+# M-R1 fused static-EP packing parity gate (R473.2 / r258 指令一①(b)(d)):
+# ep_static_pack_send vs the aten chain it replaces, bitwise send_buf plus
+# a 3-kernel launch-count fingerprint. Lane-A GPU via the config-gate
+# launcher variant.
+py_test(
+    name = "test_ep_static_pack_parity",
+    srcs = ["test_ep_static_pack_parity.py"],
+    deps = _MODEL_TEST_DEPS,
+    tags = [
+        "open_skip",
+    ],
+)
+
 [
     dsv4_py_test(
         name = name,

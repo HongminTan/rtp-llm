@@ -42,21 +42,16 @@ from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
     m_grouped_fp8_gemm_nt_masked,
 )
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
-from rtp_llm.models_py.kernels.cuda.quant_layouts import (
-    FP4_BLOCK,
-    FP8_BLOCK,
-    _FP4_LUT,
-)
+from rtp_llm.models_py.kernels.cuda.quant_layouts import _FP4_LUT, FP4_BLOCK, FP8_BLOCK
 from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
-    ep_scatter_v2,
-
     ep_gather,
     ep_scatter,
+    ep_scatter_v2,
     recompute_topk_ids_sum_expert_count,
 )
 from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
-    silu_mul_fp8_quant_f32_scale,
     per_token_group_quant_f32_scale_masked,
+    silu_mul_fp8_quant_f32_scale,
 )
 from rtp_llm.models_py.utils.math import align, ceil_div
 
@@ -79,6 +74,15 @@ _MASKED_WS_CACHE: Dict[Any, Any] = {}
 
 def _masked_ws_reuse_enabled() -> bool:
     return os.environ.get("DSV4_MASKED_WS_REUSE", "0") == "1"
+
+
+def _static_pack_fused_enabled() -> bool:
+    """M-R1 fused sender-side packing (R473): swap the aten
+    argsort/count/cumsum/index_put chain in ``_forward_ep_static`` for the
+    three Triton kernels in ``triton_kernels/moe/ep_static_pack.py``.
+    Capture path only (global_cap is None checked at the call site); the
+    aten chain stays the default and the eager/sidecar variant's fallback."""
+    return os.environ.get("DSV4_EP_STATIC_PACK_FUSED", "0") == "1"
 
 
 def _static_eager_enabled() -> bool:
@@ -208,9 +212,7 @@ def _static_eager_overflow_check() -> int:
     return int(sum(int(t.item()) for t in _STATIC_EAGER_OVERFLOW.values()))
 
 
-def _masked_ws_buffers(
-    e_local: int, cap_m: int, D: int, device: torch.device
-) -> tuple:
+def _masked_ws_buffers(e_local: int, cap_m: int, D: int, device: torch.device) -> tuple:
     """Persistent (masked_in, masked_scale) buffers, torch.empty (no fill)."""
     key = (e_local, cap_m, D, str(device))
     bufs = _MASKED_WS_CACHE.get(key)
@@ -277,7 +279,9 @@ def _dequant_fp4_to_fp8_blockwise(
     n_blocks_n = ceil_div(out_dim, FP8_BLOCK)
     n_blocks_k = ceil_div(in_dim, FP8_BLOCK)
     w_fp8 = torch.empty((E, out_dim, in_dim), dtype=torch.float8_e4m3fn, device=device)
-    s_fp32 = torch.empty((E, n_blocks_n, n_blocks_k), dtype=torch.float32, device=device)
+    s_fp32 = torch.empty(
+        (E, n_blocks_n, n_blocks_k), dtype=torch.float32, device=device
+    )
 
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     lut = _FP4_LUT.to(device)
@@ -304,9 +308,7 @@ def _dequant_fp4_to_fp8_blockwise(
         amax = blocks.abs().amax(dim=(2, 4))
         scale = (amax / fp8_max).clamp_(min=1e-12)
         q = (blocks / scale[:, :, None, :, None]).clamp_(-fp8_max, fp8_max)
-        w_fp8[start:end] = q.view(end - start, out_dim, in_dim).to(
-            torch.float8_e4m3fn
-        )
+        w_fp8[start:end] = q.view(end - start, out_dim, in_dim).to(torch.float8_e4m3fn)
         s_fp32[start:end] = scale
         del w_f32, blocks, amax, scale, q
     return w_fp8, s_fp32
@@ -649,7 +651,6 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         e_local = self._e_local
         expert_start = int(cfg.ep_rank) * e_local
 
-
         if not (dist.is_available() and dist.is_initialized()):
             raise RuntimeError("grouped_fp4_sm90 EP path requires torch.distributed")
         if dist.get_world_size() != world:
@@ -707,17 +708,13 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         # Compute on the received rows with LOCAL expert indices; router
         # weight applied by the sender during the reduce.
         local_ids = (recv_meta[:, 0] - expert_start).clamp_(0, e_local - 1)
-        ones = torch.ones(
-            (total_recv, 1), dtype=torch.float32, device=device
-        )
+        ones = torch.ones((total_recv, 1), dtype=torch.float32, device=device)
         recv_out = self._forward_local(recv_x, ones, local_ids.unsqueeze(1))
 
         # Return per-assignment outputs to the originating ranks.
         send_back = recv_out.to(x.dtype).contiguous()
         recv_back = torch.empty((total_send, D), dtype=x.dtype, device=device)
-        dist.all_to_all_single(
-            recv_back, send_back, send_counts_cpu, recv_counts_cpu
-        )
+        dist.all_to_all_single(recv_back, send_back, send_counts_cpu, recv_counts_cpu)
 
         # Deterministic reduce: one write per assignment slot, then a fixed
         # topk-order sum per token.
@@ -806,9 +803,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         dist.all_gather_into_tensor(
             w_full, weights.reshape(x.shape[0], -1).to(torch.float32).contiguous()
         )
-        i_full = torch.empty(
-            (world * exchange_n, K), dtype=torch.int64, device=device
-        )
+        i_full = torch.empty((world * exchange_n, K), dtype=torch.int64, device=device)
         dist.all_gather_into_tensor(
             i_full, indices.reshape(x.shape[0], -1).to(torch.int64).contiguous()
         )
@@ -834,9 +829,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         # full top-k total for that token. BF16 payload halves the wire
         # bytes (the MoE output is BF16 downstream regardless).
         out = torch.empty((exchange_n, D), dtype=torch.bfloat16, device=device)
-        dist.reduce_scatter_tensor(
-            out, partial.to(torch.bfloat16).contiguous()
-        )
+        dist.reduce_scatter_tensor(out, partial.to(torch.bfloat16).contiguous())
         return out[:N].float()
 
     # ------------------------------------------------------------------
@@ -1045,50 +1038,71 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         flat_ids = torch.where(valid, flat_ids, torch.zeros_like(flat_ids))
         flat_w = torch.where(valid, flat_w, torch.zeros_like(flat_w))
 
-        # ---- sender-side packing (shape-stable) ----
-        dest = flat_ids // e_local
-        order = torch.argsort(dest, stable=True)
-        dest_sorted = flat_ids.index_select(0, order) // e_local
-        # scatter_add (not bincount): bincount synchronizes with the
-        # host, which is illegal under graph capture.
-        counts = torch.zeros(
-            world, dtype=torch.int64, device=device
-        ).scatter_add_(0, dest, torch.ones_like(dest))
-        starts = torch.cumsum(counts, 0) - counts  # exclusive, per rank
-        pos = torch.arange(N * K, device=device, dtype=torch.int64)
-        within = pos - starts.index_select(0, dest_sorted)
-        assign_idx = order  # original assignment index per sorted position
+        pack_fused = global_cap is None and _static_pack_fused_enabled()
+        if pack_fused:
+            # M-R1 fused sender-side packing (R473): three Triton kernels
+            # replace the argsort/count/cumsum/index_put chain below. Slot
+            # layout is bitwise-identical (parity gate:
+            # modules/dsv4/test/test_ep_static_pack_parity.py); the combine
+            # reads slots back by assignment index -- the same bijection the
+            # aten form materialized via argsort + index_copy.
+            from rtp_llm.models_py.triton_kernels.moe.ep_static_pack import (
+                ep_static_pack_send,
+            )
 
-        x_rows = x.repeat_interleave(K, dim=0).index_select(0, order).to(bf16)
-        # Eager path (global_cap): metadata travels in an FP32 sidecar
-        # instead of the two BF16 columns. BF16 integers are exact only
-        # below 256: eid qualifies at any chunk size, but assign_idx
-        # reaches cap-1 (24575 at the 4096-token bucket), so the
-        # "small non-negative integers, exact in BF16" assumption fails
-        # at prefill scale (R62.1). The columns are write-only today,
-        # but carry exact integers so no future consumer can silently
-        # read corrupted indices back. FP32 is integer-exact to 2^24.
-        use_sidecar = global_cap is not None
-        send_buf = torch.zeros(
-            (world, cap, D + (0 if use_sidecar else 2)), dtype=bf16, device=device
-        )
-        send_buf[dest_sorted, within, :D] = x_rows
-        send_meta = None
-        if use_sidecar:
-            send_meta = torch.zeros(
-                (world, cap, 2), dtype=torch.float32, device=device
+            x_bf = (
+                x
+                if (x.dtype == bf16 and x.is_contiguous())
+                else (x.to(bf16).contiguous())
             )
-            send_meta[..., 0] = -1.0  # padding sentinel; valid slots overwrite
-            send_meta[dest_sorted, within, 0] = (
-                flat_ids.index_select(0, order).to(torch.float32)
-            )
-            send_meta[dest_sorted, within, 1] = assign_idx.to(torch.float32)
+            send_buf, within = ep_static_pack_send(flat_ids, x_bf, world, e_local, cap)
+            send_meta = None
+            use_sidecar = False
         else:
-            send_buf[..., D] = -1.0  # padding sentinel; valid slots overwrite
-            send_buf[dest_sorted, within, D] = (
-                flat_ids.index_select(0, order).to(bf16)
+            # ---- sender-side packing (shape-stable) ----
+            dest = flat_ids // e_local
+            order = torch.argsort(dest, stable=True)
+            dest_sorted = flat_ids.index_select(0, order) // e_local
+            # scatter_add (not bincount): bincount synchronizes with the
+            # host, which is illegal under graph capture.
+            counts = torch.zeros(world, dtype=torch.int64, device=device).scatter_add_(
+                0, dest, torch.ones_like(dest)
             )
-            send_buf[dest_sorted, within, D + 1] = assign_idx.to(bf16)
+            starts = torch.cumsum(counts, 0) - counts  # exclusive, per rank
+            pos = torch.arange(N * K, device=device, dtype=torch.int64)
+            within = pos - starts.index_select(0, dest_sorted)
+            assign_idx = order  # original assignment index per sorted position
+
+            x_rows = x.repeat_interleave(K, dim=0).index_select(0, order).to(bf16)
+            # Eager path (global_cap): metadata travels in an FP32 sidecar
+            # instead of the two BF16 columns. BF16 integers are exact only
+            # below 256: eid qualifies at any chunk size, but assign_idx
+            # reaches cap-1 (24575 at the 4096-token bucket), so the
+            # "small non-negative integers, exact in BF16" assumption fails
+            # at prefill scale (R62.1). The columns are write-only today,
+            # but carry exact integers so no future consumer can silently
+            # read corrupted indices back. FP32 is integer-exact to 2^24.
+            use_sidecar = global_cap is not None
+            send_buf = torch.zeros(
+                (world, cap, D + (0 if use_sidecar else 2)), dtype=bf16, device=device
+            )
+            send_buf[dest_sorted, within, :D] = x_rows
+            send_meta = None
+            if use_sidecar:
+                send_meta = torch.zeros(
+                    (world, cap, 2), dtype=torch.float32, device=device
+                )
+                send_meta[..., 0] = -1.0  # padding sentinel; valid slots overwrite
+                send_meta[dest_sorted, within, 0] = flat_ids.index_select(0, order).to(
+                    torch.float32
+                )
+                send_meta[dest_sorted, within, 1] = assign_idx.to(torch.float32)
+            else:
+                send_buf[..., D] = -1.0  # padding sentinel; valid slots overwrite
+                send_buf[dest_sorted, within, D] = flat_ids.index_select(0, order).to(
+                    bf16
+                )
+                send_buf[dest_sorted, within, D + 1] = assign_idx.to(bf16)
 
         # ---- equal-split all-to-alls (no splits, no host sync) ----
         recv_buf = torch.empty_like(send_buf)
@@ -1149,9 +1163,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
             bound = cap // K
             cap_m = align(max(share, bound), _GROUPED_ALIGNMENT)
         if _masked_ws_reuse_enabled():
-            masked_in, masked_scale = _masked_ws_buffers(
-                e_local, cap_m, D, device
-            )
+            masked_in, masked_scale = _masked_ws_buffers(e_local, cap_m, D, device)
         else:
             masked_in = torch.zeros(
                 (e_local, cap_m, D), dtype=torch.float8_e4m3fn, device=device
@@ -1159,18 +1171,16 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
             masked_scale = torch.zeros(
                 (e_local, cap_m, D // FP8_BLOCK), dtype=torch.float32, device=device
             )
-        expert_start_loc = torch.arange(
-            e_local, device=device, dtype=torch.int32
-        ) * cap_m
-        output_index = torch.zeros(
-            (r_total, 1), dtype=torch.int32, device=device
+        expert_start_loc = (
+            torch.arange(e_local, device=device, dtype=torch.int32) * cap_m
         )
+        output_index = torch.zeros((r_total, 1), dtype=torch.int32, device=device)
         ep_scatter_v2(
             a_fp8,
             a_scale,
-            torch.where(
-                flat_valid, flat_local, torch.full_like(flat_local, -1)
-            ).to(torch.int32).unsqueeze(1),
+            torch.where(flat_valid, flat_local, torch.full_like(flat_local, -1))
+            .to(torch.int32)
+            .unsqueeze(1),
             cap_m,
             expert_start_loc,
             masked_in.view(e_local * cap_m, D),
@@ -1181,11 +1191,11 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         count_ids = torch.where(
             flat_valid, flat_local, torch.full_like(flat_local, e_local)
         )
-        masked_m = torch.zeros(
-            e_local + 1, dtype=torch.int64, device=device
-        ).scatter_add_(
-            0, count_ids, torch.ones_like(count_ids)
-        )[:e_local].to(torch.int32)
+        masked_m = (
+            torch.zeros(e_local + 1, dtype=torch.int64, device=device)
+            .scatter_add_(0, count_ids, torch.ones_like(count_ids))[:e_local]
+            .to(torch.int32)
+        )
         if global_cap is not None:
             # Track per-expert capacity overflow device-side (zero host
             # sync): an expert whose real count exceeds cap_m would already
@@ -1203,9 +1213,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         expected_m = max(1, min(cap_m, r_total // max(e_local, 1)))
 
         # GEMM 1 (masked): gate+up
-        gate_up = torch.empty(
-            (e_local, cap_m, 2 * inter), device=device, dtype=bf16
-        )
+        gate_up = torch.empty((e_local, cap_m, 2 * inter), device=device, dtype=bf16)
         m_grouped_fp8_gemm_nt_masked(
             (masked_in, masked_scale),
             (self._w13, self._s13),
@@ -1220,7 +1228,10 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         )
         down = torch.empty((e_local, cap_m, D), device=device, dtype=bf16)
         m_grouped_fp8_gemm_nt_masked(
-            (h_fp8.view(e_local, cap_m, inter), h_scale.view(e_local, cap_m, inter // FP8_BLOCK)),
+            (
+                h_fp8.view(e_local, cap_m, inter),
+                h_scale.view(e_local, cap_m, inter // FP8_BLOCK),
+            ),
             (self._w2, self._s2),
             down,
             masked_m,
@@ -1237,10 +1248,18 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         dist.all_to_all_single(recv_back, send_back)
 
         # ---- deterministic sender-side reduce ----
-        assign_out = torch.zeros((N * K, D), dtype=torch.float32, device=device)
         flat_back = recv_back.reshape(r_total, D)
-        got = flat_back[dest_sorted * cap + within]
-        assign_out.index_copy_(0, assign_idx, got.float())
+        if pack_fused:
+            # Assignment-indexed slot lookup: dest[i] * cap + within[i] is
+            # the slot assignment i was written to, so the gather lands rows
+            # directly in assignment order -- the aten form's index_copy on
+            # the argsort permutation, folded away (R483 equivalence).
+            slot = (flat_ids // e_local).to(torch.int64) * cap + within.to(torch.int64)
+            assign_out = flat_back[slot].float()
+        else:
+            assign_out = torch.zeros((N * K, D), dtype=torch.float32, device=device)
+            got = flat_back[dest_sorted * cap + within]
+            assign_out.index_copy_(0, assign_idx, got.float())
         y = (assign_out.view(N, K, D) * flat_w.view(N, K, 1)).sum(dim=1)
         return y
 
@@ -1271,9 +1290,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
                 f"{cap_tokens}; raise DSV4_EP_STATIC_EAGER_CAP_TOKENS"
             )
         K = indices.size(1)
-        return self._forward_ep_static(
-            x, weights, indices, global_cap=cap_tokens * K
-        )
+        return self._forward_ep_static(x, weights, indices, global_cap=cap_tokens * K)
 
     # ------------------------------------------------------------------
     # DeepEP low-latency EP (production decode + CUDA-graph pattern)
@@ -1398,7 +1415,9 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         )
         expected_m = max(1, min(M_tot, (N * K * world) // max(e_local, 1)))
 
-        gate_up = torch.empty((E, M_tot, 2 * inter), device=device, dtype=torch.bfloat16)
+        gate_up = torch.empty(
+            (E, M_tot, 2 * inter), device=device, dtype=torch.bfloat16
+        )
         m_grouped_fp8_gemm_nt_masked(
             (a_fp8.view(E, M_tot, D), a_scale.view(E, M_tot, D // FP8_BLOCK)),
             (self._w13, self._s13),
