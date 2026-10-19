@@ -271,6 +271,15 @@ class V4Transformer(nn.Module):
                 for i in range(args.n_layers)
             ]
         )
+        # P8 full-boundary fusion (R475): each block gets pointers to the
+        # next block and its attn HC unit so its ffn-post tail can fuse the
+        # block-to-block boundary under DSV4_MHC_FUSED_POST_PRE=1 and stash
+        # the next block's pre outputs on the next block; the last block
+        # keeps None (terminal head boundary stays unfused, matching the
+        # SGLang wrapper's own split).
+        for _i in range(len(self.layers) - 1):
+            self.layers[_i]._next_attn_hc = self.layers[_i + 1].attn_hc
+            self.layers[_i]._next_block = self.layers[_i + 1]
 
         # MTP draft is a separate model (``DeepSeekV4MtpModel``) that
         # holds its own V4Transformer — no MTP layers live on the main

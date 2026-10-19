@@ -217,6 +217,17 @@ class Block(nn.Module):
         self._prefill_fast_hc_impls_cached = self._resolve_prefill_fast_hc_impls()
         self._mega_csa_adapter = None
         self._mega_hca_adapter = None
+        # P8 full-boundary fusion (R475 second site): the next block's attn
+        # HC unit and the next block itself, wired by V4Transformer after
+        # the layer list is built; None on the last block (its ffn-post
+        # feeds _hc_head_reduce, which stays unfused, matching the SGLang
+        # wrapper's own terminal split).
+        self._next_attn_hc = None
+        self._next_block = None
+        # This block's fused pre outputs stashed by the PREVIOUS block's
+        # fused ffn-post tail during the same forward pass (Python flow
+        # control at capture time only; replay reads none of it).
+        self._fused_next_pre = None
 
     def enable_mega_csa(self, runtime, layer_weights: Dict[str, torch.Tensor]) -> None:
         """Attach the TP1 CSA adapter only to compress-ratio-4 layers."""
@@ -469,6 +480,12 @@ class Block(nn.Module):
         """
         from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 
+        # P8 second-site stash: consume-and-clear up front so a mega-branch
+        # layer drops the previous block's pre outputs cleanly instead of
+        # leaking stale state into the next forward pass.
+        _pre_state = self._fused_next_pre
+        self._fused_next_pre = None
+
         _dbg_layer = _rt.should_record_layer(self.layer_id)
         mega_adapter = self._mega_csa_adapter or self._mega_hca_adapter
         use_mega_attention = (
@@ -487,12 +504,20 @@ class Block(nn.Module):
         else:
             # Attention path
             residual = x
-            x_pre, post, comb = self.attn_hc.pre(
-                x,
-                dbg_tag=(
-                    f"L{self.layer_id:02d}_decode_attn_hc_pre" if _dbg_layer else None
-                ),
-            )
+            if _pre_state is not None:
+                # The previous block's fused ffn-post -> this attn-pre
+                # boundary already produced these (R475 second site); the
+                # fused op ran against this block's own attn_hc weights.
+                x_pre, post, comb = _pre_state
+            else:
+                x_pre, post, comb = self.attn_hc.pre(
+                    x,
+                    dbg_tag=(
+                        f"L{self.layer_id:02d}_decode_attn_hc_pre"
+                        if _dbg_layer
+                        else None
+                    ),
+                )
             # Framework RMSNorm wants 2D. Attention keeps the original 3D shape.
             bsz, q_len, dim_ = x_pre.shape
             x_pre = self.attn_norm(x_pre.reshape(bsz * q_len, dim_)).view(
@@ -538,6 +563,40 @@ class Block(nn.Module):
         ffn_out = self.ffn(x_pre, input_ids, is_decode_forward=True)
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_ffn_out", ffn_out)
+        # P8 full-boundary second site: fuse this ffn-post with the next
+        # block's attn-pre (R475; the wrapper contract is the same 4-tuple
+        # the first site consumes). Stash the next block's pre outputs; the
+        # last block (no _next_attn_hc) and T > 32 stay on the unfused pair.
+        next_hc = self._next_attn_hc
+        if (
+            self._fused_boundary_enabled()
+            and next_hc is not None
+            and residual.shape[:-2].numel() <= 32
+        ):
+            from rtp_llm.models_py.modules.dsv4.hc.mhc_tilelang import (
+                tk_mhc_fused_post_pre,
+            )
+
+            _out = tk_mhc_fused_post_pre(
+                ffn_out,
+                residual,
+                post,
+                comb,
+                next_hc.fn,
+                next_hc.scale,
+                next_hc.base,
+                norm_eps=next_hc.norm_eps,
+                pre_eps=next_hc.hc_eps,
+                sinkhorn_eps=next_hc.hc_eps,
+                sinkhorn_iters=next_hc.hc_sinkhorn_iters,
+                hc_mult=next_hc.hc_mult,
+            )
+            if _out is not None:
+                x, post2, comb2, x_pre2 = _out
+                # Stash the next block's pre outputs ON the next block (the
+                # head consume-and-clear reads them there next call).
+                self._next_block._fused_next_pre = (x_pre2, post2, comb2)
+                return x
         x = self.ffn_hc.post(ffn_out, residual, post, comb)
         return x
 
