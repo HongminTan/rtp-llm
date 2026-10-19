@@ -63,8 +63,11 @@ class EPStaticPackParityTest(unittest.TestCase):
     def _check_case(self, num_tokens, invalid_frac, seed):
         ids, x = _make_inputs(num_tokens, invalid_frac, seed)
         send_ref = _aten_chain(ids, x)
+        # Drive the engine call form exactly (mr1-trace-01 lesson): the
+        # executor passes its already-flattened 1-D flat_ids into the
+        # wrapper, so the parity gate must exercise that shape.
         send_fused, _within = ep_static_pack_send(
-            ids, x, WORLD, E_LOCAL, num_tokens * K
+            ids.reshape(-1), x, WORLD, E_LOCAL, num_tokens * K
         )
         self.assertTrue(
             torch.equal(send_ref, send_fused),
@@ -86,7 +89,7 @@ class EPStaticPackParityTest(unittest.TestCase):
 
         ids, x = _make_inputs(8, 0.2, 3001)
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            ep_static_pack_send(ids, x, WORLD, E_LOCAL, 8 * K)
+            ep_static_pack_send(ids.reshape(-1), x, WORLD, E_LOCAL, 8 * K)
         kernel_names = [e.name for e in prof.events() if "CUDA" in str(e.device_type)]
         fused_kernels = [
             n

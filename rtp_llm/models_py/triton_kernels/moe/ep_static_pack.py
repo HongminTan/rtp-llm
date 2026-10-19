@@ -134,7 +134,9 @@ def ep_static_pack_send(
     """Fused replacement for the aten sender-side packing chain.
 
     Args:
-      ids: int64 [N, K] raw router ids (invalid sentinels allowed).
+      ids: int64 flat [N * K] raw router ids (invalid sentinels allowed) --
+        the executor passes its already-flattened ``flat_ids``; a [N, K]
+        view works too (any reshapeable-to-flat layout).
       x: bf16 [N, D] token activations.
       world / e_local: EP geometry.
       cap: per-destination slot count (N * K on the capture path).
@@ -148,10 +150,9 @@ def ep_static_pack_send(
     assert ids.dtype == torch.int64
     assert x.dtype == torch.bfloat16
     N, D = x.shape
-    M = N * ids.size(1)
-    K = ids.size(1)
-
     flat_ids = ids.reshape(-1)
+    M = flat_ids.numel()
+    K = M // N
     within = torch.empty(M, dtype=torch.int32, device=x.device)
     send_buf = torch.empty(world * cap * (D + 2), dtype=torch.bfloat16, device=x.device)
 
