@@ -81,8 +81,12 @@ def _static_pack_fused_enabled() -> bool:
     argsort/count/cumsum/index_put chain in ``_forward_ep_static`` for the
     three Triton kernels in ``triton_kernels/moe/ep_static_pack.py``.
     Capture path only (global_cap is None checked at the call site); the
-    aten chain stays the default and the eager/sidecar variant's fallback."""
-    return os.environ.get("DSV4_EP_STATIC_PACK_FUSED", "0") == "1"
+    aten chain stays the fallback and the eager/sidecar variant's path.
+    Default ON per the r263 final-verification ruling: 4/4 paired decode
+    points improved (R504) with all five negative-control buckets stable;
+    the in-graph NCCL rendezvous spin (+1.1 ms/step kernel busy) is a
+    wall-clock-invisible absorption face in the paired data."""
+    return os.environ.get("DSV4_EP_STATIC_PACK_FUSED", "1") != "0"
 
 
 def _static_eager_enabled() -> bool:
