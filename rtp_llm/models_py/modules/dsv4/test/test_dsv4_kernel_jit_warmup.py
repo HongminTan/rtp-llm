@@ -687,8 +687,15 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
         root.add_module("attn_same_shape", Attention())
         root.add_module("no_wo_a", nn.Linear(1, 1))
 
+        attention_fp32 = nn.Module()
+        attention_fp32.register_buffer("_wo_a_stk_w", torch.empty((2, 1024, 4096)))
+        attention_fp32.register_buffer("_wo_a_stk_s", torch.ones((2, 8, 32)))
+        root.add_module("attn_fp32", attention_fp32)
+
         shapes = _collect_dsv4_batched_fp8_einsum_shapes(root)
-        self.assertEqual(sorted(shapes.keys()), [(8, 1024, 4096)])
+        self.assertEqual(sorted(shapes.keys()), [(2, 1024, 4096), (8, 1024, 4096)])
+        self.assertFalse(shapes[(2, 1024, 4096)]["scale_ue8m0"])
+        self.assertTrue(shapes[(8, 1024, 4096)]["scale_ue8m0"])
         self.assertEqual(shapes[(8, 1024, 4096)]["name"], "attn")
 
     def test_collect_fp8_mqa_logits_shapes_uses_indexer_modules(self):

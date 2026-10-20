@@ -1263,11 +1263,24 @@ def _collect_dsv4_batched_fp8_einsum_shapes(
         k_value = int(weight.shape[2])
         if groups <= 0 or n_value <= 0 or k_value <= 0:
             continue
-        if int(scale.shape[0]) != groups or int(scale.shape[1]) < n_value:
+        scale_ue8m0 = scale.dtype == torch.int32
+        if scale.dtype not in (torch.int32, torch.float32):
+            continue
+        expected_scale_shape = (
+            (groups, n_value, _ceil_div(k_value, 512))
+            if scale_ue8m0
+            else (groups, _ceil_div(n_value, 128), _ceil_div(k_value, 128))
+        )
+        if tuple(scale.shape) != expected_scale_shape:
             continue
         key = (groups, n_value, k_value)
         if key not in shapes:
-            shapes[key] = {"name": module_name, "weight": weight, "scale": scale}
+            shapes[key] = {
+                "name": module_name,
+                "weight": weight,
+                "scale": scale,
+                "scale_ue8m0": scale_ue8m0,
+            }
 
     logging.info(
         "[DSV4 BatchedFP8Einsum] collected wo_a shapes: count=%d shapes=%s",
@@ -1764,12 +1777,16 @@ def warmup_dense_gemm_jit(
     num_sms = _get_deep_gemm_num_sms(device)
     shape_keys = tuple(sorted(shapes.keys()))
     m_grids = {
-        key: _generate_dense_gemm_warmup_m_grid(
-            max_m=int(max_m),
-            n_value=int(key[1]),
-            k_value=int(key[2]),
-            kind=str(key[0]),
-            num_sms=num_sms,
+        key: (
+            _generate_dense_gemm_warmup_m_grid(
+                max_m=int(max_m),
+                n_value=int(key[1]),
+                k_value=int(key[2]),
+                kind=str(key[0]),
+                num_sms=num_sms,
+            )
+            if shapes[key].get("scale_ue8m0", True)
+            else tuple(_dense_gemm_m_grid(int(max_m)))
         )
         for key in shape_keys
     }
@@ -1846,13 +1863,17 @@ def warmup_batched_fp8_einsum_jit(
     num_sms = _get_deep_gemm_num_sms(device)
     shape_keys = tuple(sorted(shapes.keys()))
     m_grids = {
-        key: _generate_dense_gemm_warmup_m_grid(
-            max_m=int(max_m),
-            n_value=int(key[1]),
-            k_value=int(key[2]),
-            kind="fp8_batched",
-            num_sms=num_sms,
-            num_groups=int(key[0]),
+        key: (
+            _generate_dense_gemm_warmup_m_grid(
+                max_m=int(max_m),
+                n_value=int(key[1]),
+                k_value=int(key[2]),
+                kind="fp8_batched",
+                num_sms=num_sms,
+                num_groups=int(key[0]),
+            )
+            if shapes[key]["scale_ue8m0"]
+            else tuple(_dense_gemm_m_grid(int(max_m)))
         )
         for key in shape_keys
     }
@@ -2481,13 +2502,17 @@ def _launch_dummy_batched_fp8_einsum(
         k_value=k_value,
         device=device,
     )
+    scale_ue8m0 = info["scale_ue8m0"]
+    if not scale_ue8m0:
+        packed = a_scale.contiguous().view(torch.uint8).to(torch.int32)
+        a_scale = (packed - 127).to(torch.float32).exp2()
     out = torch.empty((m_value, groups, n_value), dtype=torch.bfloat16, device=device)
     deep_gemm.fp8_einsum(
         "bhr,hdr->bhd",
         (a, a_scale),
         (info["weight"], info["scale"]),
         out,
-        recipe=(1, 1, 128),
+        recipe=(1, 1 if scale_ue8m0 else 128, 128),
     )
     del a, a_scale, out
 

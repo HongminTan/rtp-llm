@@ -33,7 +33,7 @@ from deep_gemm.utils.layout import (  # noqa: E402
     get_mn_major_tma_aligned_packed_ue8m0_tensor,
 )
 
-from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton import (
     fused_inv_rope_fp8_quant,
 )
@@ -76,7 +76,7 @@ from rtp_llm.models_py.modules.dsv4.fp8.compressor import CompressorFP8, Compres
 from rtp_llm.models_py.modules.dsv4.fp8.indexer import IndexerFP8
 from rtp_llm.models_py.modules.dsv4.prefill_workspace import PrefillWorkspace
 from rtp_llm.models_py.modules.dsv4.rope import precompute_freqs_cis
-from rtp_llm.models_py.modules.factory.linear import LinearFactory
+from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
 from rtp_llm.models_py.utils.memory import dispose_tensor
 
 
@@ -285,8 +285,6 @@ def _build_suffix_cp_sliced_slot_mapping(
     return torch.where(valid, slot, torch.full_like(slot, -1)).contiguous()
 
 
-_V4_FP8_BLOCK_CFG = Fp8BlockWiseQuantConfig()
-
 _DSV4_FP8_KV_ENTRY_BYTES = 584
 
 # Call sites whose first byte-sliced (CP-RR) SWA cache write has been logged.
@@ -335,82 +333,41 @@ if _FLASH_MLA_SPARSE_Q_CHUNK <= 0:
     )
 
 
-def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
-    """V4 ckpt UE8M0 ``[N/128, K/128]`` → DeepGEMM ``[N, K/128]`` UE8M0
-    int32-packed TMA-aligned scale.  Row-repeats by 128 along N so each
-    weight row gets its own scale row, then hands off to DeepGEMM's
-    ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` (column-major,
-    int32-packed).  Must be called on-device (DeepGEMM helper is CUDA)."""
-    assert scale.dtype == torch.float8_e8m0fnu, f"unexpected scale dtype {scale.dtype}"
-    assert scale.dim() == 2, f"unexpected scale dim {scale.dim()}"
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
-
-    N_blk, _ = scale.shape
-    N = N_blk * 128
-    idx = torch.arange(N, device=scale.device) // 128
-    scale_rep = scale.float().index_select(-2, idx)
-    return get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_rep)
-
-
 def _prepare_wo_a_stacked(
     weight_fp8: torch.Tensor,
     scale_raw: torch.Tensor,
     G: int,
     R: int,
     K: int,
+    *,
+    use_ue8m0: bool,
 ) -> tuple:
-    """Stack V4 wo_a ckpt (``[G*R, K]`` fp8 + ``[G*R/128, K/128]`` e8m0fnu)
-    into the ``fp8_einsum``-expected layout, computed once at init:
-
-    - weight: ``[G, R, K]`` fp8 contiguous (free view)
-    - scale : ``[G, R, K/512]`` int32 UE8M0 packed, MN-major TMA-aligned
-      (stride ``(K/512 * tma_R, 1, tma_R)``)
-
-    Cast e8m0fnu → fp32, row-repeat by 128 along R so
-    ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` (which operates on
-    fp32 ``[*, mn, k/128]``) sees the full [G, R, K/128] grid.  The helper
-    floor-log2 bitcasts each block scale and packs 4 UE8M0 bytes per
-    int32; output shape ``[G, R, K/512]`` matches
-    ``deep_gemm.fp8_einsum(..., recipe=(1, 1, 128))`` expectations."""
+    """Prepare raw checkpoint FP8 weights and E8M0 block scales for wo_a."""
+    assert (
+        weight_fp8.dtype == torch.float8_e4m3fn
+    ), f"wo_a requires FP8 E4M3 weights, got {weight_fp8.dtype}"
+    assert (
+        scale_raw.dtype == torch.float8_e8m0fnu
+    ), f"wo_a requires raw E8M0 block scales, got {scale_raw.dtype}"
+    assert (
+        G > 0 and R > 0 and K > 0 and R % 128 == 0 and K % 128 == 0
+    ), f"wo_a requires positive dimensions and 128-aligned R/K, got {G=}, {R=}, {K=}"
+    assert weight_fp8.shape == (
+        G * R,
+        K,
+    ), f"wo_a weight shape {tuple(weight_fp8.shape)} != {(G * R, K)}"
+    assert scale_raw.shape == (
+        G * R // 128,
+        K // 128,
+    ), f"wo_a scale shape {tuple(scale_raw.shape)} != {(G * R // 128, K // 128)}"
     w_stk = weight_fp8.view(G, R, K).contiguous()
     scale_fp32 = scale_raw.float().view(G, R // 128, K // 128)
+    if not use_ue8m0:
+        return w_stk, scale_fp32.contiguous()
     idx = torch.arange(R, device=scale_raw.device) // 128
-    scale_rep = scale_fp32.index_select(-2, idx).contiguous()  # [G, R, K/128]
+    scale_rep = scale_fp32.index_select(-2, idx).contiguous()
     s_stk = get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_rep)
     return w_stk, s_stk
-
-
-def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
-    """Build a CudaFp8DeepGEMMLinear from raw V4 FP8 weight + scale tensors.
-
-    Repacks the UE8M0 ``float8_e8m0fnu`` scale into DeepGEMM's int32
-    TMA-aligned packed layout when needed. Framework descriptor path may
-    deliver the scale already packed (dtype int32) — we no-op then."""
-    assert s is not None, "expected non-null FP8 scale"
-    if s.dtype == torch.float8_e8m0fnu:
-        s = _repack_v4_fp8_scale_to_int32(s)
-    # LinearFactory.create_linear_from_weights consumes a (weights_dict,
-    # weight_key, scale_key) triple — feed it a one-shot dict so the
-    # factory plumbing is unchanged.
-    local = {"_w": w, "_s": s}
-    return LinearFactory.create_linear_from_weights(
-        local,
-        "_w",
-        "_s",
-        quant_config=_V4_FP8_BLOCK_CFG,
-    )
-
-
-def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):
-    """Backwards-compat bridge over ``_v4_fp8_linear`` for callers that
-    still pass a flat dict + keys.  Mutates ``weights[scale_key]`` to the
-    packed form so subsequent callers don't repack."""
-    w = weights[weight_key]
-    s = weights[scale_key]
-    if s.dtype == torch.float8_e8m0fnu:
-        s = _repack_v4_fp8_scale_to_int32(s)
-        weights[scale_key] = s
-    return _v4_fp8_linear(w, s)
 
 
 def _get_window_topk_idxs(
@@ -963,28 +920,42 @@ class AttentionFP8(nn.Module):
         self.wkv = _fp8_w_s(W.v4_attn_wkv_w, W.v4_attn_wkv_s)
 
         # wo_a grouped projection: row-split along (n_groups*o_lora_rank).
-        # Stored as plain ``[N, K]`` fp8 weight + UE8M0 scale tensors;
-        # the ``fp8_einsum`` production path uses the pre-stacked
-        # ``_wo_a_stk_w`` / ``_wo_a_stk_s`` buffers below, the BF16
-        # fallback path inline-dequants from these via
-        # ``dequantize_fp8_weight``.
+        # Prepare scales for the selected FP8 projection backend.
         assert (n_heads * head_dim) % o_groups == 0
         wo_a_w = layer_weights[W.v4_attn_wo_a_w]
         wo_a_s = layer_weights[W.v4_attn_wo_a_s]
+        wo_a_n = o_groups * o_lora_rank
+        wo_a_k = n_heads * head_dim // o_groups
+        assert wo_a_w.shape == (
+            wo_a_n,
+            wo_a_k,
+        ), f"wo_a checkpoint weight shape {tuple(wo_a_w.shape)} != {(wo_a_n, wo_a_k)}"
+        assert wo_a_s.shape == (wo_a_n // 128, wo_a_k // 128), (
+            f"wo_a checkpoint scale shape {tuple(wo_a_s.shape)} "
+            f"!= {(wo_a_n // 128, wo_a_k // 128)}"
+        )
         if tp_size > 1:
+            assert (
+                wo_a_row_slice.start % 128 == 0 and wo_a_row_slice.stop % 128 == 0
+            ), "wo_a TP slices must align to 128-row scale blocks"
             wo_a_w = wo_a_w[wo_a_row_slice].contiguous()
-            if wo_a_s.dtype == torch.int32:
-                # framework path: scale is already (N, K//128//4) int32
-                wo_a_s = wo_a_s[wo_a_row_slice].contiguous()
-            else:
-                wo_a_s = wo_a_s[
-                    wo_a_row_slice.start // 128 : wo_a_row_slice.stop // 128
-                ].contiguous()
+            wo_a_s = wo_a_s[
+                wo_a_row_slice.start // 128 : wo_a_row_slice.stop // 128
+            ].contiguous()
         self.wo_a_w = wo_a_w
         self.wo_a_s = wo_a_s
         K_local = n_heads_local * head_dim // n_groups_local
+        use_ue8m0 = is_deep_gemm_e8m0_used()
+        self._wo_a_project_impl = (
+            self._wo_a_einsum_ue8m0 if use_ue8m0 else self._wo_a_einsum_fp32
+        )
         _stk_w, _stk_s = _prepare_wo_a_stacked(
-            wo_a_w, wo_a_s, n_groups_local, o_lora_rank, K_local
+            wo_a_w,
+            wo_a_s,
+            n_groups_local,
+            o_lora_rank,
+            K_local,
+            use_ue8m0=use_ue8m0,
         )
         self.register_buffer("_wo_a_stk_w", _stk_w, persistent=False)
         self.register_buffer("_wo_a_stk_s", _stk_s, persistent=False)
@@ -1981,19 +1952,19 @@ class AttentionFP8(nn.Module):
         y = layer.forward_quantized(*quantized_input)
         return y.view(*shape[:-1], y.shape[-1])
 
-    def _wo_a_einsum_from_fp8(
+    def _wo_a_project_from_fp8(
         self, o_fp8: torch.Tensor, o_scale: torch.Tensor, B: int, S: int
     ) -> torch.Tensor:
-        """One ``fp8_einsum`` call on pre-quantized activations.
+        M, G, _ = o_fp8.shape
+        out = torch.empty(
+            M, G, self.o_lora_rank, dtype=torch.bfloat16, device=o_fp8.device
+        )
+        self._wo_a_project_impl(o_fp8, o_scale, out)
+        return out.view(B, S, G, self.o_lora_rank)
 
-        ``fused_inv_rope_fp8_quant`` emits ``(o_fp8 [M, G, K], o_scale
-        [M, G, K/512])`` in the exact layout ``deep_gemm.fp8_einsum``
-        consumes, so the wo_a projection is a single einsum launch.
-        Matches vLLM ``deepseek_v4_attention.py:325`` (same
-        ``"bhr,hdr->bhd"`` + recipe ``(1, 1, 128)`` for SM100 UE8M0)."""
-        M, G, _K = o_fp8.shape
-        R = self.o_lora_rank
-        out = torch.empty(M, G, R, dtype=torch.bfloat16, device=o_fp8.device)
+    def _wo_a_einsum_ue8m0(
+        self, o_fp8: torch.Tensor, o_scale: torch.Tensor, out: torch.Tensor
+    ) -> None:
         deep_gemm.fp8_einsum(
             "bhr,hdr->bhd",
             (o_fp8, o_scale),
@@ -2001,7 +1972,19 @@ class AttentionFP8(nn.Module):
             out,
             recipe=(1, 1, 128),
         )
-        return out.view(B, S, G, R)
+
+    def _wo_a_einsum_fp32(
+        self, o_fp8: torch.Tensor, o_scale: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        packed = o_scale.contiguous().view(torch.uint8).to(torch.int32)
+        o_scale_f32 = (packed - 127).to(torch.float32).exp2()
+        deep_gemm.fp8_einsum(
+            "bhr,hdr->bhd",
+            (o_fp8, o_scale_f32),
+            (self._wo_a_stk_w, self._wo_a_stk_s),
+            out,
+            recipe=(1, 128, 128),
+        )
 
     def forward_decode(
         self,
@@ -5713,8 +5696,8 @@ class AttentionFP8(nn.Module):
                 nope_dim=self.head_dim - self.rope_head_dim,
                 rope_head_dim=self.rope_head_dim,
             )
-        with record_function_range("dsv4.fp8.attn.out.wo_a_einsum"):
-            o_proj = self._wo_a_einsum_from_fp8(o_fp8, o_scale, 1, seqlen)
+        with record_function_range("dsv4.fp8.attn.out.wo_a"):
+            o_proj = self._wo_a_project_from_fp8(o_fp8, o_scale, 1, seqlen)
         with record_function_range("dsv4.fp8.attn.out.wo_b"):
             wo_b_in = o_proj.flatten(2).reshape(seqlen, -1)
             self.wo_b(wo_b_in, out=out)

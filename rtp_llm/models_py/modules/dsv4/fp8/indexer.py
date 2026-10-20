@@ -336,7 +336,7 @@ class IndexerFP8(PoolBackedModule):
         self.softmax_scale = self.head_dim**-0.5
         self.compress_ratio = compress_ratio
 
-        from rtp_llm.models_py.modules.dsv4.fp8.attention import _v4_fp8_linear
+        from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
         from rtp_llm.utils.model_weight import W
 
         self.wq_b = _v4_fp8_linear(

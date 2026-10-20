@@ -863,6 +863,7 @@ py_wheel(
 py_package(
     name = "rtp_llm_deepgemm_pkg",
     deps = select({
+        "@//:using_cuda12_9_x86": [],
         "@//:using_cuda13_x86": [],
         "@//:using_cuda13_arm": [],
         "@//:using_cuda12": ["@deep_gemm_ext//:deep_gemm"],

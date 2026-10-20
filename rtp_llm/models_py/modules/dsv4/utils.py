@@ -4,6 +4,7 @@ import torch
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
 
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 
 _V4_FP8_BLOCK_CFG = Fp8BlockWiseQuantConfig()
@@ -21,11 +22,26 @@ def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
     return get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_rep)
 
 
+def _v4_fp8_scale_relabelled_fp32(w: torch.Tensor, scale: torch.Tensor) -> tuple:
+    assert scale.dtype == torch.float8_e8m0fnu, f"unexpected scale dtype {scale.dtype}"
+    assert scale.dim() == 2 and w.dim() == 2, "expected 2D weight and scale"
+    n, k = w.shape
+    n_blk, k_blk = scale.shape
+    assert n_blk == n // 128 and k_blk == k // 128, (
+        f"scale {tuple(scale.shape)} is not the 128x128 block grid of "
+        f"weight {tuple(w.shape)}"
+    )
+    # The FP32-scale linear constructor reads [K, N], then reshapes to [N, K].
+    return w.reshape(k, n), scale.float().reshape(k_blk, n_blk)
+
+
 def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
-    """Build a CudaFp8DeepGEMMLinear from raw V4 FP8 weight + scale tensors."""
     assert s is not None, "expected non-null FP8 scale"
     if s.dtype == torch.float8_e8m0fnu:
-        s = _repack_v4_fp8_scale_to_int32(s)
+        if is_deep_gemm_e8m0_used():
+            s = _repack_v4_fp8_scale_to_int32(s)
+        else:
+            w, s = _v4_fp8_scale_relabelled_fp32(w, s)
     local = {"_w": w, "_s": s}
     return LinearFactory.create_linear_from_weights(
         local,
@@ -36,10 +52,9 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
 
 
 def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):
-    """Backwards-compat bridge over ``_v4_fp8_linear`` for flat dict callers."""
     w = weights[weight_key]
     s = weights[scale_key]
-    if s.dtype == torch.float8_e8m0fnu:
+    if s.dtype == torch.float8_e8m0fnu and is_deep_gemm_e8m0_used():
         s = _repack_v4_fp8_scale_to_int32(s)
         weights[scale_key] = s
     return _v4_fp8_linear(w, s)

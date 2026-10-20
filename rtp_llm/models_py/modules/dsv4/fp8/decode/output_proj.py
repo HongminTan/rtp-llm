@@ -46,9 +46,8 @@ def decode_output_proj(
     Fast path (CUDA, non-empty): ``fused_inv_rope_fp8_quant`` collapses
     ``apply_rotary_emb_batched`` (5 launches) + per-group
     ``per_token_group_quant_fp8`` (G launches) into ONE Triton kernel
-    emitting ``(fp8 [M, G, K], scale [M, G, K/512])`` in the UE8M0 layout
-    ``deep_gemm.fp8_einsum`` consumes. Matches vLLM
-    ``deepseek_v4_attention.py``.
+    emitting ``(fp8 [M, G, K], scale [M, G, K/512])`` with packed UE8M0
+    scales. The selected wo_a backend consumes or unpacks those scales.
 
     Eager fallback (CPU / empty): explicit inv-rotary + bf16-dequant +
     ``einsum("bsgd,grd->bsgr")``, preserved for framework warmup forwards.
@@ -64,7 +63,7 @@ def decode_output_proj(
             nope_dim=attn.head_dim - attn.rope_head_dim,
             rope_head_dim=attn.rope_head_dim,
         )
-        o = attn._wo_a_einsum_from_fp8(o_fp8, o_scale, bsz, q_len)
+        o = attn._wo_a_project_from_fp8(o_fp8, o_scale, bsz, q_len)
     else:
         if freqs_cis.dim() == 2 and int(freqs_cis.shape[0]) == bsz:
             apply_rotary_emb_batched(o[..., -rd:], freqs_cis, inverse=True)

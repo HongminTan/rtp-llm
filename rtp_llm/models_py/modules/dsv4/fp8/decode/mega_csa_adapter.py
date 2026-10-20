@@ -535,7 +535,7 @@ class MegaCSAAdapter:
             workspace.o_proj_fp8,
             workspace.o_proj_scale,
         )
-        o_lora = attn._wo_a_einsum_from_fp8(
+        o_lora = attn._wo_a_project_from_fp8(
             workspace.o_proj_fp8,
             workspace.o_proj_scale,
             batch_size,

@@ -124,6 +124,10 @@ def whl_deps():
             "tilelang@https://search-ad.oss-cn-hangzhou-zmf-internal.aliyuncs.com/rtp-llm-deps/dsv41/20261009/tilelang-0.1.15%2Bcuda.gita35f8ddf-cp39-abi3-linux_aarch64.whl",
             "apache-tvm-ffi==0.1.12",
         ],
+        "@rtp_llm//:using_cuda12_9_x86": [
+            "torch@https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/torch-2.8.0%2Bcu129-cp310-cp310-manylinux_2_28_x86_64.whl",
+            "deep_gemm@http://artlab.alibaba-inc.com/1/pypi/rtp_llm/deep-gemm/deep_gemm-2.5.0+d7d5eca.cu129-cp310-cp310-linux_x86_64.whl",
+        ],
         "@rtp_llm//:using_cuda12": ["torch==2.6.0+cu126"],
         "@rtp_llm//:using_rocm": [
             "pyrsmi==0.2.0",

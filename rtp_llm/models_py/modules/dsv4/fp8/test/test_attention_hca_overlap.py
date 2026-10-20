@@ -865,7 +865,7 @@ class PrefillOutputProjectionContractTest(unittest.TestCase):
             device=device,
         )
         o_proj = torch.randn(1, seqlen, 1, 5, dtype=torch.bfloat16, device=device)
-        layer._wo_a_einsum_from_fp8 = MagicMock(  # type: ignore[assignment]
+        layer._wo_a_project_from_fp8 = MagicMock(  # type: ignore[assignment]
             return_value=o_proj
         )
         out = torch.empty(seqlen, layer.dim, dtype=torch.bfloat16, device=device)
@@ -903,7 +903,7 @@ class PrefillOutputProjectionContractTest(unittest.TestCase):
         self.assertEqual(tuple(fused_args[0].shape), (seqlen, 2, 4))
         self.assertEqual(tuple(fused_args[1].shape), (seqlen, 2))
         self.assertEqual(fused_kwargs["n_groups"], 1)
-        layer._wo_a_einsum_from_fp8.assert_called_once_with(
+        layer._wo_a_project_from_fp8.assert_called_once_with(
             fused_ret[0], fused_ret[1], 1, seqlen
         )
         self.assertEqual(len(wo_b_calls), 1)
