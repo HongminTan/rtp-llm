@@ -1,18 +1,13 @@
-"""Resolve the FlashMLA runtime for existing MLA/DSv4 cache formats.
+"""Resolve and cache FlashMLA for the existing MLA/DSv4 cache formats."""
 
-CUDA13 ARM ships separate current V4.1 and legacy wheels. Other platform locks
-retain their original FlashMLA distribution, so use that only when the isolated
-legacy distribution is absent. V4.1 never imports this module.
-
-Resolution happens per attribute access (``import_module`` consults
-``sys.modules`` first), so tests that substitute a fake module under either
-name intercept these imports, and restoring ``sys.modules`` restores the real
-backend without stale caching here.
-"""
-
+import logging
+from functools import cache
 from importlib import import_module
 
 
+# Cache successful resolution: a missing legacy wheel otherwise triggers an
+# import-finder search on every attention call before falling back to flash_mla.
+@cache
 def get_legacy_flash_mla():
     try:
         return import_module("flash_mla_legacy")
@@ -22,5 +17,19 @@ def get_legacy_flash_mla():
         return import_module("flash_mla")
 
 
+def flash_mla_available() -> bool:
+    try:
+        backend = get_legacy_flash_mla()
+        getattr(backend, "flash_mla_sparse_fwd")
+        getattr(backend, "flash_mla_with_kvcache")
+        getattr(backend, "get_mla_metadata")
+        return True
+    except (ImportError, AttributeError, OSError, ValueError, RuntimeError) as error:
+        logging.warning("[dsv4-fp8] FlashMLA unavailable: %s", error)
+        return False
+
+
 def __getattr__(name):
+    if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     return getattr(get_legacy_flash_mla(), name)

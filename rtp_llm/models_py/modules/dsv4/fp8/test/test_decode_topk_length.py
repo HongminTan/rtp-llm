@@ -346,6 +346,9 @@ class DecodeTopkLengthPlumbingTest(unittest.TestCase):
         fake.flash_mla_with_kvcache = fake_kv
         old = sys.modules.get("flash_mla")
         old_flash_mla_legacy = sys.modules.get("flash_mla_legacy")
+        from rtp_llm.models_py.utils.flash_mla_legacy import get_legacy_flash_mla
+
+        get_legacy_flash_mla.cache_clear()
         # The production shim prefers the isolated legacy wheel; alias the
         # fake under both names so the mock still intercepts it.
         sys.modules["flash_mla"] = fake
@@ -364,10 +367,11 @@ class DecodeTopkLengthPlumbingTest(unittest.TestCase):
                 sys.modules.pop("flash_mla", None)
             else:
                 sys.modules["flash_mla"] = old
-        if old_flash_mla_legacy is None:
-            sys.modules.pop("flash_mla_legacy", None)
-        else:
-            sys.modules["flash_mla_legacy"] = old_flash_mla_legacy
+            if old_flash_mla_legacy is None:
+                sys.modules.pop("flash_mla_legacy", None)
+            else:
+                sys.modules["flash_mla_legacy"] = old_flash_mla_legacy
+            get_legacy_flash_mla.cache_clear()
         return calls
 
     def test_dual_paged_forwards_both_lengths(self) -> None:

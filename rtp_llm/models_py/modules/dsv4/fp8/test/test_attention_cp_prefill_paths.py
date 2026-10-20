@@ -416,7 +416,11 @@ class AttentionRawQMergeWorkspaceTest(unittest.TestCase):
                 torch.zeros(q.shape[0], q.shape[1], dtype=torch.float32),
             )
 
+        from rtp_llm.models_py.utils.flash_mla_legacy import get_legacy_flash_mla
+
+        get_legacy_flash_mla.cache_clear()
         with ExitStack() as stack:
+            stack.callback(get_legacy_flash_mla.cache_clear)
             stack.enter_context(
                 patch.dict(
                     sys.modules,
