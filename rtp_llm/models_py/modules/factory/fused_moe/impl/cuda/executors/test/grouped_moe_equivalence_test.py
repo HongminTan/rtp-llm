@@ -13,6 +13,10 @@ import unittest
 import torch
 import torch.nn.functional as F
 
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.grouped_fp4 import (
     GroupedFp4Executor,
     _has_fp8_fp4_grouped_kernel,
@@ -23,6 +27,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.local_loop 
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
     ChunkedFp8Fp4MoeLayer as MoE,
 )
+from rtp_llm.ops import MoeConfig, ParallelismConfig
 from rtp_llm.utils.model_weight import W
 
 
@@ -158,24 +163,38 @@ class GroupedMoEExecutionTest(unittest.TestCase):
         hash_routing: bool = False,
         n_shared_experts: int = 1,
     ) -> MoE:
-        return MoE(
-            moe_w1_layout="gate_up",
+        model_config = ModelConfig()
+        model_config.hidden_size = 512
+        model_config.moe_inter_size = 256
+        model_config.expert_num = 16
+        model_config.moe_k = 4
+        model_config.n_shared_experts = n_shared_experts
+        model_config.routed_scaling_factor = 1.0
+        model_config.swiglu_limit = 10.0
+        model_config.moe_w1_layout = "gate_up"
+        parallelism = ParallelismConfig()
+        parallelism.ep_size = 1
+        parallelism.ep_rank = 0
+        parallelism.world_size = 1
+        parallelism.world_rank = 0
+        parallelism.dp_size = 1
+        parallelism.dp_rank = 0
+        moe_config = MoeConfig()
+        moe_config.moe_strategy = strategy
+        config = MoEConfigAdapter(model_config, parallelism, moe_config).for_layer(
             layer_id=layer_id,
-            dim=512,
             moe_inter_dim=256,
-            n_routed_experts=16,
-            n_activated_experts=4,
-            n_shared_experts=n_shared_experts,
+            moe_w1_layout="gate_up",
+            max_tokens_per_rank=128,
+            moe_quant_method="FP8_FP4",
+            warmup_include_capacity=True,
+        )
+        return MoE(
+            config=config,
             score_func="sqrtsoftplus",
-            route_scale=1.0,
-            swiglu_limit=10.0,
             n_hash_layers=4 if hash_routing else 0,
             vocab_size=32,
             layer_weights=layer_weights,
-            ep_size=1,
-            ep_rank=0,
-            max_tokens_per_rank=128,
-            strategy=strategy,
         )
 
     def test_grouped_matches_local_loop_and_handles_empty_rank(self):

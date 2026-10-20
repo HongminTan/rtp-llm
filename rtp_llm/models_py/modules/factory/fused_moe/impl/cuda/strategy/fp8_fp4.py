@@ -2,6 +2,8 @@
 
 from typing import Any, Type
 
+import torch
+
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
@@ -125,3 +127,51 @@ class CudaLocalLoopStrategy(_CudaFp8Fp4Strategy):
         )
 
         return LocalLoopExecutor
+
+
+class CudaGroupedFp4Sm90EpStrategy(_CudaFp8Fp4Strategy):
+    """Hopper FP8 experts with the common DeepEP normal router."""
+
+    strategy_name = "grouped_fp4_sm90_ep"
+    requires_ep = True
+
+    @classmethod
+    def get_executor_class(cls) -> Type:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.grouped_fp4_sm90 import (
+            GroupedFp4Sm90Executor,
+        )
+
+        return GroupedFp4Sm90Executor
+
+    @classmethod
+    def get_router_class(cls):
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_normal_router import (
+            DeepepNormalRouterFp8Fp4,
+        )
+
+        return DeepepNormalRouterFp8Fp4
+
+    @classmethod
+    def check_conditions(cls, checker, config):
+        super().check_conditions(checker, config)
+        checker.check(config.use_deepep_moe)
+
+    def get_attributes(self) -> StrategyAttributes:
+        return StrategyAttributes(
+            router_class=self.get_router_class(),
+            executor_class=self.get_executor_class(),
+            quant_config=FusedMoEQuantConfig(
+                quant_dtype=torch.float8_e4m3fn,
+                block_shape=[128, 128],
+            ),
+        )
+
+
+class CudaGroupedFp4Sm90EpLowLatencyStrategy(CudaGroupedFp4Sm90EpStrategy):
+    @classmethod
+    def get_router_class(cls):
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router import (
+            DeepEpLowLatencyRouter,
+        )
+
+        return DeepEpLowLatencyRouter

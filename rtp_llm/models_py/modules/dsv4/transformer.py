@@ -23,6 +23,9 @@ from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 from rtp_llm.models_py.modules.dsv4.block import Block
 from rtp_llm.models_py.modules.dsv4.cp import CPContext, build_cp_context
 from rtp_llm.models_py.modules.dsv4.hc import build_hc_head
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
     synchronized_moe_chunk_plan,
 )
@@ -81,6 +84,7 @@ class V4Args:
     n_physical_experts: Optional[int] = None
     n_shared_experts: int = 1
     moe_strategy: str = "auto"
+    moe_config: Optional[MoEConfigAdapter] = None
     n_activated_experts: int = 6
     score_func: str = "sqrtsoftplus"
     route_scale: float = 1.5
@@ -160,14 +164,8 @@ def _block_kwargs(
         index_head_dim=args.index_head_dim,
         index_topk=args.index_topk,
         moe_inter_dim=args.moe_inter_dim,
-        n_routed_experts=args.n_routed_experts,
-        n_physical_experts=args.n_physical_experts,
-        n_activated_experts=args.n_activated_experts,
-        n_shared_experts=args.n_shared_experts,
-        moe_strategy=args.moe_strategy,
+        moe_config=args.moe_config,
         score_func=args.score_func,
-        route_scale=args.route_scale,
-        swiglu_limit=args.swiglu_limit,
         n_hash_layers=args.n_hash_layers,
         vocab_size=args.vocab_size,
         hc_mult=args.hc_mult,
@@ -177,10 +175,6 @@ def _block_kwargs(
         layer_weights=layer_weights,
         tp_size=args.tp_size,
         tp_rank=args.tp_rank,
-        ep_size=args.ep_size,
-        ep_rank=args.ep_rank,
-        world_size=args.world_size,
-        world_rank=args.world_rank,
         max_tokens_per_rank=args.max_tokens_per_rank,
         is_decode_role=args.is_decode_role,
         fp8_kv_cache=args.fp8_kv_cache,

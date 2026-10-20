@@ -231,6 +231,43 @@ class StrategyRegistryDiagnosticsTest(unittest.TestCase):
                 moe_config=MoeConfig(),
             )
 
+    def test_layer_configs_preserve_checkpoint_and_isolate_execution_metadata(self):
+        checkpoint_quant = CompressedW8A8Int8PerChannelQuantConfig()
+        source = _config("auto", checkpoint_quant)
+        source.model_config.moe_inter_size = 1408
+        source.moe_inter_dim = 1408
+        first = source.for_layer(
+            layer_id=0,
+            moe_inter_dim=1536,
+            moe_w1_layout="gate_up",
+            max_tokens_per_rank=256,
+            moe_quant_method="FP8_FP4",
+            warmup_include_capacity=True,
+        )
+        second = source.for_layer(
+            layer_id=1,
+            moe_inter_dim=1408,
+            moe_w1_layout="up_gate",
+            max_tokens_per_rank=64,
+            moe_quant_method="FP8_FP4",
+        )
+
+        self.assertEqual(first.moe_inter_dim, 1536)
+        self.assertEqual(first.max_tokens_per_rank, 256)
+        self.assertTrue(first.warmup_include_capacity)
+        self.assertEqual(first.layer_id, 0)
+        self.assertEqual(second.layer_id, 1)
+        self.assertFalse(second.warmup_include_capacity)
+        self.assertEqual(source.layer_id, -1)
+        self.assertEqual(source.moe_inter_dim, 1408)
+        self.assertEqual(source.model_config.moe_inter_size, 1408)
+        self.assertIs(first.quant_config, checkpoint_quant)
+        self.assertIs(first.model_config.quant_config, checkpoint_quant)
+        self.assertEqual(first.moe_quant_method, "FP8_FP4")
+        self.assertEqual(source.moe_quant_method, checkpoint_quant.get_method())
+        self.assertIs(first.parallelism_config, source.parallelism_config)
+        self.assertIs(first.moe_config, source.moe_config)
+
     def test_prefill_capacity_is_not_limited_by_decode_concurrency(self):
         model_config = ModelConfig()
         model_config.max_seq_len = 4096

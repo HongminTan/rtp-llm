@@ -1081,9 +1081,7 @@ class DeepEPTest(TestCase):
             parallelism_config=engine_config.parallelism_config,
             moe_config=engine_config.moe_config,
         )
-        deepep_config = DeepepWrapperConfig.from_config_adapter(
-            config_adapter, ll_num_max_token_per_rank=0
-        )
+        deepep_config = DeepepWrapperConfig.from_config_adapter(config_adapter)
         deepep_wrapper = DeepEPWrapper.get_instance(deepep_config)
         buffer = deepep_wrapper.buffer
         # run test
@@ -1134,16 +1132,7 @@ class DeepEPTest(TestCase):
             parallelism_config=engine_config.parallelism_config,
             moe_config=engine_config.moe_config,
         )
-        ll_num_max_token_per_rank = (
-            DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
-                engine_config.moe_config.ll_num_max_token,
-                engine_config.parallelism_config.tp_size,
-                model_config.quant_config,
-            )
-        )
-        deepep_config = DeepepWrapperConfig.from_config_adapter(
-            config_adapter, ll_num_max_token_per_rank
-        )
+        deepep_config = DeepepWrapperConfig.from_config_adapter(config_adapter)
         deepep_wrapper = DeepEPWrapper.get_instance(deepep_config)
         buffer = deepep_wrapper.buffer
         # run test
@@ -1193,9 +1182,7 @@ class DeepEPTest(TestCase):
             parallelism_config=engine_config.parallelism_config,
             moe_config=engine_config.moe_config,
         )
-        deepep_config = DeepepWrapperConfig.from_config_adapter(
-            config_adapter, ll_num_max_token_per_rank=0
-        )
+        deepep_config = DeepepWrapperConfig.from_config_adapter(config_adapter)
         deepep_wrapper = DeepEPWrapper.get_instance(deepep_config)
         buffer = deepep_wrapper.buffer
         # run test
@@ -1269,16 +1256,7 @@ class DeepEPTest(TestCase):
             parallelism_config=engine_config.parallelism_config,
             moe_config=engine_config.moe_config,
         )
-        ll_num_max_token_per_rank = (
-            DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
-                engine_config.moe_config.ll_num_max_token,
-                engine_config.parallelism_config.tp_size,
-                model_config.quant_config,
-            )
-        )
-        deepep_config = DeepepWrapperConfig.from_config_adapter(
-            config_adapter, ll_num_max_token_per_rank
-        )
+        deepep_config = DeepepWrapperConfig.from_config_adapter(config_adapter)
         # just need test get instance
         deepep_wrapper = DeepEPWrapper.get_instance(deepep_config)
         destroy_distributed_environment()

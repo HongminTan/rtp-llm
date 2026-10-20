@@ -6,6 +6,8 @@ from .fp4 import (
     CudaFp4NoDPStrategy,
 )
 from .fp8_fp4 import (
+    CudaGroupedFp4Sm90EpLowLatencyStrategy,
+    CudaGroupedFp4Sm90EpStrategy,
     CudaGroupedFp4Strategy,
     CudaLocalLoopStrategy,
     CudaMegaMoeSEStrategy,
@@ -60,6 +62,8 @@ __all__ = [
     "CudaFp4NoDPStrategy",
     "CudaMegaMoeSEStrategy",
     "CudaMegaMoeStrategy",
+    "CudaGroupedFp4Sm90EpStrategy",
+    "CudaGroupedFp4Sm90EpLowLatencyStrategy",
     "CudaGroupedFp4Strategy",
     "CudaLocalLoopStrategy",
 ]

@@ -34,6 +34,7 @@ from rtp_llm.ops import (
     RoleType,
     RuntimeConfig,
     SpeculativeExecutionConfig,
+    SpeculativeType,
     VitSeparation,
 )
 
@@ -72,6 +73,29 @@ class EngineConfig:
     dash_sc_grpc_config: DashScGrpcConfig
     grammar_config: GrammarConfig
     load_config: LoadConfig
+
+    def __post_init__(self) -> None:
+        """Resolve LL's token bound before router TP slicing for every entry point."""
+        if self.moe_config.use_deepep_low_latency:
+            max_decode_batch_size = self.runtime_config.max_generate_batch_size
+            if (
+                self.hw_kernel_config is not None
+                and self.hw_kernel_config.enable_cuda_graph
+            ):
+                max_decode_batch_size = max(
+                    max_decode_batch_size,
+                    max(self.hw_kernel_config.decode_capture_batch_sizes, default=0),
+                )
+            tokens_per_request = (
+                self.sp_config.gen_num_per_cycle + 1
+                if self.sp_config.type != SpeculativeType.NONE
+                else 1
+            )
+            # ll_num_max_token is already a token bound, unlike graph batch sizes.
+            self.moe_config.ll_num_max_token = max(
+                self.moe_config.ll_num_max_token,
+                max_decode_batch_size * tokens_per_request,
+            )
 
     def to_string(self) -> str:
         """Return a formatted string representation of EngineConfig for debugging.
@@ -219,6 +243,8 @@ class EngineConfig:
                 ffn_tp_nccl_port=0,
             )
 
+        runtime_config.max_generate_batch_size = concurrency_config.concurrency_limit
+
         # Create EngineConfig instance
         engine_config = EngineConfig(
             parallelism_config=parallelism_config,
@@ -243,8 +269,6 @@ class EngineConfig:
             grammar_config=grammar_config,
             load_config=load_config,
         )
-
-        runtime_config.max_generate_batch_size = concurrency_config.concurrency_limit
 
         # Setup PD separation config
         setup_pd_sep_config(

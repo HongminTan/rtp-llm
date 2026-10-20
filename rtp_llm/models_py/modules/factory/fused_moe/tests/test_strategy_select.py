@@ -6,8 +6,20 @@ from unittest.mock import patch
 
 import torch
 
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.models_py.distributed.deepep_wrapper import DeepepWrapperConfig
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
+from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
+    FusedMoEQuantConfig,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.grouped_fp4 import (
     _has_fp8_fp4_grouped_kernel,
+)
+from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_normal_router import (
+    DeepepNormalRouterBase,
+    DeepepNormalRouterFp8Fp4,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy.fp8_fp4 import (
     CudaGroupedFp4Strategy,
@@ -18,9 +30,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy.fp8_fp4 impo
 from rtp_llm.models_py.modules.factory.fused_moe.strategy_registry import (
     StrategyRegistry,
 )
-from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.layer import (
-    Fp8Fp4MoeRuntimeConfig,
-)
+from rtp_llm.ops import CPRotateMethod, MoeConfig, ParallelismConfig
 
 
 def _config(
@@ -30,19 +40,30 @@ def _config(
     world_size=None,
     has_shared_expert_gate=False,
 ):
-    return Fp8Fp4MoeRuntimeConfig(
+    model_config = ModelConfig()
+    model_config.hidden_size = 512
+    model_config.moe_inter_size = 256
+    model_config.expert_num = 16
+    model_config.moe_k = 4
+    model_config.n_shared_experts = n_shared_experts
+    model_config.swiglu_limit = 10.0
+    model_config.routed_scaling_factor = 1.0
+    model_config.moe_w1_layout = "up_gate"
+    parallelism = ParallelismConfig()
+    parallelism.ep_size = ep_size
+    parallelism.ep_rank = 0
+    parallelism.world_size = world_size if world_size is not None else ep_size
+    parallelism.world_rank = 0
+    parallelism.dp_size = ep_size
+    parallelism.dp_rank = 0
+    moe_config = MoeConfig()
+    moe_config.moe_strategy = strategy
+    return MoEConfigAdapter(model_config, parallelism, moe_config).for_layer(
         layer_id=0,
-        hidden_size=512,
         moe_inter_dim=256,
-        expert_num=16,
-        moe_k=4,
-        n_shared_experts=n_shared_experts,
-        swiglu_limit=10.0,
-        ep_size=ep_size,
-        ep_rank=0,
-        world_size=world_size,
+        moe_w1_layout="up_gate",
         max_tokens_per_rank=128,
-        moe_strategy=strategy,
+        moe_quant_method="FP8_FP4",
         has_shared_expert_gate=has_shared_expert_gate,
     )
 
@@ -57,6 +78,49 @@ def _registry():
 
 
 class Fp8Fp4StrategySelectionTest(unittest.TestCase):
+    def test_ll_capacity_follows_input_tp_view(self):
+        for cp, expected in ((False, 64), (True, 128)):
+            with self.subTest(cp=cp):
+                source = _config(ep_size=4)
+                parallelism = source.parallelism_config
+                parallelism.tp_size = 4
+                parallelism.tp_rank = 2
+                parallelism.prefill_cp_config.method = (
+                    CPRotateMethod.ALL_GATHER if cp else CPRotateMethod.DISABLED
+                )
+                source.moe_config.use_deepep_low_latency = True
+                source.moe_config.ll_num_max_token = 128
+                config = MoEConfigAdapter(
+                    source.model_config, parallelism, source.moe_config
+                )
+                wrapper_config = DeepepWrapperConfig.from_config_adapter(config)
+                self.assertEqual(wrapper_config.tp_size, 4)
+                self.assertEqual(wrapper_config.ll_num_max_token_per_rank, expected)
+                self.assertEqual(config.tp_size, 1 if cp else 4)
+
+    def test_fp8_fp4_normal_router_contract(self):
+        config = _config(ep_size=4)
+        valid = FusedMoEQuantConfig(
+            quant_dtype=torch.float8_e4m3fn, block_shape=[128, 128]
+        )
+        with patch.object(
+            DeepepNormalRouterBase, "__init__", return_value=None
+        ) as init:
+            DeepepNormalRouterFp8Fp4(config, valid)
+            init.assert_called_once_with(config, valid, expert_alignment=1)
+
+        invalid = (
+            FusedMoEQuantConfig(),
+            FusedMoEQuantConfig(
+                quant_dtype=torch.float8_e4m3fn, per_act_token_quant=True
+            ),
+            FusedMoEQuantConfig(quant_dtype=torch.float8_e4m3fn, block_shape=[128, 64]),
+        )
+        for quant_config in invalid:
+            with self.subTest(quant_config=quant_config):
+                with self.assertRaisesRegex(ValueError, "requires FP8"):
+                    DeepepNormalRouterFp8Fp4(config, quant_config)
+
     @patch(
         "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.grouped_fp4._has_fp8_fp4_grouped_kernel",
         return_value=True,

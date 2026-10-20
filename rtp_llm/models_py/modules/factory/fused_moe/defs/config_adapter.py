@@ -3,6 +3,7 @@ Adapter to provide a unified interface from individual config objects.
 This allows Router and Executor classes to work with specific config objects.
 """
 
+from copy import copy
 from typing import Optional
 
 from rtp_llm.config.model_config import ModelConfig
@@ -27,7 +28,9 @@ class MoEConfigAdapter:
         self.model_config = model_config
         self.parallelism_config = parallelism_config
         self.moe_config = moe_config or MoeConfig()
-        self.quant_config = quant_config
+        self.quant_config = (
+            quant_config if quant_config is not None else model_config.quant_config
+        )
 
         # Provide shortcut access to commonly used attributes
         self.ep_size = parallelism_config.ep_size
@@ -105,22 +108,43 @@ class MoEConfigAdapter:
         # Generic execution is not chunked, so JIT warmup only needs the
         # request-visible bucket representatives rather than the capacity cap.
         self.warmup_include_capacity = False
-        effective_quant_config = (
-            quant_config if quant_config is not None else model_config.quant_config
-        )
         self.moe_quant_method = (
-            effective_quant_config.get_method()
-            if effective_quant_config is not None
-            else None
+            self.quant_config.get_method() if self.quant_config is not None else None
         )
         self.data_type = model_config.data_type
         self.head_num = model_config.attn_config.head_num
-        self.ll_num_max_token = moe_config.ll_num_max_token
-        self.masked_max_token_num = moe_config.masked_max_token_num
-        self.moe_strategy = moe_config.moe_strategy
-        self.use_mori_ep = moe_config.use_mori_ep
-        self.use_deepep_moe = moe_config.use_deepep_moe
+        self.ll_num_max_token = self.moe_config.ll_num_max_token
+        self.masked_max_token_num = self.moe_config.masked_max_token_num
+        self.moe_strategy = self.moe_config.moe_strategy
+        self.use_mori_ep = self.moe_config.use_mori_ep
+        self.use_deepep_moe = self.moe_config.use_deepep_moe
         self.enable_cuda_graph = enable_cuda_graph
+
+    def for_layer(
+        self,
+        *,
+        layer_id: int,
+        moe_inter_dim: int,
+        moe_w1_layout: str,
+        max_tokens_per_rank: int,
+        moe_quant_method: str,
+        warmup_include_capacity: bool = False,
+        has_shared_expert_gate: bool = False,
+    ) -> "MoEConfigAdapter":
+        """Bind execution metadata without changing shared model configuration."""
+        if moe_w1_layout not in {"gate_up", "up_gate"}:
+            raise ValueError(f"Unsupported MoE w1 layout: {moe_w1_layout!r}")
+        if moe_inter_dim <= 0 or max_tokens_per_rank <= 0:
+            raise ValueError("MoE layer dimensions and token capacity must be positive")
+        config = copy(self)
+        config.layer_id = layer_id
+        config.moe_inter_dim = moe_inter_dim
+        config.moe_w1_layout = moe_w1_layout
+        config.max_tokens_per_rank = max_tokens_per_rank
+        config.moe_quant_method = moe_quant_method
+        config.warmup_include_capacity = warmup_include_capacity
+        config.has_shared_expert_gate = has_shared_expert_gate
+        return config
 
     @property
     def activation_type(self):

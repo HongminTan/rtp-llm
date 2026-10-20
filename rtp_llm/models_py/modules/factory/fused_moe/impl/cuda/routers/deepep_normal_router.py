@@ -154,9 +154,7 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
                 expert_x_scale = expert_x_scale[:, 0].contiguous()
         else:
             if use_fp8:
-                raise ValueError(
-                    "FP8 DeepEP dispatch must return (activation, scale)"
-                )
+                raise ValueError("FP8 DeepEP dispatch must return (activation, scale)")
             expert_x = output
 
         expert_num_tokens = torch.tensor(
@@ -177,6 +175,7 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
             expert_x_scale=expert_x_scale,
             expert_x_origin_dtype=act_dtype,
             expert_topk_ids=expert_topk_ids,
+            expert_ids_are_local=use_fp8 or use_fp4,
             expert_topk_weights=recv_topk_weights,
             expert_tokens_meta=ExpertTokensMetadata(
                 expert_num_tokens=expert_num_tokens,
@@ -388,3 +387,33 @@ class DeepepNormalRouterFp4PerGroup(DeepepNormalRouterBase):
         checker.check(quant_method == "modelopt_fp4")
         checker.check(config.moe_config.use_deepep_moe)
         checker.check(not config.moe_config.use_deepep_low_latency)
+
+
+class DeepepNormalRouterFp8Fp4(DeepepNormalRouterBase):
+    """Dispatch unpadded FP8 rows with row-major FP32 block-128 scales."""
+
+    def __init__(self, config: MoEConfigAdapter, quant_config: FusedMoEQuantConfig):
+        if (
+            quant_config.quant_dtype != torch.float8_e4m3fn
+            or quant_config.block_shape != [128, 128]
+            or quant_config.per_act_token_quant
+            or quant_config.per_out_ch_quant
+        ):
+            raise ValueError("FP8/FP4 DeepEP normal requires FP8 block-[128, 128]")
+        super().__init__(config, quant_config, expert_alignment=1)
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        super().check_conditions(checker, config)
+        checker.check(config.moe_quant_method == "FP8_FP4")
+        checker.check(config.use_deepep_moe)
+
+    def _do_quant_fp8_per_block(self, a1):
+        return sgl_per_token_group_quant_fp8(
+            a1.contiguous(),
+            128,
+            eps=1e-4,
+            column_major_scales=False,
+            scale_tma_aligned=False,
+            scale_ue8m0=False,
+        )

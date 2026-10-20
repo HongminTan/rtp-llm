@@ -131,3 +131,18 @@ cuda13_sm100_py_test(
     srcs = ["test_mega_moe_input_packer_perf.py"],
     deps = ["//rtp_llm/models_py/triton_kernels:moe"],
 )
+
+py_test(
+    name = "test_silu_mul_fp8_quant_f32_scale",
+    srcs = ["test_silu_mul_fp8_quant_f32_scale.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:modules",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["H20_CU13"],
+    exec_properties = {
+        "gpu": "H20_CU13",
+        "gpu_count": "1",
+    },
+)

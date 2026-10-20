@@ -73,10 +73,10 @@ def _quant_weight(weight_bf16: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
         scales.fill_(0x7F7F7F7F)
         return weight_bf16.to(torch.float8_e4m3fn), scales
     return (
-        weight_bf16.t().contiguous().to(torch.float8_e4m3fn),
+        weight_bf16.to(torch.float8_e4m3fn),
         torch.ones(
-            (in_features + 127) // 128,
             (out_features + 127) // 128,
+            (in_features + 127) // 128,
             dtype=torch.float32,
             device=weight_bf16.device,
         ),
@@ -134,6 +134,30 @@ def _split_reference(
 
     T, D = x.shape
     inter = shared.w1.weight.shape[0]
+    if not is_deep_gemm_e8m0_used():
+        from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+            sgl_per_token_group_quant_fp8,
+        )
+
+        out = torch.empty((T, D), dtype=torch.bfloat16, device=x.device)
+        if T == 0:
+            return out
+        x_parts = sgl_per_token_group_quant_fp8(x, 128, eps=1e-4)
+        gate = torch.empty((T, inter), dtype=torch.bfloat16, device=x.device)
+        up = torch.empty_like(gate)
+        fp8_gemm_nt(x_parts, (shared.w1.weight, shared.w1.weight_scales), gate)
+        fp8_gemm_nt(x_parts, (shared.w3.weight, shared.w3.weight_scales), up)
+        gate, up = gate.float(), up.float()
+        if swiglu_limit > 0:
+            gate = gate.clamp(max=swiglu_limit)
+            up = up.clamp(-swiglu_limit, swiglu_limit)
+        hidden = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+        hidden_parts = sgl_per_token_group_quant_fp8(
+            hidden, 128, eps=1e-10 * torch.finfo(torch.float8_e4m3fn).max
+        )
+        fp8_gemm_nt(hidden_parts, (shared.w2.weight, shared.w2.weight_scales), out)
+        return out
+
     x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     x_scale_storage = FusedSharedExpertFastPath._scale_storage(
         (D // 128 + 3) // 4,
@@ -185,9 +209,19 @@ def _split_reference(
 
 def _fake_fp8_gemm_nt(a, b, output, *args, **kwargs) -> None:
     del args, kwargs
-    a_q = a[0]
-    b_q = b[0]
-    output.copy_((a_q.float() @ b_q.float().t()).to(torch.bfloat16))
+
+    def dequantize(parts):
+        values, scales = parts
+        if scales.dtype == torch.int32:
+            shifts = torch.arange(4, device=scales.device) * 8
+            exponents = (scales.unsqueeze(-1) >> shifts) & 255
+            scales = torch.exp2(exponents.float() - 127).flatten(-2)
+            scales = scales[:, : values.shape[1] // 128]
+        elif scales.shape[0] != values.shape[0]:
+            scales = scales.repeat_interleave(128, dim=0)
+        return values.float() * scales.repeat_interleave(128, dim=-1)
+
+    output.copy_((dequantize(a) @ dequantize(b).t()).to(torch.bfloat16))
 
 
 class TestSharedExpertExecutor(unittest.TestCase):
@@ -219,78 +253,86 @@ class TestSharedExpertExecutor(unittest.TestCase):
         self.assertEqual(fast_path.inter_dim, 256)
 
     def test_workspace_views_are_shared_and_invalidated_on_growth(self):
-        _SHARED_EXPERT_WORKSPACE_CACHE.clear()
-        self.addCleanup(_SHARED_EXPERT_WORKSPACE_CACHE.clear)
-        first = FusedSharedExpertFastPath(
-            max_tokens_per_rank=4,
-            dim=128,
-            inter_dim=128,
-        )
-        second = FusedSharedExpertFastPath(
-            max_tokens_per_rank=4,
-            dim=128,
-            inter_dim=128,
-        )
-        grower = FusedSharedExpertFastPath(
-            max_tokens_per_rank=9,
-            dim=128,
-            inter_dim=128,
-        )
-        x3 = torch.empty((3, 128), dtype=torch.bfloat16)
+        for use_ue8m0 in (False, True):
+            with self.subTest(use_ue8m0=use_ue8m0), mock.patch(
+                "rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.is_deep_gemm_e8m0_used",
+                return_value=use_ue8m0,
+            ):
+                _SHARED_EXPERT_WORKSPACE_CACHE.clear()
+                self.addCleanup(_SHARED_EXPERT_WORKSPACE_CACHE.clear)
+                first = FusedSharedExpertFastPath(
+                    max_tokens_per_rank=4,
+                    dim=128,
+                    inter_dim=128,
+                )
+                second = FusedSharedExpertFastPath(
+                    max_tokens_per_rank=4,
+                    dim=128,
+                    inter_dim=128,
+                )
+                grower = FusedSharedExpertFastPath(
+                    max_tokens_per_rank=9,
+                    dim=128,
+                    inter_dim=128,
+                )
+                x3 = torch.empty((3, 128), dtype=torch.bfloat16)
 
-        def aligned(rows: int, element_size: int) -> int:
-            del element_size
-            return ((rows + 7) // 8) * 8
+                def aligned(rows: int, element_size: int) -> int:
+                    del element_size
+                    return ((rows + 7) // 8) * 8
 
-        with mock.patch.object(
-            FusedSharedExpertFastPath,
-            "_tma_aligned_rows",
-            side_effect=aligned,
-        ):
-            workspace = first._ensure_workspace(x3)
-            views = first._workspace_views(workspace, 3)
-            self.assertIs(first._workspace_views(workspace, 3), views)
+                with mock.patch.object(
+                    FusedSharedExpertFastPath,
+                    "_tma_aligned_rows",
+                    side_effect=aligned,
+                ):
+                    workspace = first._ensure_workspace(x3)
+                    views = first._workspace_views(workspace, 3)
+                    self.assertIs(first._workspace_views(workspace, 3), views)
 
-            second_workspace = second._ensure_workspace(x3)
-            self.assertIs(second_workspace, workspace)
-            self.assertIs(second._workspace_views(second_workspace, 3), views)
-            self.assertEqual(tuple(views.x_fp8.shape), (3, 128))
-            self.assertEqual(tuple(views.x_scale.shape), (3, 1))
-            self.assertEqual(tuple(views.gate_up_bf16.shape), (3, 256))
-            self.assertEqual(tuple(views.hidden_fp8.shape), (3, 128))
-            self.assertEqual(tuple(views.hidden_scale.shape), (3, 1))
-            self.assertEqual(tuple(views.out_bf16.shape), (3, 128))
+                    second_workspace = second._ensure_workspace(x3)
+                    self.assertIs(second_workspace, workspace)
+                    self.assertIs(second._workspace_views(second_workspace, 3), views)
+                    self.assertEqual(tuple(views.x_fp8.shape), (3, 128))
+                    self.assertEqual(tuple(views.x_scale.shape), (3, 1))
+                    expected_scale_dtype = torch.int32 if use_ue8m0 else torch.float32
+                    self.assertEqual(views.x_scale.dtype, expected_scale_dtype)
+                    self.assertEqual(views.hidden_scale.dtype, expected_scale_dtype)
+                    self.assertEqual(tuple(views.gate_up_bf16.shape), (3, 256))
+                    self.assertEqual(tuple(views.hidden_fp8.shape), (3, 128))
+                    self.assertEqual(tuple(views.hidden_scale.shape), (3, 1))
+                    self.assertEqual(tuple(views.out_bf16.shape), (3, 128))
 
-            old_x_fp8 = workspace.x_fp8
-            grown_workspace = grower._ensure_workspace(
-                torch.empty((9, 128), dtype=torch.bfloat16)
-            )
-            self.assertIsNot(grown_workspace, workspace)
-            self.assertEqual(grown_workspace.capacity, 9)
-            self.assertEqual(grown_workspace.views, {})
-            self.assertIs(workspace.x_fp8, old_x_fp8)
-            self.assertEqual(workspace.capacity, 4)
-            self.assertIs(first._workspace, workspace)
+                    old_x_fp8 = workspace.x_fp8
+                    grown_workspace = grower._ensure_workspace(
+                        torch.empty((9, 128), dtype=torch.bfloat16)
+                    )
+                    self.assertIsNot(grown_workspace, workspace)
+                    self.assertEqual(grown_workspace.capacity, 9)
+                    self.assertEqual(grown_workspace.views, {})
+                    self.assertIs(workspace.x_fp8, old_x_fp8)
+                    self.assertEqual(workspace.capacity, 4)
+                    self.assertIs(first._workspace, workspace)
 
-            first_grown = first._ensure_workspace(
-                torch.empty((9, 128), dtype=torch.bfloat16)
-            )
-            self.assertIs(first_grown, grown_workspace)
-            refreshed = first._workspace_views(first_grown, 3)
-            self.assertIsNot(refreshed, views)
-            self.assertIs(refreshed.x_fp8._base, grown_workspace.x_fp8)
+                    first_grown = first._ensure_workspace(
+                        torch.empty((9, 128), dtype=torch.bfloat16)
+                    )
+                    self.assertIs(first_grown, grown_workspace)
+                    refreshed = first._workspace_views(first_grown, 3)
+                    self.assertIsNot(refreshed, views)
+                    self.assertIs(refreshed.x_fp8._base, grown_workspace.x_fp8)
 
-            # Variable-length traffic retains one cached shape, while callers
-            # holding previous views keep their original buffer references.
-            other_shape = first._workspace_views(first_grown, 5)
-            self.assertEqual(set(first_grown.views), {5})
-            self.assertEqual(tuple(other_shape.x_fp8.shape), (5, 128))
-            self.assertEqual(tuple(refreshed.x_fp8.shape), (3, 128))
+                    # Variable-length traffic retains one cached shape, while callers
+                    # holding previous views keep their original buffer references.
+                    other_shape = first._workspace_views(first_grown, 5)
+                    self.assertEqual(set(first_grown.views), {5})
+                    self.assertEqual(tuple(other_shape.x_fp8.shape), (5, 128))
+                    self.assertEqual(tuple(refreshed.x_fp8.shape), (3, 128))
 
-            first.prepare(self._prepare_only_shared(inter=256, dim=128))
-            resized = first._ensure_workspace(x3)
-            self.assertEqual(resized.hidden_fp8.size(1), 256)
-            self.assertEqual(grown_workspace.hidden_fp8.size(1), 128)
+                    first.prepare(self._prepare_only_shared(inter=256, dim=128))
+                    resized = first._ensure_workspace(x3)
+                    self.assertEqual(resized.hidden_fp8.size(1), 256)
+                    self.assertEqual(grown_workspace.hidden_fp8.size(1), 128)
 
     def test_overlap_threshold_short_circuits_capture_query(self):
         executor = OverlapSharedExpertExecutor()
@@ -488,9 +530,12 @@ class TestSharedExpertExecutor(unittest.TestCase):
             w13_w.shape,
             (512, 256),
         )
-        self.assertEqual(w13_s.shape[0], 512)
         if w13_s.dtype == torch.int32:
+            self.assertEqual(w13_s.shape[0], 512)
             self.assertEqual(w13_s.stride(0), 1)
+        else:
+            self.assertEqual(w13_s.dtype, torch.float32)
+            self.assertEqual(w13_s.shape, (4, 2))
         self.assertFalse(hasattr(shared, "w1"))
         self.assertFalse(hasattr(shared, "w3"))
 

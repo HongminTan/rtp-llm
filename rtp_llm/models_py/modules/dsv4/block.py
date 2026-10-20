@@ -19,6 +19,9 @@ from rtp_llm.models_py.modules.dsv4.fp8.attention import (
     CommitOnlyAttentionFP8,
 )
 from rtp_llm.models_py.modules.dsv4.hc import build_hc_unit
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
     ChunkedFp8Fp4MoeLayer,
 )
@@ -79,13 +82,9 @@ class Block(nn.Module):
         index_n_heads: int,
         index_head_dim: int,
         index_topk: int,
+        moe_config: MoEConfigAdapter,
         moe_inter_dim: int,
-        n_routed_experts: int,
-        n_activated_experts: int,
-        n_shared_experts: int,
         score_func: str,
-        route_scale: float,
-        swiglu_limit: float,
         n_hash_layers: int,
         vocab_size: int,
         hc_mult: int,
@@ -95,16 +94,10 @@ class Block(nn.Module):
         layer_weights: Optional[Dict[str, torch.Tensor]] = None,
         tp_size: int = 1,
         tp_rank: int = 0,
-        ep_size: int = 1,
-        ep_rank: int = 0,
-        world_size: Optional[int] = None,
-        world_rank: Optional[int] = None,
         max_tokens_per_rank: int = 8192,
         is_decode_role: bool = False,
-        moe_strategy: str = "auto",
         fp8_kv_cache: bool = False,
         commit_only: bool = False,
-        n_physical_experts: Optional[int] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -151,32 +144,25 @@ class Block(nn.Module):
         if layer_weights is None:
             raise ValueError("Block requires per-layer weights")
         adapt_split_moe_weights(
-            layer_weights, moe_inter_dim, n_shared_experts, _MOE_WEIGHT_NAMES
+            layer_weights, moe_inter_dim, moe_config.n_shared_experts, _MOE_WEIGHT_NAMES
+        )
+        chunking_enabled = chunked_moe_enabled()
+        layer_config = moe_config.for_layer(
+            layer_id=layer_id,
+            moe_inter_dim=moe_inter_dim,
+            moe_w1_layout="gate_up",
+            max_tokens_per_rank=max_tokens_per_rank,
+            moe_quant_method="FP8_FP4",
+            warmup_include_capacity=chunking_enabled and not is_decode_role,
         )
         self.ffn = ChunkedFp8Fp4MoeLayer(
-            layer_id=layer_id,
-            dim=dim,
-            moe_inter_dim=moe_inter_dim,
-            n_routed_experts=n_routed_experts,
-            n_activated_experts=n_activated_experts,
-            n_shared_experts=n_shared_experts,
+            config=layer_config,
             score_func=score_func,
-            route_scale=route_scale,
-            swiglu_limit=swiglu_limit,
             n_hash_layers=n_hash_layers,
             vocab_size=vocab_size,
             layer_weights=layer_weights,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            world_size=world_size,
-            world_rank=world_rank,
-            max_tokens_per_rank=max_tokens_per_rank,
             is_decode_role=is_decode_role,
-            strategy=moe_strategy,
-            n_physical_experts=n_physical_experts,
-            chunking_enabled=chunked_moe_enabled(),
-            model_type="deepseek_v4",
-            moe_w1_layout="gate_up",
+            chunking_enabled=chunking_enabled,
             observer_factory=self._moe_observer,
             record_function_scope=_profiler.moe_record_function_scope,
         )
