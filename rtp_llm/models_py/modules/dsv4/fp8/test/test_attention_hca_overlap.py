@@ -548,6 +548,10 @@ class WorkspaceStreamingOutputProjectionTest(unittest.TestCase):
             side_effect=fake_output_proj_into
         )
 
+        from rtp_llm.models_py.utils.flash_mla_legacy import get_legacy_flash_mla
+
+        get_legacy_flash_mla.cache_clear()
+        self.addCleanup(get_legacy_flash_mla.cache_clear)
         with patch(
             "rtp_llm.models_py.modules.dsv4.fp8.attention." "_FLASH_MLA_SPARSE_Q_CHUNK",
             2,
@@ -795,6 +799,10 @@ class SwaStreamingOutputProjectionTest(unittest.TestCase):
             side_effect=fake_output_proj_into
         )
 
+        from rtp_llm.models_py.utils.flash_mla_legacy import get_legacy_flash_mla
+
+        get_legacy_flash_mla.cache_clear()
+        self.addCleanup(get_legacy_flash_mla.cache_clear)
         with patch(
             "rtp_llm.models_py.modules.dsv4.fp8.attention." "_FLASH_MLA_SPARSE_Q_CHUNK",
             2,

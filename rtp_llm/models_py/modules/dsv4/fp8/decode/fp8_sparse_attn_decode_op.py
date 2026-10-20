@@ -13,33 +13,20 @@ softmax merging across both pools (mirrors vLLM
 pools -> BF16 cat -> TileLang sparse_attn" path which was
 bandwidth-bound on the dequant kernels.
 
-FlashMLA wheel is required (CUDA >= 12.9). The op asserts wheel
+FlashMLA wheel is required. The op asserts wheel
 availability at forward — there is no slow Python reference fallback
 because all dev/CI/prod boxes carry flash_mla.
 """
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Optional
 
 import torch
 
-_FLASH_MLA_AVAILABLE = False
-try:
-    if torch.version.cuda:
-        major, minor = map(int, torch.version.cuda.split(".")[:2])
-        if (major, minor) >= (12, 9):
-            from rtp_llm.models_py.utils.flash_mla_legacy import (
-                flash_mla_with_kvcache,  # type: ignore[import-not-found]
-            )
-            from rtp_llm.models_py.utils.flash_mla_legacy import (
-                get_mla_metadata,  # type: ignore[import-not-found]
-            )
+from rtp_llm.models_py.utils.flash_mla_legacy import flash_mla_available
 
-            _FLASH_MLA_AVAILABLE = True
-except (ImportError, AttributeError, ValueError) as e:
-    logging.warning("[dsv4-fp8] flash_mla wheel unavailable (%s)", e)
+_FLASH_MLA_AVAILABLE = flash_mla_available()
 
 
 class SparseAttnV4DecodeFp8Op:
