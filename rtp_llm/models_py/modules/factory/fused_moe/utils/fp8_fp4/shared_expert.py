@@ -44,6 +44,7 @@ class _SharedExpertWorkspaceViews:
 class _SharedExpertWorkspace:
     capacity: int
     device: torch.device
+    use_ue8m0: bool
     x_fp8: torch.Tensor
     x_scale_storage: torch.Tensor
     gate_up_bf16: torch.Tensor
@@ -272,6 +273,8 @@ class FusedSharedExpertFastPath:
 
     @staticmethod
     def _scale_view(storage: torch.Tensor, tokens: int) -> torch.Tensor:
+        if storage.dtype == torch.float32:
+            return storage[:tokens]
         aligned_tokens = FusedSharedExpertFastPath._tma_aligned_rows(
             max(tokens, 1),
             storage.element_size(),
@@ -282,6 +285,11 @@ class FusedSharedExpertFastPath:
         )
 
     def _ensure_workspace(self, x: torch.Tensor) -> _SharedExpertWorkspace:
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            is_deep_gemm_e8m0_used,
+        )
+
+        use_ue8m0 = is_deep_gemm_e8m0_used()
         T, D = x.shape
         if self.dim is None:
             self.dim = D
@@ -298,13 +306,14 @@ class FusedSharedExpertFastPath:
             and workspace.device == x.device
             and workspace.capacity >= capacity
             and workspace.hidden_fp8.size(1) == inter
+            and workspace.use_ue8m0 == use_ue8m0
         ):
             return workspace
         if D % 128 != 0 or inter % 128 != 0:
             raise RuntimeError(
                 f"shared expert fused path requires D/inter divisible by 128, got {D}/{inter}"
             )
-        key = (x.device, D, inter)
+        key = (x.device, D, inter, use_ue8m0)
         workspace = _SHARED_EXPERT_WORKSPACE_CACHE.get(key)
         if workspace is not None and workspace.capacity >= capacity:
             self._workspace = workspace
@@ -315,7 +324,20 @@ class FusedSharedExpertFastPath:
             dtype=torch.float8_e4m3fn,
             device=x.device,
         )
-        x_scale_storage = self._scale_storage((D // 128 + 3) // 4, capacity, x.device)
+        if use_ue8m0:
+            x_scale_storage = self._scale_storage(
+                (D // 128 + 3) // 4, capacity, x.device
+            )
+            hidden_scale_storage = self._scale_storage(
+                (inter // 128 + 3) // 4, capacity, x.device
+            )
+        else:
+            x_scale_storage = torch.empty(
+                (capacity, D // 128), dtype=torch.float32, device=x.device
+            )
+            hidden_scale_storage = torch.empty(
+                (capacity, inter // 128), dtype=torch.float32, device=x.device
+            )
         gate_up_bf16 = torch.empty(
             (capacity, 2 * inter),
             dtype=torch.bfloat16,
@@ -325,11 +347,6 @@ class FusedSharedExpertFastPath:
             (capacity, inter),
             dtype=torch.float8_e4m3fn,
             device=x.device,
-        )
-        hidden_scale_storage = self._scale_storage(
-            (inter // 128 + 3) // 4,
-            capacity,
-            x.device,
         )
         out_bf16 = torch.empty(
             (capacity, D),
@@ -342,6 +359,7 @@ class FusedSharedExpertFastPath:
         workspace = _SharedExpertWorkspace(
             capacity=capacity,
             device=x.device,
+            use_ue8m0=use_ue8m0,
             x_fp8=x_fp8,
             x_scale_storage=x_scale_storage,
             gate_up_bf16=gate_up_bf16,
@@ -412,8 +430,35 @@ class FusedSharedExpertFastPath:
             quant_bf16_fp8_packed_ue8m0,
         )
         from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
             silu_mul_fp8_quant_packed,
         )
+
+        if not workspace.use_ue8m0:
+            from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+                sgl_per_token_group_quant_fp8,
+            )
+
+            sgl_per_token_group_quant_fp8(
+                x.contiguous(),
+                group_size=128,
+                eps=1.0e-4,
+                column_major_scales=False,
+                scale_tma_aligned=False,
+                scale_ue8m0=False,
+                output_q=x_fp8,
+                output_scale=x_scale,
+            )
+            fp8_gemm_nt((x_fp8, x_scale), w13_parts, gate_up)
+            silu_mul_fp8_quant_f32_scale(
+                gate_up,
+                clamp_limit=self.swiglu_limit,
+                group_size=128,
+                output_q=hidden_fp8,
+                output_scale=hidden_scale,
+            )
+            fp8_gemm_nt((hidden_fp8, hidden_scale), w2_parts, out)
+            return out
 
         quant_bf16_fp8_packed_ue8m0(x, x_fp8, x_scale, group_size=128, eps=1.0e-4)
         fp8_gemm_nt(

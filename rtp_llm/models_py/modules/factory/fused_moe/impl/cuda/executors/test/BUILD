@@ -334,3 +334,18 @@ dsv4_sm100_py_test(
     ],
     visibility = ["//visibility:public"],
 )
+
+py_test(
+    name = "grouped_fp4_sm90_weight_test",
+    srcs = ["grouped_fp4_sm90_weight_test.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:modules",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["H20_CU13"],
+    exec_properties = {
+        "gpu": "H20_CU13",
+        "gpu_count": "1",
+    },
+)

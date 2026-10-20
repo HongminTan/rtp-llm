@@ -378,3 +378,173 @@ def silu_mul_fp8_quant_packed_from_parts(
     )
 
     return output_q, output_scale_packed
+
+
+@triton.jit(do_not_specialize=["M"])
+def _silu_mul_fp8_quant_f32_scale_kernel(
+    input_ptr,
+    output_q_ptr,
+    output_scale_ptr,
+    M,
+    masked_m_ptr,
+    input_stride_m,
+    output_q_stride_m,
+    output_scale_stride_m,
+    output_scale_stride_g,
+    clamp_limit,
+    N: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_CLAMP: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    N_2: tl.constexpr = N // 2
+
+    pid_g = tl.program_id(0).to(tl.int64)
+    pid_m = tl.program_id(1).to(tl.int64)
+    expert = tl.program_id(2).to(tl.int64)
+    m_offset = pid_m * BLOCK_M
+
+    row_bound = M
+    if HAS_MASK:
+        row_bound = tl.minimum(M, tl.load(masked_m_ptr + expert))
+    if m_offset >= row_bound:
+        return
+
+    offs_m = tl.arange(0, BLOCK_M).to(tl.int64)
+    offs_n = tl.arange(0, GROUP_SIZE)
+    row_mask = (m_offset + offs_m) < row_bound
+    rows = expert * M + m_offset + offs_m
+
+    base_row_offset = rows[:, None] * input_stride_m
+    base_out_offset = rows[:, None] * output_q_stride_m
+
+    n_offset = pid_g * GROUP_SIZE
+
+    act_ptrs = input_ptr + base_row_offset + n_offset + offs_n[None, :]
+    act_in = tl.load(act_ptrs, mask=row_mask[:, None], other=0.0)
+    mul_ptrs = act_ptrs + N_2
+    mul_in = tl.load(mul_ptrs, mask=row_mask[:, None], other=0.0)
+
+    act_f32 = act_in.to(tl.float32)
+    mul_f32 = mul_in.to(tl.float32)
+
+    if HAS_CLAMP:
+        act_f32 = tl.minimum(act_f32, clamp_limit)
+        mul_f32 = tl.clamp(mul_f32, -clamp_limit, clamp_limit)
+
+    y = (act_f32 / (1.0 + tl.exp(-act_f32))) * mul_f32
+
+    # Preserve the BF16 rounding between SwiGLU and quantization.
+    y = y.to(tl.bfloat16).to(tl.float32)
+
+    absmax = tl.max(tl.abs(y), axis=1)
+    scale = tl.maximum(absmax / fp8_max, 1e-10)
+
+    y_q = tl.clamp(y / scale[:, None], fp8_min, fp8_max)
+    out_q_ptrs = output_q_ptr + base_out_offset + n_offset + offs_n[None, :]
+    tl.store(
+        out_q_ptrs,
+        y_q.to(output_q_ptr.dtype.element_ty),
+        mask=row_mask[:, None],
+    )
+
+    scale_ptrs = (
+        output_scale_ptr + rows * output_scale_stride_m + pid_g * output_scale_stride_g
+    )
+    tl.store(scale_ptrs, scale, mask=row_mask)
+
+
+def silu_mul_fp8_quant_f32_scale(
+    gate_up: torch.Tensor,
+    clamp_limit: float = 0.0,
+    group_size: int = 128,
+    masked_m: Optional[torch.Tensor] = None,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert gate_up.is_contiguous(), "gate_up must be contiguous"
+    assert gate_up.dtype == torch.bfloat16, f"expected bf16, got {gate_up.dtype}"
+
+    if masked_m is None:
+        assert gate_up.dim() == 2, f"expected 2D, got {gate_up.shape}"
+        E = 1
+    else:
+        assert (
+            gate_up.dim() == 3
+        ), f"expected [experts, capacity, hidden], got {gate_up.shape}"
+        E = gate_up.shape[0]
+        assert masked_m.shape == (E,) and masked_m.dtype == torch.int32
+        assert masked_m.device == gate_up.device and masked_m.is_contiguous()
+    M, N = gate_up.shape[-2:]
+    assert N % 2 == 0
+    N_2 = N // 2
+    assert (
+        N_2 % group_size == 0
+    ), f"inter ({N_2}) must be a multiple of group_size ({group_size})"
+
+    fp8_dtype = torch.float8_e4m3fn
+    finfo = torch.finfo(fp8_dtype)
+    fp8_min, fp8_max = finfo.min, finfo.max
+
+    num_groups_per_row = N_2 // group_size
+
+    q_shape = gate_up.shape[:-1] + (N_2,)
+    scale_shape = gate_up.shape[:-1] + (num_groups_per_row,)
+    if output_q is None:
+        output_q = torch.empty(q_shape, dtype=fp8_dtype, device=gate_up.device)
+    elif (
+        output_q.shape != q_shape
+        or output_q.dtype != fp8_dtype
+        or output_q.device != gate_up.device
+        or not output_q.is_contiguous()
+    ):
+        raise ValueError(
+            "output_q must be a contiguous FP8 tensor matching SwiGLU output"
+        )
+    if output_scale is None:
+        output_scale = torch.empty(
+            scale_shape, dtype=torch.float32, device=gate_up.device
+        )
+    elif (
+        output_scale.shape != scale_shape
+        or output_scale.dtype != torch.float32
+        or output_scale.device != gate_up.device
+        or not output_scale.is_contiguous()
+    ):
+        raise ValueError("output_scale must be contiguous FP32 block scales")
+    if M == 0:
+        return output_q, output_scale
+
+    BLOCK_M = 8
+    # Keep each tile within one expert, including partial capacity tiles.
+    grid = (num_groups_per_row, triton.cdiv(M, BLOCK_M), E)
+    num_warps = max(4, group_size // 32)
+    has_clamp = clamp_limit > 0
+    _silu_mul_fp8_quant_f32_scale_kernel[grid](
+        gate_up,
+        output_q,
+        output_scale,
+        M,
+        masked_m if masked_m is not None else gate_up,
+        gate_up.stride(-2),
+        output_q.stride(-2),
+        output_scale.stride(-2),
+        output_scale.stride(-1),
+        clamp_limit if has_clamp else 0.0,
+        N=N,
+        NUM_GROUPS=num_groups_per_row,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        GROUP_SIZE=group_size,
+        BLOCK_M=BLOCK_M,
+        HAS_CLAMP=has_clamp,
+        HAS_MASK=masked_m is not None,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return output_q, output_scale

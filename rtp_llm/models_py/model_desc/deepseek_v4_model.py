@@ -374,6 +374,19 @@ class DeepSeekV4Model(GptModelBase):
             max_generate_batch_size,
             moe_config=moe_config,
         )
+        from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+            MoEConfigAdapter,
+        )
+
+        args.moe_config = MoEConfigAdapter(
+            model_config,
+            parallelism_config,
+            moe_config,
+            model_config.quant_config,
+            enable_cuda_graph=bool(
+                py_hw_kernel_config and py_hw_kernel_config.enable_cuda_graph
+            ),
+        )
         self._max_generate_batch_size = int(max_generate_batch_size)
         assert self._max_generate_batch_size > 0, (
             "max_generate_batch_size must be positive, "
@@ -704,6 +717,12 @@ class DeepSeekV4Model(GptModelBase):
             chunking_enabled=chunked_moe_enabled(),
             chunk_tokens=moe_chunk_tokens_from_env(),
         )
+        moe_config = self._v4_args.moe_config
+        if moe_config is not None and moe_config.moe_config.use_deepep_low_latency:
+            runtime_resolved_max_tokens_per_rank = max(
+                runtime_resolved_max_tokens_per_rank,
+                moe_config.ll_num_max_token,
+            )
         if runtime_resolved_max_tokens_per_rank != self._v4_args.max_tokens_per_rank:
             chunk_tokens_env_for_log = (
                 DSV4_CHUNK_TOKENS_ENV

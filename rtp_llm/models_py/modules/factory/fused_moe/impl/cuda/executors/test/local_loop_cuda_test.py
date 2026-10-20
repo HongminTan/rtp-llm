@@ -12,6 +12,10 @@ from unittest.mock import patch
 
 import torch
 
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
 )
@@ -21,9 +25,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.fp8_fp4_bas
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.local_loop import (
     LocalLoopExecutor,
 )
-from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.layer import (
-    Fp8Fp4MoeRuntimeConfig,
-)
+from rtp_llm.ops import MoeConfig, ParallelismConfig
 from rtp_llm.utils.model_weight import W
 
 _PROBE = textwrap.dedent(
@@ -54,18 +56,30 @@ _PROBE = textwrap.dedent(
 
 
 def _cfg(experts: int, dim: int, inter: int, topk: int, tokens: int):
-    return Fp8Fp4MoeRuntimeConfig(
+    model_config = ModelConfig()
+    model_config.hidden_size = dim
+    model_config.moe_inter_size = inter
+    model_config.expert_num = experts
+    model_config.moe_k = topk
+    model_config.n_shared_experts = 1
+    model_config.swiglu_limit = 10.0
+    model_config.routed_scaling_factor = 1.0
+    model_config.moe_w1_layout = "up_gate"
+    parallelism = ParallelismConfig()
+    parallelism.ep_size = 1
+    parallelism.ep_rank = 0
+    parallelism.world_size = 1
+    parallelism.world_rank = 0
+    parallelism.dp_size = 1
+    parallelism.dp_rank = 0
+    moe_config = MoeConfig()
+    moe_config.moe_strategy = "local_loop"
+    return MoEConfigAdapter(model_config, parallelism, moe_config).for_layer(
         layer_id=0,
-        hidden_size=dim,
         moe_inter_dim=inter,
-        expert_num=experts,
-        moe_k=topk,
-        n_shared_experts=1,
-        swiglu_limit=10.0,
-        ep_size=1,
-        ep_rank=0,
+        moe_w1_layout="up_gate",
         max_tokens_per_rank=tokens,
-        moe_strategy="local_loop",
+        moe_quant_method="FP8_FP4",
     )
 
 

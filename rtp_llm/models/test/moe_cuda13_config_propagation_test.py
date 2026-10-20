@@ -418,34 +418,28 @@ class Dsv4MoeConfigTest(unittest.TestCase):
     def test_eplb_physical_expert_count_reaches_v4_block_inputs(self):
         from rtp_llm.models_py.modules.dsv4.transformer import _block_kwargs
         from rtp_llm.models_py.modules.factory.fused_moe import FusedMoeFactory
-        from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.layer import (
-            Fp8Fp4MoeRuntimeConfig,
-        )
 
         model_config = self._load_minimal_model_config(1)
         model_config.eplb_config.redundant_expert = 8
 
+        parallelism = ParallelismConfig()
+        parallelism.ep_size = 8
+        parallelism.world_size = 8
         args = _args_from_model_config(model_config)
+        args.moe_config = MoEConfigAdapter(model_config, parallelism, MoeConfig())
         kwargs = _block_kwargs(0, args, layer_weights={})
 
         self.assertEqual(args.n_routed_experts, 16)
         self.assertEqual(args.n_physical_experts, 24)
-        self.assertEqual(kwargs["n_physical_experts"], 24)
+        self.assertEqual(kwargs["moe_config"].physical_expert_num, 24)
         # Propagation preserves the unsupported request so the production
         # factory rejects it, rather than silently dropping redundant experts.
-        runtime = Fp8Fp4MoeRuntimeConfig(
+        runtime = kwargs["moe_config"].for_layer(
             layer_id=0,
-            hidden_size=args.dim,
             moe_inter_dim=args.moe_inter_dim,
-            expert_num=args.n_routed_experts,
-            physical_expert_num=kwargs["n_physical_experts"],
-            moe_k=args.n_activated_experts,
-            n_shared_experts=args.n_shared_experts,
-            swiglu_limit=args.swiglu_limit,
-            ep_size=8,
-            ep_rank=0,
+            moe_w1_layout="gate_up",
             max_tokens_per_rank=32,
-            moe_strategy="auto",
+            moe_quant_method="FP8_FP4",
         )
         with self.assertRaisesRegex(
             ValueError, "do not support EPLB.*logical_experts=16, physical_experts=24"
@@ -569,7 +563,7 @@ class Dsv4MoeConfigTest(unittest.TestCase):
         class DummyMoe(DummyModule):
             def __init__(self, *args, **kwargs):
                 super().__init__()
-                self.strategy_name = kwargs["strategy"]
+                self.strategy_name = kwargs["config"].moe_strategy
                 self.received_kwargs = kwargs
 
         weight_keys = (
@@ -598,6 +592,13 @@ class Dsv4MoeConfigTest(unittest.TestCase):
                 )
                 args.ep_size = 2
                 args.ep_rank = 0
+                args.moe_inter_dim = 384
+                parallelism = ParallelismConfig()
+                parallelism.ep_size = 2
+                parallelism.world_size = 2
+                args.moe_config = MoEConfigAdapter(
+                    model_config, parallelism, public_config
+                )
                 layer_weights = {key: torch.ones(1) for key in weight_keys}
                 experts = args.n_routed_experts // args.ep_size
                 inter, dim = args.moe_inter_dim, args.dim
@@ -657,11 +658,21 @@ class Dsv4MoeConfigTest(unittest.TestCase):
 
                 self.assertEqual(public_config.moe_strategy, strategy)
                 self.assertEqual(args.moe_strategy, strategy)
-                self.assertEqual(kwargs["moe_strategy"], strategy)
+                self.assertEqual(kwargs["moe_config"].moe_strategy, strategy)
                 self.assertEqual(block.ffn.strategy_name, strategy)
                 received = block.ffn.received_kwargs
-                self.assertEqual(received["moe_w1_layout"], "gate_up")
-                self.assertEqual(received["model_type"], "deepseek_v4")
+                layer_config = received["config"]
+                self.assertEqual(layer_config.moe_w1_layout, "gate_up")
+                self.assertEqual(layer_config.moe_inter_dim, 384)
+                self.assertEqual(
+                    layer_config.max_tokens_per_rank, args.max_tokens_per_rank
+                )
+                self.assertTrue(layer_config.warmup_include_capacity)
+                self.assertIsNot(layer_config, args.moe_config)
+                self.assertEqual(args.moe_config.moe_inter_dim, 256)
+                self.assertEqual(
+                    received["config"].model_config.model_type, "deepseek_v4"
+                )
                 self.assertTrue(received["chunking_enabled"])
                 self.assertEqual(received["observer_factory"], block._moe_observer)
                 self.assertTrue(torch.all(layer_weights[W.moe_w1][:, :inter] == 1))

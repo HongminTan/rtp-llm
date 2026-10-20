@@ -116,6 +116,9 @@ def sgl_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    *,
+    output_q: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -123,15 +126,40 @@ def sgl_per_token_group_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
-    x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=out_shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
-    )
+    if output_q is None:
+        x_q = torch.empty(out_shape, device=x.device, dtype=fp8_dtype)
+    else:
+        if (
+            output_q.shape != out_shape
+            or output_q.dtype != fp8_dtype
+            or output_q.device != x.device
+            or not output_q.is_contiguous()
+        ):
+            raise ValueError(
+                "output_q must be a contiguous FP8 tensor matching the output"
+            )
+        x_q = output_q
+    if output_scale is None:
+        x_s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=out_shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+        )
+    else:
+        if column_major_scales or scale_tma_aligned or scale_ue8m0:
+            raise ValueError("output_scale only supports row-major FP32 scales")
+        scale_shape = (*out_shape[:-1], out_shape[-1] // group_size)
+        if (
+            output_scale.shape != scale_shape
+            or output_scale.dtype != torch.float32
+            or output_scale.device != x.device
+            or not output_scale.is_contiguous()
+        ):
+            raise ValueError("output_scale must be contiguous FP32 block scales")
+        x_s = output_scale
     if x.shape[0] > 0:
         quant_kernel = os.environ.get("DSV4_FP8_QUANT_KERNEL", "auto").strip().lower()
 

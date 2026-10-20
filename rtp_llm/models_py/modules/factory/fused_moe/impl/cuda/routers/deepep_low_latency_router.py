@@ -70,14 +70,8 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
 
         # DeepEpLowLatency-specific initialization
         self._num_experts = config.expert_num
-        self._ll_num_max_token_per_rank = (
-            DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
-                config.ll_num_max_token, config.tp_size, config.quant_config
-            )
-        )
-        deepep_config = DeepepWrapperConfig.from_config_adapter(
-            self.config, self._ll_num_max_token_per_rank
-        )
+        deepep_config = DeepepWrapperConfig.from_config_adapter(self.config)
+        self._ll_num_max_token_per_rank = deepep_config.ll_num_max_token_per_rank
         wrapper = DeepEPWrapper.get_instance(deepep_config)
         assert (
             wrapper.mode == DeepEPMode.LOW_LATENCY
@@ -223,8 +217,9 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             "return_recv_hook": self._return_recv_hook,
         }
         # Set quantization config for DeepEP low latency dispatch
-        if self.quant_config.is_block_quantized and is_deep_gemm_e8m0_used():
-            dispatch_args.update({"round_scale": True, "use_ue8m0": True})
+        if self.quant_config.is_block_quantized:
+            use_ue8m0 = is_deep_gemm_e8m0_used()
+            dispatch_args.update({"round_scale": use_ue8m0, "use_ue8m0": use_ue8m0})
 
         # Normal prepare
         expert_payload = self._normal_prepare(dispatch_args, tp_topk_weights)

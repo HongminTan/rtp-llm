@@ -11,6 +11,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from rtp_llm.config.model_config import ModelConfig
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.local_loop import (
     LocalLoopExecutor,
 )
@@ -27,6 +31,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer imp
     resolve_moe_max_tokens_per_rank,
     synchronized_moe_chunk_plan,
 )
+from rtp_llm.ops import MoeConfig, ParallelismConfig
 from rtp_llm.utils.model_weight import W
 
 _WORLD_SIZE = 2
@@ -157,25 +162,39 @@ def _make_moe(
     max_tokens_per_rank: int = _MAX_TOKENS,
     chunking_enabled: bool = True,
 ) -> MoE:
-    return MoE(
-        moe_w1_layout="gate_up",
+    model_config = ModelConfig()
+    model_config.hidden_size = _DIM
+    model_config.moe_inter_size = _INTER_DIM
+    model_config.expert_num = _EXPERTS
+    model_config.moe_k = _TOPK
+    model_config.n_shared_experts = n_shared_experts
+    model_config.routed_scaling_factor = 1.5
+    model_config.swiglu_limit = 10.0
+    model_config.moe_w1_layout = "gate_up"
+    parallelism = ParallelismConfig()
+    parallelism.ep_size = ep_size
+    parallelism.ep_rank = ep_rank
+    parallelism.world_size = ep_size
+    parallelism.world_rank = ep_rank
+    parallelism.dp_size = ep_size
+    parallelism.dp_rank = ep_rank
+    moe_config = MoeConfig()
+    moe_config.moe_strategy = strategy
+    config = MoEConfigAdapter(model_config, parallelism, moe_config).for_layer(
         layer_id=layer_id,
-        dim=_DIM,
         moe_inter_dim=_INTER_DIM,
-        n_routed_experts=_EXPERTS,
-        n_activated_experts=_TOPK,
-        n_shared_experts=n_shared_experts,
+        moe_w1_layout="gate_up",
+        max_tokens_per_rank=max_tokens_per_rank,
+        moe_quant_method="FP8_FP4",
+        warmup_include_capacity=chunking_enabled,
+    )
+    return MoE(
+        config=config,
         score_func="sqrtsoftplus",
-        route_scale=1.5,
-        swiglu_limit=10.0,
         n_hash_layers=8 if hash_routing else 0,
         vocab_size=64,
         layer_weights=layer_weights,
-        ep_size=ep_size,
-        ep_rank=ep_rank,
-        max_tokens_per_rank=max_tokens_per_rank,
         chunking_enabled=chunking_enabled,
-        strategy=strategy,
     )
 
 

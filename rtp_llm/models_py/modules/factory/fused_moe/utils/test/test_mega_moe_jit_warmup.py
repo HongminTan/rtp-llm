@@ -21,9 +21,6 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe im
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se import (
     MegaMoeSEExecutor,
 )
-from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.layer import (
-    Fp8Fp4MoeRuntimeConfig,
-)
 from rtp_llm.models_py.modules.factory.fused_moe.utils.mega_moe.input_packer import (
     FusedMegaMoEInputPacker,
 )
@@ -55,18 +52,32 @@ class MegaMoeJitWarmupTest(unittest.TestCase):
     def test_tmpdir_is_restored_after_warmup_failure(self):
         executor = MegaMoeExecutor.__new__(MegaMoeExecutor)
         torch.nn.Module.__init__(executor)
-        executor.cfg = Fp8Fp4MoeRuntimeConfig(
+        model_config = ModelConfig()
+        model_config.hidden_size = 7168
+        model_config.moe_inter_size = 2048
+        model_config.expert_num = 256
+        model_config.moe_k = 6
+        model_config.n_shared_experts = 1
+        model_config.swiglu_limit = 7.0
+        model_config.routed_scaling_factor = 1.0
+        model_config.moe_w1_layout = "up_gate"
+        parallelism = ParallelismConfig()
+        parallelism.ep_size = 8
+        parallelism.ep_rank = 5
+        parallelism.world_size = 8
+        parallelism.world_rank = 5
+        parallelism.dp_size = 8
+        parallelism.dp_rank = 5
+        moe_config = MoeConfig()
+        moe_config.moe_strategy = "mega_moe"
+        executor.cfg = MoEConfigAdapter(
+            model_config, parallelism, moe_config
+        ).for_layer(
             layer_id=1,
-            hidden_size=7168,
             moe_inter_dim=2048,
-            expert_num=256,
-            moe_k=6,
-            n_shared_experts=1,
-            swiglu_limit=7.0,
-            ep_size=8,
-            ep_rank=5,
+            moe_w1_layout="up_gate",
             max_tokens_per_rank=4096,
-            moe_strategy="mega_moe",
+            moe_quant_method="FP8_FP4",
         )
         executor._input_packer = FusedMegaMoEInputPacker()
         executor.warmup_jit = mock.Mock(side_effect=RuntimeError("compile failed"))
@@ -99,19 +110,32 @@ class MegaMoeJitWarmupTest(unittest.TestCase):
     def test_warmup_compiles_ordinary_and_both_gate_pack_variants(self):
         executor = MegaMoeExecutor.__new__(MegaMoeExecutor)
         torch.nn.Module.__init__(executor)
-        executor.cfg = Fp8Fp4MoeRuntimeConfig(
+        model_config = ModelConfig()
+        model_config.hidden_size = 128
+        model_config.moe_inter_size = 128
+        model_config.expert_num = 16
+        model_config.moe_k = 4
+        model_config.n_shared_experts = 0
+        model_config.swiglu_limit = 7.0
+        model_config.routed_scaling_factor = 2.5
+        model_config.moe_w1_layout = "up_gate"
+        parallelism = ParallelismConfig()
+        parallelism.ep_size = 2
+        parallelism.ep_rank = 0
+        parallelism.world_size = 2
+        parallelism.world_rank = 0
+        parallelism.dp_size = 2
+        parallelism.dp_rank = 0
+        moe_config = MoeConfig()
+        moe_config.moe_strategy = "mega_moe"
+        executor.cfg = MoEConfigAdapter(
+            model_config, parallelism, moe_config
+        ).for_layer(
             layer_id=1,
-            hidden_size=128,
             moe_inter_dim=128,
-            expert_num=16,
-            moe_k=4,
-            n_shared_experts=0,
-            swiglu_limit=7.0,
-            ep_size=2,
-            ep_rank=0,
+            moe_w1_layout="up_gate",
             max_tokens_per_rank=4,
-            moe_strategy="mega_moe",
-            route_scale=2.5,
+            moe_quant_method="FP8_FP4",
         )
         executor._mega_l1_w = torch.empty(1)
         executor._input_packer = FusedMegaMoEInputPacker()

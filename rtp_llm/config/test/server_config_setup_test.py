@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
@@ -15,7 +16,13 @@ from rtp_llm.config.server_config_setup import (
     set_parallelism_config,
     setup_and_configure_server,
 )
-from rtp_llm.ops import CPRotateMethod, NcclCommConfig, RoleType
+from rtp_llm.ops import (
+    CPRotateMethod,
+    MoeConfig,
+    NcclCommConfig,
+    RoleType,
+    SpeculativeType,
+)
 from rtp_llm.server.server_args.server_args import setup_args
 from rtp_llm.start_backend_server import start_backend_server
 
@@ -29,6 +36,52 @@ _PINNED_DEVICES = {
 
 def _jit_env(**values):
     return {**_PINNED_DEVICES, "MODEL_TYPE": "fake_model", **values}
+
+
+class DeepEPCapacityConfigTest(TestCase):
+    def test_ll_capacity_covers_graph_and_speculative_tokens(self):
+        cases = (
+            (False, 128, 0, 0, 32),
+            (True, 128, 0, 0, 128),
+            (True, 128, 4, 160, 640),
+            (True, 128, 4, 1024, 1024),
+        )
+        for graph, graph_batch, draft_tokens, token_floor, expected in cases:
+            with self.subTest(case=(graph, graph_batch, draft_tokens, token_floor)):
+                configs = PyEnvConfigs()
+                configs.concurrency_config.concurrency_limit = 32
+                configs.moe_config.use_deepep_low_latency = True
+                configs.moe_config.ll_num_max_token = token_floor
+                configs.py_hw_kernel_config.enable_cuda_graph = graph
+                configs.py_hw_kernel_config.decode_capture_batch_sizes = [
+                    1,
+                    graph_batch,
+                ]
+                configs.sp_config.type = (
+                    SpeculativeType.EAGLE if draft_tokens else SpeculativeType.NONE
+                )
+                configs.sp_config.gen_num_per_cycle = draft_tokens
+
+                engine = EngineConfig.create(configs)
+                self.assertEqual(engine.moe_config.ll_num_max_token, expected)
+
+                # replace also exercises direct dataclass construction.
+                direct_moe = MoeConfig()
+                direct_moe.use_deepep_low_latency = True
+                direct_moe.ll_num_max_token = token_floor
+                direct = replace(engine, moe_config=direct_moe)
+                self.assertEqual(direct.moe_config.ll_num_max_token, expected)
+                self.assertEqual(replace(direct).moe_config.ll_num_max_token, expected)
+                self.assertEqual(engine.runtime_config.max_generate_batch_size, 32)
+
+    def test_normal_mode_does_not_expand_ll_capacity(self):
+        configs = PyEnvConfigs()
+        configs.moe_config.use_deepep_low_latency = False
+        configs.moe_config.ll_num_max_token = 7
+        configs.py_hw_kernel_config.enable_cuda_graph = True
+        configs.py_hw_kernel_config.decode_capture_batch_sizes = [128]
+        engine = EngineConfig.create(configs)
+        self.assertEqual(engine.moe_config.ll_num_max_token, 7)
 
 
 class ServerConfigPortLayoutTest(TestCase):

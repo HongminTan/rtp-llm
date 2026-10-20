@@ -57,10 +57,12 @@ _configure_deepep_nccl_root()
 try:
     from deep_ep import Buffer as DeepEPBuffer
     from deep_ep import Config as DeepEPConfig
+    from deep_ep_cpp import Buffer as _DeepEPRuntimeBuffer
 except ImportError as _deep_ep_import_err:
     # Some CPU and non-NVIDIA builds intentionally omit deep_ep. Keep unrelated
     # startup paths importable and fail only when a DeepEP path is selected.
     _DEEP_EP_IMPORT_ERROR = _deep_ep_import_err
+    _DeepEPRuntimeBuffer = None
 
     class _DeepEPUnavailable:
         """Stub for deep_ep.Buffer / deep_ep.Config when the wheel is missing."""
@@ -88,7 +90,6 @@ from rtp_llm.config.quant_config import QuantizationConfig
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
-from rtp_llm.ops import SpeculativeType
 
 __all__ = [
     "DeepepWrapperConfig",
@@ -140,7 +141,7 @@ class DeepepWrapperConfig:
 
     @classmethod
     def from_config_adapter(
-        cls, config_adapter: MoEConfigAdapter, ll_num_max_token_per_rank: int = 0
+        cls, config_adapter: MoEConfigAdapter
     ) -> "DeepepWrapperConfig":
         """Create DeepepWrapperConfig from MoEConfigAdapter.
 
@@ -153,6 +154,15 @@ class DeepepWrapperConfig:
         model_config = config_adapter.model_config
         parallelism_config = config_adapter.parallelism_config
         moe_config = config_adapter.moe_config
+        ll_num_max_token_per_rank = (
+            cls.calc_low_latency_max_token_per_rank(
+                config_adapter.ll_num_max_token,
+                config_adapter.tp_size,
+                config_adapter.quant_config,
+            )
+            if moe_config.use_deepep_low_latency
+            else 0
+        )
 
         ffn_config = parallelism_config.ffn_disaggregate_config
         if ffn_config is not None and ffn_config.enable_ffn_disaggregate:
@@ -514,6 +524,8 @@ class DeepEPWrapper:
     def _init_low_latency_buffer(self, group: ProcessGroup) -> DeepEPBuffer:
         """Initialize buffer for low-latency mode."""
         config = self._config
+        if config.ll_num_max_token_per_rank <= 0:
+            raise ValueError("DeepEP LL requires a positive per-rank token capacity")
         num_rdma_bytes = DeepEPBuffer.get_low_latency_rdma_size_hint(
             config.ll_num_max_token_per_rank,
             config.hidden_size,
@@ -531,7 +543,7 @@ class DeepEPWrapper:
                 flush=True,
             )
 
-        num_qps_per_rank = config.expert_num / config.ep_size
+        num_qps_per_rank = config.expert_num // config.ep_size
 
         init_kwargs = {
             "group": group,
@@ -540,6 +552,13 @@ class DeepEPWrapper:
             "low_latency_mode": True,
             "num_qps_per_rank": num_qps_per_rank,
         }
+        if hasattr(_DeepEPRuntimeBuffer, "is_low_latency_optimize"):
+            # Match AcclEP C++'s low_latency_optimize > 0 predicate. Otherwise
+            # Python's allow_nvlink=True default promotes opt=0 to 1 by itself.
+            # Keep topology-dependent kernel selection in the C++ runtime.
+            init_kwargs["allow_nvlink_for_low_latency_mode"] = (
+                int(os.environ.get("ACCL_LOW_LATENCY_OPTIMIZE", "0")) > 0
+            )
         return DeepEPBuffer(**init_kwargs)  # type: ignore
 
     def _destroy_buffer(self) -> None:
@@ -588,21 +607,6 @@ def init_deepep_wrapper(
         enable_cuda_graph=enable_cuda_graph,
     )
 
-    ll_num_max_token_per_rank = 0
-    if engine_config.moe_config.use_deepep_low_latency:
-        ll_num_max_token = engine_config.runtime_config.max_generate_batch_size
-        if engine_config.sp_config.type != SpeculativeType.NONE:
-            ll_num_max_token *= engine_config.sp_config.gen_num_per_cycle + 1
-        ll_num_max_token_per_rank = (
-            DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
-                ll_num_max_token,
-                engine_config.parallelism_config.tp_size,
-                model_config.quant_config,
-            )
-        )
-
-    deepep_config = DeepepWrapperConfig.from_config_adapter(
-        deepep_config_adapter, ll_num_max_token_per_rank
-    )
+    deepep_config = DeepepWrapperConfig.from_config_adapter(deepep_config_adapter)
 
     DeepEPWrapper.create(deepep_config)

@@ -11,6 +11,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
+    MoEConfigAdapter,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.layer import (
     Fp8Fp4MoeLayer,
 )
@@ -128,68 +131,31 @@ class ChunkedFp8Fp4MoeLayer(nn.Module):
 
     def __init__(
         self,
-        layer_id: int,
-        dim: int,
-        moe_inter_dim: int,
-        n_routed_experts: int,
-        n_activated_experts: int,
-        n_shared_experts: int,
+        *,
+        config: MoEConfigAdapter,
         score_func: str,
-        route_scale: float,
-        swiglu_limit: float,
         n_hash_layers: int,
         vocab_size: int,
-        layer_weights: Optional[Dict] = None,
-        ep_size: int = 1,
-        ep_rank: int = 0,
-        world_size: Optional[int] = None,
-        world_rank: Optional[int] = None,
-        max_tokens_per_rank: int = 8192,
+        layer_weights: Dict,
         is_decode_role: bool = False,
-        strategy: Optional[str] = None,
-        n_physical_experts: Optional[int] = None,
-        *,
         chunking_enabled: bool = True,
-        model_type: str = "generic_fp8_fp4_moe",
-        moe_w1_layout: str = "up_gate",
-        has_shared_expert_gate: bool = False,
         observer_factory: Optional[ObserverFactory] = None,
         record_function_scope: Callable[[], ContextManager] = nullcontext,
     ) -> None:
         super().__init__()
-        if layer_weights is None:
-            raise ValueError("ChunkedFp8Fp4MoeLayer requires per-layer weights")
-        self.layer_id = int(layer_id)
-        self.dim = int(dim)
-        self.max_tokens_per_rank = int(max_tokens_per_rank)
+        self.layer_id = config.layer_id
+        self.dim = config.dim
+        self.max_tokens_per_rank = config.max_tokens_per_rank
         self._is_decode_role = bool(is_decode_role)
         self.chunking_enabled = chunking_enabled
         self._observer_factory = observer_factory
         self._record_function_scope = record_function_scope
         self._moe = Fp8Fp4MoeLayer(
-            layer_id=layer_id,
-            dim=dim,
-            moe_inter_dim=moe_inter_dim,
-            n_routed_experts=n_routed_experts,
-            n_activated_experts=n_activated_experts,
-            n_shared_experts=n_shared_experts,
+            config=config,
             score_func=score_func,
-            route_scale=route_scale,
-            swiglu_limit=swiglu_limit,
             n_hash_layers=n_hash_layers,
             vocab_size=vocab_size,
             layer_weights=layer_weights,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            world_size=world_size,
-            world_rank=world_rank,
-            max_tokens_per_rank=max_tokens_per_rank,
-            strategy=strategy or "auto",
-            model_type=model_type,
-            warmup_include_capacity=chunking_enabled and not is_decode_role,
-            moe_w1_layout=moe_w1_layout,
-            has_shared_expert_gate=has_shared_expert_gate,
-            physical_expert_num=n_physical_experts,
         )
         self.strategy_name = self._moe.strategy_name
 
