@@ -21,6 +21,7 @@ def _mhc_pre_big_fuse(
     sinkhorn_repeat: int,
     n_splits: int = 16,
     mhc_mult: int = 4,
+    use_pdl: bool = False,
 ):
     num_tokens = T.dynamic("num_tokens")
     mhc_mult3 = mhc_mult * (2 + mhc_mult)
@@ -39,6 +40,8 @@ def _mhc_pre_big_fuse(
         layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
     ) -> None:
         with T.Kernel(num_tokens, threads=96) as pid:
+            if use_pdl:
+                T.pdl_sync()
             ##################################################################
             # _mhc_pre_norm_fn_fwd_norm
             mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
@@ -136,5 +139,8 @@ def _mhc_pre_big_fuse(
                             ol[i1_h] += pre * xl[i_mhc, i1_h]
 
                     T.copy(ol, layer_input[pid, i0_h * hidden_block], disable_tma=True)
+
+            if use_pdl:
+                T.pdl_trigger()
 
     return mhc_pre_big_fuse

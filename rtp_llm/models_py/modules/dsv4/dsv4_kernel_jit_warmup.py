@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import torch
 
+from rtp_llm.models_py.modules.dsv4 import mhc_prenorm_backend
 from rtp_llm.utils.warmup import model_warm_up_enabled
 
 _DENSE_GEMM_FALLBACK_M_GRID = [
@@ -1681,66 +1682,28 @@ def _generate_dense_gemm_warmup_m_grid(
     return tuple(sorted(reps_by_signature.values()))
 
 
-def _mhc_prenorm_deepgemm_backend_enabled() -> bool:
-    requested = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
-    if requested in ("", "auto", "deepgemm", "dg"):
-        return True
-    if requested in ("tilelang", "single", "tilelang_single", "tilelang_splitk"):
-        return False
-    return requested == "deepgemm"
-
-
-def _mhc_prenorm_deepgemm_backend_name() -> str:
-    requested = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
-    if requested in ("", "auto", "deepgemm", "dg"):
-        return "deepgemm"
-    if requested in ("tilelang", "single"):
-        return "tilelang_single"
-    return requested
-
-
-def _compute_mhc_prenorm_num_split(
-    *,
-    m_value: int,
-    k_value: int,
-    num_sms: int,
-) -> int:
-    block_m = 64
-    block_k = 64
-    grid_size = _ceil_div(max(int(m_value), 1), block_m)
-    split_k = max(int(num_sms), 1) // max(grid_size, 1)
-    num_block_k = _ceil_div(int(k_value), block_k)
-    split_k = min(split_k, num_block_k // 4)
-    return max(split_k, 1)
-
-
 @lru_cache(maxsize=1024)
 def _generate_mhc_prenorm_warmup_specs(
     *,
     max_m: int,
     k_value: int,
     num_sms: int,
+    backend: str,
 ) -> tuple[tuple[int, int], ...]:
-    """Return ``(num_splits, representative_m)`` pairs for mHC prenorm GEMM.
-
-    DeepGEMM compiles ``num_splits`` for this kernel, not M itself.  RTP's
-    TileKernels wrapper derives ``num_splits`` from ``ceil(num_tokens / 64)``;
-    choose the first M that reaches each split value up to the rank-local
-    prefill token bound.
-    """
-
     max_m = max(int(max_m), 0)
     if max_m <= 0:
         return ()
 
+    resolve_n_splits = mhc_prenorm_backend.resolve_n_splits
     reps_by_split: dict[int, int] = {}
     max_grid = _ceil_div(max_m, 64)
     for grid_size in range(1, max_grid + 1):
         m_value = (grid_size - 1) * 64 + 1
-        num_splits = _compute_mhc_prenorm_num_split(
-            m_value=m_value,
-            k_value=k_value,
-            num_sms=num_sms,
+        num_splits = resolve_n_splits(
+            mhc_hidden_size=int(k_value),
+            num_tokens=m_value,
+            num_sms=int(num_sms),
+            backend=str(backend),
         )
         reps_by_split.setdefault(num_splits, m_value)
         if num_splits == 1:
@@ -1942,8 +1905,6 @@ def warmup_mhc_prenorm_gemm_jit(
     max_m: int,
     device: torch.device,
 ) -> None:
-    """Compile reachable mHC prenorm GEMM and TileLang post-fuse variants."""
-
     if not model_warm_up_enabled():
         return
     device = torch.device(device)
@@ -1951,21 +1912,19 @@ def warmup_mhc_prenorm_gemm_jit(
         return
     _assert_not_capturing()
 
-    backend = _mhc_prenorm_deepgemm_backend_name()
-    deepgemm_enabled = _mhc_prenorm_deepgemm_backend_enabled()
-    num_sms = _get_deep_gemm_num_sms(device)
+    backend = mhc_prenorm_backend.resolve_backend()
+    deepgemm_enabled = backend == "deepgemm"
+    num_sms = mhc_prenorm_backend.device_num_sms(device)
     shape_keys = tuple(sorted(shapes.keys()))
-    if deepgemm_enabled:
-        specs_by_shape = {
-            key: _generate_mhc_prenorm_warmup_specs(
-                max_m=int(max_m),
-                k_value=int(key[1]),
-                num_sms=num_sms,
-            )
-            for key in shape_keys
-        }
-    else:
-        specs_by_shape = {key: ((1, 1),) for key in shape_keys if int(max_m) > 0}
+    specs_by_shape = {
+        key: _generate_mhc_prenorm_warmup_specs(
+            max_m=int(max_m),
+            k_value=int(key[1]),
+            num_sms=num_sms,
+            backend=backend,
+        )
+        for key in shape_keys
+    }
     specs_by_shape = {key: specs for key, specs in specs_by_shape.items() if specs}
     if not specs_by_shape:
         return
@@ -2031,7 +1990,7 @@ def warmup_mhc_prenorm_gemm_jit(
                 else:
                     _run_tilelang_warmup_launch_with_retry(
                         "DSV4 mHC TileLangPre",
-                        f"shape={key} m={m_value}",
+                        f"shape={key} backend={backend} num_splits={num_splits} m={m_value}",
                         partial(
                             _launch_dummy_mhc_pre_wrapper,
                             key=key,
@@ -2595,6 +2554,7 @@ def _launch_dummy_mhc_pre_big_fuse(
         sinkhorn_iters,
         n_splits=int(num_splits),
         mhc_mult=mhc_mult,
+        use_pdl=mhc_prenorm_backend.device_supports_pdl(device),
     )(
         gemm_out_mul,
         gemm_out_sqrsum,

@@ -69,30 +69,41 @@ def _mhc_pre_norm_fn_fwd_mul(
     mhc_mult3: int,
     n_rms_group: int,
     rms_group_size: int,
+    n_splits: int = 1,
     token_block: int = 32,
     hidden_block: int = 256,
 ) -> tilelang.JITKernel:
-    assert mhc_mult3 <= 32
+    assert (
+        0 < mhc_mult3 <= 32
+    ), f"mhc_mult3={mhc_mult3} must be positive and fit the 32-wide store fragment"
     num_tokens = T.dynamic("num_tokens")
     assert rms_group_size % hidden_block == 0
+    assert n_splits > 0
+    n_blk = rms_group_size // hidden_block
+    assert n_blk % n_splits == 0, (
+        f"n_splits={n_splits} must divide the {n_blk} K blocks "
+        f"(rms_group_size={rms_group_size}, hidden_block={hidden_block})"
+    )
+    blk_per_split = n_blk // n_splits
 
     @T.prim_func
     def _mhc_pre_norm_fn_fwd_mul_kernel(
         x: T.Tensor[(num_tokens, n_rms_group * rms_group_size), T.bfloat16],
         fn: T.Tensor[(mhc_mult3, n_rms_group * rms_group_size), T.float32],
-        out: T.Tensor[(num_tokens, n_rms_group, mhc_mult3), T.float32],
-        sqrsum: T.Tensor[(num_tokens, n_rms_group), T.float32],
+        out: T.Tensor[(n_splits, num_tokens, n_rms_group, mhc_mult3), T.float32],
+        sqrsum: T.Tensor[(n_splits, num_tokens, n_rms_group), T.float32],
     ) -> None:
         _ = mhc_mult3
-        with T.Kernel(T.ceildiv(num_tokens, token_block), n_rms_group) as (
+        with T.Kernel(T.ceildiv(num_tokens, token_block), n_rms_group, n_splits) as (
             pid_x,
             pid_y,
+            pid_s,
         ):
             out_frag = T.alloc_fragment((token_block, 32), T.float32)
             sqrsum_part = T.alloc_fragment((token_block, 4), T.float32)
             T.clear(out_frag)
             T.clear(sqrsum_part)
-            for pz in T.Pipelined(rms_group_size // hidden_block, num_stages=2):
+            for pz in T.Pipelined(blk_per_split, num_stages=2):
                 x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
                 fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
@@ -101,10 +112,21 @@ def _mhc_pre_norm_fn_fwd_mul(
                 )
 
                 T.copy(
-                    x[pid_x * token_block, pid_y * rms_group_size + pz * hidden_block],
+                    x[
+                        pid_x * token_block,
+                        pid_y * rms_group_size
+                        + (pid_s * blk_per_split + pz) * hidden_block,
+                    ],
                     x_smem_16,
                 )
-                T.copy(fn[0, pid_y * rms_group_size + pz * hidden_block], fn_smem)
+                T.copy(
+                    fn[
+                        0,
+                        pid_y * rms_group_size
+                        + (pid_s * blk_per_split + pz) * hidden_block,
+                    ],
+                    fn_smem,
+                )
 
                 x_frag_16 = T.alloc_fragment((token_block, hidden_block), T.bfloat16)
                 T.copy(x_smem_16, x_frag_16)
@@ -128,10 +150,10 @@ def _mhc_pre_norm_fn_fwd_mul(
             sqrsum_l = T.alloc_fragment(token_block, T.float32)
             T.reduce_sum(sqrsum_part, sqrsum_l)
             for i in T.Parallel(token_block):
-                sqrsum[pid_x * token_block + i, pid_y] = sqrsum_l[i]
+                sqrsum[pid_s, pid_x * token_block + i, pid_y] = sqrsum_l[i]
             for i, j in T.Parallel(token_block, 32):
-                if j < 24:
-                    out[pid_x * token_block + i, pid_y, j] = out_frag[i, j]
+                if j < mhc_mult3:
+                    out[pid_s, pid_x * token_block + i, pid_y, j] = out_frag[i, j]
 
     return _mhc_pre_norm_fn_fwd_mul_kernel
 

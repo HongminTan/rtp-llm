@@ -47,7 +47,6 @@ from rtp_llm.models_py.modules.dsv4.dsv4_kernel_jit_warmup import (
     _collect_dsv4_fp8_mqa_logits_shapes,
     _collect_dsv4_mhc_head_fused_shapes,
     _collect_dsv4_mhc_prenorm_shapes,
-    _compute_mhc_prenorm_num_split,
     _cp_direct_gather_batch_warmup_sizes,
     _cp_padded_tokens_per_rank_bound,
     _cp_restore_batch_warmup_sizes,
@@ -779,31 +778,23 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
         self.assertIn(96, block_ms)
 
     def test_mhc_prenorm_warmup_specs_cover_reachable_num_splits(self):
-        specs = _generate_mhc_prenorm_warmup_specs(
-            max_m=200000,
-            k_value=16384,
-            num_sms=148,
-        )
-        splits = {split for split, _ in specs}
-        self.assertTrue({1, 8, 49, 64}.issubset(splits))
-
-        reps_by_split = dict(specs)
-        self.assertEqual(
-            _compute_mhc_prenorm_num_split(
-                m_value=reps_by_split[49],
-                k_value=16384,
-                num_sms=148,
-            ),
-            49,
-        )
-        self.assertEqual(
-            _compute_mhc_prenorm_num_split(
-                m_value=reps_by_split[8],
-                k_value=16384,
-                num_sms=148,
-            ),
-            8,
-        )
+        policy = warmup_module.mhc_prenorm_backend
+        for backend in ("deepgemm", "tilelang"):
+            with self.subTest(backend=backend):
+                specs = _generate_mhc_prenorm_warmup_specs(
+                    max_m=200000, k_value=16384, num_sms=148, backend=backend
+                )
+                expected = {
+                    policy.resolve_n_splits(
+                        mhc_hidden_size=16384,
+                        num_tokens=m,
+                        num_sms=148,
+                        backend=backend,
+                    )
+                    for m in range(1, 200001, 64)
+                }
+                self.assertEqual({split for split, _ in specs}, expected)
+                self.assertEqual(expected, {1, 2, 4, 8, 16, 32, 64})
 
     def test_mhc_warmup_launches_prenorm_gemm_and_pre_big_fuse(self):
         calls = []
@@ -834,14 +825,13 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             old_values["_assert_not_capturing"] = with_patch(
                 "_assert_not_capturing", lambda: None
             )
-            old_values["_get_deep_gemm_num_sms"] = with_patch(
-                "_get_deep_gemm_num_sms", lambda device: 148
-            )
-            old_values["_mhc_prenorm_deepgemm_backend_name"] = with_patch(
-                "_mhc_prenorm_deepgemm_backend_name", lambda: "deepgemm"
-            )
-            old_values["_mhc_prenorm_deepgemm_backend_enabled"] = with_patch(
-                "_mhc_prenorm_deepgemm_backend_enabled", lambda: True
+            old_values["mhc_prenorm_backend"] = with_patch(
+                "mhc_prenorm_backend",
+                SimpleNamespace(
+                    resolve_backend=lambda: "deepgemm",
+                    device_num_sms=lambda device: 148,
+                    resolve_n_splits=warmup_module.mhc_prenorm_backend.resolve_n_splits,
+                ),
             )
             old_values["_generate_mhc_prenorm_warmup_specs"] = with_patch(
                 "_generate_mhc_prenorm_warmup_specs",
@@ -892,7 +882,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             [("fuse_launch", 8), ("fuse_launch", 1)],
         )
 
-    def test_mhc_tilelang_single_warmup_uses_runtime_wrapper(self):
+    def test_mhc_tilelang_warmup_uses_runtime_wrapper(self):
         calls = []
         shapes = {
             (24, 16384): {
@@ -921,14 +911,13 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             old_values["_assert_not_capturing"] = with_patch(
                 "_assert_not_capturing", lambda: None
             )
-            old_values["_get_deep_gemm_num_sms"] = with_patch(
-                "_get_deep_gemm_num_sms", lambda device: 148
-            )
-            old_values["_mhc_prenorm_deepgemm_backend_name"] = with_patch(
-                "_mhc_prenorm_deepgemm_backend_name", lambda: "tilelang_single"
-            )
-            old_values["_mhc_prenorm_deepgemm_backend_enabled"] = with_patch(
-                "_mhc_prenorm_deepgemm_backend_enabled", lambda: False
+            old_values["mhc_prenorm_backend"] = with_patch(
+                "mhc_prenorm_backend",
+                SimpleNamespace(
+                    resolve_backend=lambda: "tilelang",
+                    device_num_sms=lambda device: 148,
+                    resolve_n_splits=warmup_module.mhc_prenorm_backend.resolve_n_splits,
+                ),
             )
             old_values["_dist_rank"] = with_patch("_dist_rank", lambda: 0)
             old_values["_sync_cuda"] = with_patch("_sync_cuda", lambda device: None)
@@ -963,7 +952,15 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
                 setattr(warmup_module, name, value)
             warmup_module._MHC_PRENORM_GEMM_JIT_WARMED_KEYS.clear()
 
-        self.assertEqual(calls, [("wrapper", 1)])
+        self.assertEqual(
+            calls,
+            [
+                ("wrapper", m)
+                for _, m in _generate_mhc_prenorm_warmup_specs(
+                    max_m=1024, k_value=16384, num_sms=148, backend="tilelang"
+                )
+            ],
+        )
 
     def test_mhc_head_fused_warmup_uses_batched_two_token_shape(self):
         calls = []

@@ -1,6 +1,8 @@
+import importlib
 import os
 import unittest
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
 
@@ -253,45 +255,94 @@ class TestHCImpl(unittest.TestCase):
                     unit.post(x, residual, bad_post, comb)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_tilelang_matches_fallback_cuda(self) -> None:
-        hc, dim = 4, 128
-        fn, base, scale = _weights(hc, dim, device="cuda")
-        x = torch.randn(1, 64, hc, dim, device="cuda", dtype=torch.bfloat16)
-        sublayer = torch.randn(1, 64, dim, device="cuda", dtype=torch.bfloat16)
+    @torch.inference_mode()
+    def test_prenorm_backends_match_reference_cuda(self):
+        from rtp_llm.models_py.modules.dsv4.hc.mhc_tilelang import _import_tk
 
-        fallback = FallbackHCUnit(
-            fn,
-            base,
-            scale,
-            dim=dim,
-            hc_mult=hc,
-            hc_sinkhorn_iters=20,
-            norm_eps=1e-6,
-            hc_eps=1e-6,
+        _, mhc_post, _, _ = _import_tk()
+        op = importlib.import_module(
+            "rtp_llm.models_py.3rdparty.tile_kernels.modeling.mhc.ops.pre_big_fuse"
         )
-        tilelang = TileLangHCUnit(
-            fn,
-            base,
-            scale,
-            dim=dim,
-            hc_mult=hc,
-            hc_sinkhorn_iters=20,
-            norm_eps=1e-6,
-            hc_eps=1e-6,
+        self.addCleanup(
+            setattr,
+            torch.backends.cuda.matmul,
+            "allow_tf32",
+            torch.backends.cuda.matmul.allow_tf32,
         )
-        with torch.inference_mode():
-            ref_y, ref_post, ref_comb = fallback.pre(x)
-            tk_y, tk_post, tk_comb = tilelang.pre(x)
-            ref_out = fallback.post(sublayer, x, ref_post, ref_comb)
-            tk_out = tilelang.post(sublayer, x, tk_post, tk_comb)
-        torch.testing.assert_close(tk_y, ref_y, atol=2e-2, rtol=2e-2)
-        torch.testing.assert_close(
-            tk_post.float(), ref_post.float(), atol=5e-3, rtol=5e-3
-        )
-        torch.testing.assert_close(
-            tk_comb.float(), ref_comb.float(), atol=5e-3, rtol=5e-3
-        )
-        torch.testing.assert_close(tk_out, ref_out, atol=2e-2, rtol=2e-2)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        hc, eps = 4, 1e-6
+        for tokens, hidden_size, n_splits in (
+            (64, 128, None),
+            (1, 4096, None),
+            (65, 4096, None),
+            (512, 4096, None),
+            (4096, 4096, None),
+            (65, 4096, 1),
+        ):
+            torch.manual_seed(tokens)
+            residual = torch.randn(
+                tokens, hc, hidden_size, device="cuda", dtype=torch.bfloat16
+            )
+            weight = (
+                torch.randn(24, hc * hidden_size, device="cuda")
+                / (hc * hidden_size) ** 0.5
+            )
+            scale = torch.tensor([0.8, 1.2, 0.7], device="cuda")
+            base = torch.randn(24, device="cuda") * 0.1
+            flat = residual.float().flatten(1)
+            mixes = (flat @ weight.T) * torch.rsqrt(
+                flat.square().mean(-1, keepdim=True) + eps
+            )
+            pre = torch.sigmoid(mixes[:, :4] * scale[0] + base[:4]) + eps
+            post = (2 * torch.sigmoid(mixes[:, 4:8] * scale[1] + base[4:8])).unsqueeze(
+                -1
+            )
+            comb = (mixes[:, 8:] * scale[2] + base[8:]).view(-1, hc, hc)
+            comb = comb.softmax(-1) + eps
+            comb = comb / (comb.sum(-2, keepdim=True) + eps)
+            for _ in range(19):
+                comb = comb / (comb.sum(-1, keepdim=True) + eps)
+                comb = comb / (comb.sum(-2, keepdim=True) + eps)
+            output = (residual.float() * pre.unsqueeze(-1)).sum(1).bfloat16()
+            sublayer = torch.randn(
+                tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+            )
+            ref_out = (
+                post * sublayer.float().unsqueeze(-2)
+                + comb.transpose(-1, -2) @ residual.float()
+            ).bfloat16()
+            for backend in ("deepgemm", "tilelang"):
+                with self.subTest(
+                    tokens=tokens,
+                    hidden_size=hidden_size,
+                    n_splits=n_splits,
+                    backend=backend,
+                ), patch.object(op._policy(), "resolve_backend", return_value=backend):
+                    actual = op.mhc_pre_big_fuse(
+                        residual,
+                        weight,
+                        scale,
+                        base,
+                        eps,
+                        eps,
+                        eps,
+                        2.0,
+                        20,
+                        n_splits=n_splits,
+                    )
+                    actual_post = mhc_post(
+                        sublayer.unsqueeze(0),
+                        residual.unsqueeze(0),
+                        actual[0].unsqueeze(0),
+                        actual[1].unsqueeze(0),
+                    ).squeeze(0)
+                    for result, expected in zip(
+                        (*actual, actual_post), (post, comb, output, ref_out)
+                    ):
+                        relative_error = (
+                            result.float() - expected.float()
+                        ).norm() / expected.float().norm()
+                        self.assertLess(relative_error.item(), 0.005)
 
     def test_tilelang_post_reuses_residual_buffer_in_place(self) -> None:
         # Pins the memory-saving wiring (no CUDA needed): _post_impl must pass
@@ -385,12 +436,12 @@ class TestHCImpl(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_tilelang_head_matches_fallback_cuda(self) -> None:
-        hc, dim = 4, 128
+        hc, dim = 4, 4096
         fn, base, scale = _weights(hc, dim, device="cuda")
         head_fn = fn[:hc]
         head_base = base[:hc]
         head_scale = scale[:1]
-        x = torch.randn(1, 64, hc, dim, device="cuda", dtype=torch.bfloat16)
+        x = torch.randn(1, 65, hc, dim, device="cuda", dtype=torch.bfloat16)
         fallback = FallbackHCHead(
             head_fn,
             head_base,
@@ -411,8 +462,10 @@ class TestHCImpl(unittest.TestCase):
         )
         with torch.inference_mode():
             ref_y = fallback.head(x)
-            tk_y = tilelang.head(x)
-        torch.testing.assert_close(tk_y, ref_y, atol=2e-2, rtol=2e-2)
+            for fused in ("0", "1"):
+                with self.subTest(fused=fused), _env("DSV4_MHC_HEAD_FUSED", fused):
+                    tk_y = tilelang.head(x)
+                    torch.testing.assert_close(tk_y, ref_y, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":

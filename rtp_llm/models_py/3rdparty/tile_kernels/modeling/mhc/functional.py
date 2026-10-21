@@ -41,7 +41,7 @@ def mhc_pre(
     pre_eps: float = 1e-6,
     sinkhorn_eps: float = 1e-6,
     sinkhorn_repeat: int = 10,
-    n_splits: int = 16,
+    n_splits: int | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """MHC pre-processing for one sublayer (attention or FFN).
 
@@ -61,7 +61,7 @@ def mhc_pre(
         pre_eps: epsilon for pre-layer mix sigmoid
         sinkhorn_eps: epsilon for Sinkhorn normalization
         sinkhorn_repeat: number of Sinkhorn iterations
-        n_splits: number of splits for split-K GEMM
+        n_splits: number of splits for split-K GEMM; None selects adaptively
 
     Returns:
         layer_input: tensor of shape [..., hidden_size], input to the sublayer
@@ -116,7 +116,7 @@ def mhc_head(
     norm_eps: float = 1e-6,
     mhc_mult: int = 4,
     pre_eps: float = 1e-6,
-    n_splits: int = 16,
+    n_splits: int | None = None,
 ) -> torch.Tensor:
     """MHC head processing for the final language model head.
 
@@ -134,7 +134,7 @@ def mhc_head(
         norm_eps: epsilon for RMSNorm
         mhc_mult: number of hyper-connection heads (currently only 4 is guaranteed to work)
         pre_eps: epsilon for pre-layer mix sigmoid
-        n_splits: number of splits for split-K GEMM
+        n_splits: number of splits for split-K GEMM; None selects adaptively
 
     Returns:
         layer_input: tensor of shape [..., hidden_size], input to lm_head
