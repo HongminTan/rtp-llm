@@ -27,7 +27,7 @@ class SiluMulFp8QuantF32ScaleTest(unittest.TestCase):
         relative_error = (q.float() - ref_q).norm() / ref_q.norm()
         self.assertLess(relative_error.item(), 0.005)
 
-    def test_contiguous_shared_expert_quantization(self):
+    def test_dense_quantization(self):
         from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
             silu_mul_fp8_quant_f32_scale,
         )
@@ -42,7 +42,7 @@ class SiluMulFp8QuantF32ScaleTest(unittest.TestCase):
         )
         self._assert_quantization(q, scales, *self._reference(inputs, 1.5))
 
-    def test_masked_partial_tiles_and_preallocated_outputs(self):
+    def test_mask_partial_tiles_and_preallocated_outputs(self):
         from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
             silu_mul_fp8_quant_f32_scale,
         )
@@ -93,6 +93,40 @@ class SiluMulFp8QuantF32ScaleTest(unittest.TestCase):
                 self.assertTrue(torch.all(scales[~valid] == -123.0).item())
                 self.assertTrue(torch.all(q_storage[-1].float() == 7.0).item())
                 self.assertTrue(torch.all(scale_storage[-1] == -123.0).item())
+
+    def test_mask_sparse_and_populated_experts(self):
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
+        )
+
+        torch.manual_seed(44)
+        # Cover a non-power-of-two expert count with sparse and populated rows.
+        experts, capacity, inter = 48, 64, 512
+        cases = {
+            "sparse": torch.randint(0, experts, (12,), device="cuda"),
+            "populated": torch.randint(0, experts, (3000,), device="cuda"),
+        }
+        for name, ids in cases.items():
+            with self.subTest(case=name):
+                counts = torch.bincount(ids, minlength=experts).to(torch.int32)
+                # Counts beyond capacity are clamped to the capacity.
+                counts[0] = capacity + 5
+                inputs = (
+                    torch.randn(
+                        (experts, capacity, 2 * inter),
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    )
+                    * 4
+                )
+                q, scales = silu_mul_fp8_quant_f32_scale(
+                    inputs, clamp_limit=1.5, masked_m=counts
+                )
+                valid = torch.arange(capacity, device="cuda")[None, :] < counts[:, None]
+                ref_q, ref_scales = self._reference(inputs, 1.5)
+                self._assert_quantization(
+                    q.float()[valid], scales[valid], ref_q[valid], ref_scales[valid]
+                )
 
 
 if __name__ == "__main__":
