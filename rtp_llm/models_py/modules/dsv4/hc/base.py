@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from rtp_llm.models_py.modules.dsv4._profiler import record_function_range
+from rtp_llm.models_py.modules.dsv4._profiler import hc_record_function_range
 
 
 class HCMode(str, Enum):
@@ -119,7 +119,7 @@ class HCUnitBase(nn.Module):
         leading = self._check_residual_shape(x, "pre input")
         layer = f"L{self.layer_id:02d}" if self.layer_id >= 0 else "Lxx"
         name = self.name or "unit"
-        with record_function_range(f"dsv4.hc.{layer}.{name}.pre"):
+        with hc_record_function_range(f"dsv4.hc.{layer}.{name}.pre"):
             y, post, comb = self._pre_impl(x, dbg_tag=dbg_tag)
         self._check_pre_output(leading, y, post, comb)
         return y, post, comb
@@ -169,7 +169,7 @@ class HCUnitBase(nn.Module):
             )
         layer = f"L{self.layer_id:02d}" if self.layer_id >= 0 else "Lxx"
         name = self.name or "unit"
-        with record_function_range(f"dsv4.hc.{layer}.{name}.post"):
+        with hc_record_function_range(f"dsv4.hc.{layer}.{name}.post"):
             out = self._post_impl(x, residual, post, comb)
         if tuple(out.shape) != tuple(residual.shape):
             raise ValueError(
@@ -232,7 +232,7 @@ class HCHeadBase(nn.Module):
             ``[T, dim]`` or ``[B, S, dim]`` with the same leading token layout.
         """
         leading = self._check_residual_shape(x, "head input")
-        with record_function_range("dsv4.hc.head"):
+        with hc_record_function_range("dsv4.hc.head"):
             out = self._head_impl(x)
         expected = leading + (self.dim,)
         if tuple(out.shape) != expected:

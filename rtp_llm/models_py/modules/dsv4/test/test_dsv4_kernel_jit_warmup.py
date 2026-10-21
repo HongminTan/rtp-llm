@@ -628,6 +628,9 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             },
         )
         root.add_module("attn_hc", TileLangHCUnit())
+        root.add_module(
+            "attn_norm", _module_type("RMSNorm", {"variance_epsilon": 1e-4})()
+        )
         root.add_module("ffn_hc_same_shape", TileLangHCUnit())
         root.add_module("head_hc", TileLangHCHead())
         root.add_module("fallback_hc", FallbackHCUnit())
@@ -635,6 +638,8 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
         shapes = _collect_dsv4_mhc_prenorm_shapes(root)
         self.assertEqual(sorted(shapes.keys()), [(24, 16384)])
         self.assertEqual(shapes[(24, 16384)]["name"], "attn_hc")
+        self.assertEqual(shapes[(24, 16384)]["output_norm_eps"], 1e-4)
+        self.assertEqual(shapes[(24, 16384)]["norm_eps"], 1e-5)
         self.assertEqual(shapes[(24, 16384)]["dim"], 4096)
         self.assertEqual(shapes[(24, 16384)]["hc_mult"], 4)
         self.assertEqual(shapes[(24, 16384)]["hc_sinkhorn_iters"], 20)
@@ -807,6 +812,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
                 "dim": 4096,
                 "hc_mult": 4,
                 "norm_eps": 1.0e-6,
+                "output_norm_eps": 1.0e-5,
                 "hc_eps": 1.0e-6,
                 "hc_sinkhorn_iters": 20,
             }
@@ -828,6 +834,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             old_values["mhc_prenorm_backend"] = with_patch(
                 "mhc_prenorm_backend",
                 SimpleNamespace(
+                    MHC_FMA_MAX_TOKENS=16,
                     resolve_backend=lambda: "deepgemm",
                     device_num_sms=lambda device: 148,
                     resolve_n_splits=warmup_module.mhc_prenorm_backend.resolve_n_splits,
@@ -859,28 +866,41 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             )
             old_values["_launch_dummy_mhc_pre_big_fuse"] = with_patch(
                 "_launch_dummy_mhc_pre_big_fuse",
-                lambda **kwargs: calls.append(("fuse_launch", kwargs["num_splits"])),
+                lambda **kwargs: calls.append(
+                    ("fuse_launch", kwargs["num_splits"], kwargs["with_output_norm"])
+                ),
             )
-            warmup_module._MHC_PRENORM_GEMM_JIT_WARMED_KEYS.clear()
-
-            warmup_module.warmup_mhc_prenorm_gemm_jit(
-                shapes,
-                max_m=1024,
-                device=torch.device("cuda"),
+            old_values["_launch_dummy_mhc_fused_post_pre"] = with_patch(
+                "_launch_dummy_mhc_fused_post_pre",
+                lambda **kwargs: calls.append(("boundary", kwargs["m_value"])),
             )
+            for max_m, expected_batches in ((1024, (1, 8)), (7, (1,))):
+                with self.subTest(max_m=max_m):
+                    calls.clear()
+                    warmup_module._MHC_PRENORM_GEMM_JIT_WARMED_KEYS.clear()
+                    warmup_module.warmup_mhc_prenorm_gemm_jit(
+                        shapes, max_m=max_m, device=torch.device("cuda")
+                    )
+                    self.assertEqual(
+                        [c for c in calls if c[0] == "boundary"],
+                        [("boundary", m) for m in expected_batches],
+                    )
+                    self.assertEqual(
+                        [c for c in calls if c[0] == "gemm_launch"],
+                        [("gemm_launch", 8), ("gemm_launch", 1)],
+                    )
+                    self.assertEqual(
+                        [c for c in calls if c[0] == "fuse_launch"],
+                        [
+                            ("fuse_launch", n, norm)
+                            for n in (8, 1)
+                            for norm in (False, True)
+                        ],
+                    )
         finally:
             for name, value in old_values.items():
                 setattr(warmup_module, name, value)
             warmup_module._MHC_PRENORM_GEMM_JIT_WARMED_KEYS.clear()
-
-        self.assertEqual(
-            [c for c in calls if c[0] == "gemm_launch"],
-            [("gemm_launch", 8), ("gemm_launch", 1)],
-        )
-        self.assertEqual(
-            [c for c in calls if c[0] == "fuse_launch"],
-            [("fuse_launch", 8), ("fuse_launch", 1)],
-        )
 
     def test_mhc_tilelang_warmup_uses_runtime_wrapper(self):
         calls = []
@@ -893,6 +913,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
                 "dim": 4096,
                 "hc_mult": 4,
                 "norm_eps": 1.0e-6,
+                "output_norm_eps": 1.0e-5,
                 "hc_eps": 1.0e-6,
                 "hc_sinkhorn_iters": 20,
             }
@@ -914,6 +935,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             old_values["mhc_prenorm_backend"] = with_patch(
                 "mhc_prenorm_backend",
                 SimpleNamespace(
+                    MHC_FMA_MAX_TOKENS=16,
                     resolve_backend=lambda: "tilelang",
                     device_num_sms=lambda device: 148,
                     resolve_n_splits=warmup_module.mhc_prenorm_backend.resolve_n_splits,
@@ -938,29 +960,42 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             )
             old_values["_launch_dummy_mhc_pre_wrapper"] = with_patch(
                 "_launch_dummy_mhc_pre_wrapper",
-                lambda **kwargs: calls.append(("wrapper", kwargs["m_value"])),
+                lambda **kwargs: calls.append(
+                    ("wrapper", kwargs["m_value"], kwargs["with_output_norm"])
+                ),
             )
-            warmup_module._MHC_PRENORM_GEMM_JIT_WARMED_KEYS.clear()
-
-            warmup_module.warmup_mhc_prenorm_gemm_jit(
-                shapes,
-                max_m=1024,
-                device=torch.device("cuda"),
+            old_values["_launch_dummy_mhc_fused_post_pre"] = with_patch(
+                "_launch_dummy_mhc_fused_post_pre",
+                lambda **kwargs: calls.append(("boundary", kwargs["m_value"])),
             )
+            for max_m, expected_batches in ((1024, (1, 8)), (7, (1,))):
+                with self.subTest(max_m=max_m):
+                    calls.clear()
+                    warmup_module._MHC_PRENORM_GEMM_JIT_WARMED_KEYS.clear()
+                    warmup_module.warmup_mhc_prenorm_gemm_jit(
+                        shapes, max_m=max_m, device=torch.device("cuda")
+                    )
+                    self.assertEqual(
+                        [c for c in calls if c[0] == "boundary"],
+                        [("boundary", m) for m in expected_batches],
+                    )
+                    self.assertEqual(
+                        [c for c in calls if c[0] != "boundary"],
+                        [
+                            ("wrapper", m, norm)
+                            for _, m in _generate_mhc_prenorm_warmup_specs(
+                                max_m=max_m,
+                                k_value=16384,
+                                num_sms=148,
+                                backend="tilelang",
+                            )
+                            for norm in (False, True)
+                        ],
+                    )
         finally:
             for name, value in old_values.items():
                 setattr(warmup_module, name, value)
             warmup_module._MHC_PRENORM_GEMM_JIT_WARMED_KEYS.clear()
-
-        self.assertEqual(
-            calls,
-            [
-                ("wrapper", m)
-                for _, m in _generate_mhc_prenorm_warmup_specs(
-                    max_m=1024, k_value=16384, num_sms=148, backend="tilelang"
-                )
-            ],
-        )
 
     def test_mhc_head_fused_warmup_uses_batched_two_token_shape(self):
         calls = []

@@ -22,28 +22,27 @@ def _mhc_pre_big_fuse(
     n_splits: int = 16,
     mhc_mult: int = 4,
     use_pdl: bool = False,
+    output_norm_eps: float | None = None,
 ):
     num_tokens = T.dynamic("num_tokens")
     mhc_mult3 = mhc_mult * (2 + mhc_mult)
     hidden_block = math.gcd(512, hidden_size)
 
-    @T.prim_func
-    def mhc_pre_big_fuse(
-        gemm_out_mul: T.Tensor[(n_splits, num_tokens, mhc_mult3), T.float32],
-        gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32],
-        mhc_scale: T.Tensor[(3,), T.float32],
-        mhc_base: T.Tensor[(mhc_mult3,), T.float32],
-        residual: T.Tensor[(num_tokens, mhc_mult, hidden_size), T.bfloat16],
-        # outputs
-        post_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
-        comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
-        layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
-    ) -> None:
+    @T.macro
+    def compute(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        mhc_scale,
+        mhc_base,
+        residual,
+        post_mix,
+        comb_mix,
+        layer_input,
+        output_norm_weight,
+    ):
         with T.Kernel(num_tokens, threads=96) as pid:
             if use_pdl:
                 T.pdl_sync()
-            ##################################################################
-            # _mhc_pre_norm_fn_fwd_norm
             mixes_shared = T.alloc_shared(mhc_mult3, T.float32)
             if T.get_thread_binding() < 32:
                 rms = T.alloc_fragment(1, T.float32)
@@ -61,8 +60,6 @@ def _mhc_pre_big_fuse(
                 T.copy(mixes, mixes_shared, disable_tma=True)
 
             if T.get_thread_binding() < 32:
-                ##################################################################
-                # _mhc_pre_split_mixes_fwd (post & comb)
                 cm = T.alloc_fragment((mhc_mult, mhc_mult), T.float32)
                 for j in T.Parallel(mhc_mult):
                     post_mix[pid, j] = (
@@ -78,8 +75,6 @@ def _mhc_pre_big_fuse(
                         + mhc_base[j * mhc_mult + k + mhc_mult * 2]
                     )
 
-                ##################################################################
-                # _mhc_sinkhorn_fwd
                 row_sum = T.alloc_fragment(mhc_mult, T.float32)
                 col_sum = T.alloc_fragment(mhc_mult, T.float32)
 
@@ -112,8 +107,6 @@ def _mhc_pre_big_fuse(
                 for j, k in T.Parallel(mhc_mult, mhc_mult):
                     comb_mix[pid, j * mhc_mult + k] = cm[j, k]
             else:
-                ##################################################################
-                # _mhc_pre_split_mixes_fwd (pre)
                 pre_mix_shared = T.alloc_shared(mhc_mult, T.float32)
                 for j in T.Parallel(mhc_mult):
                     pre_mix_shared[j] = (
@@ -122,8 +115,10 @@ def _mhc_pre_big_fuse(
                         )
                         + mhc_pre_eps
                     )
-                ###################################################################
-                # _mhc_pre_apply_mix_fwd
+                if output_norm_eps is not None:
+                    norm_input = T.alloc_shared(hidden_size, T.bfloat16)
+                    sqrsum = T.alloc_fragment(hidden_block, T.float32)
+                    T.clear(sqrsum)
                 for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
                     xs = T.alloc_shared((mhc_mult, hidden_block), T.bfloat16)
                     xl = T.alloc_fragment((mhc_mult, hidden_block), T.float32)
@@ -138,9 +133,86 @@ def _mhc_pre_big_fuse(
                         for i1_h in T.Parallel(hidden_block):
                             ol[i1_h] += pre * xl[i_mhc, i1_h]
 
-                    T.copy(ol, layer_input[pid, i0_h * hidden_block], disable_tma=True)
+                    if output_norm_eps is not None:
+                        # RMSNorm consumes the BF16 output of HC mixing.
+                        for i1_h in T.Parallel(hidden_block):
+                            ol[i1_h] = T.float32(T.bfloat16(ol[i1_h]))
+                            sqrsum[i1_h] += ol[i1_h] * ol[i1_h]
+                        T.copy(ol, norm_input[i0_h * hidden_block], disable_tma=True)
+                    else:
+                        T.copy(
+                            ol, layer_input[pid, i0_h * hidden_block], disable_tma=True
+                        )
+
+                if output_norm_eps is not None:
+                    total = T.alloc_fragment(1, T.float32)
+                    T.reduce_sum(sqrsum, total, dim=0)
+                    total[0] = T.rsqrt(total[0] / hidden_size + output_norm_eps)
+                    for i0_h in T.serial(hidden_size // hidden_block):
+                        normalized = T.alloc_fragment(hidden_block, T.float32)
+                        for i1_h in T.Parallel(hidden_block):
+                            h = i0_h * hidden_block + i1_h
+                            normalized[i1_h] = (
+                                T.float32(norm_input[h]) * total[0]
+                            ) * T.float32(output_norm_weight[h])
+                        T.copy(
+                            normalized,
+                            layer_input[pid, i0_h * hidden_block],
+                            disable_tma=True,
+                        )
 
             if use_pdl:
                 T.pdl_trigger()
 
-    return mhc_pre_big_fuse
+    if output_norm_eps is None:
+
+        @T.prim_func
+        def mhc_pre_big_fuse(
+            gemm_out_mul: T.Tensor[(n_splits, num_tokens, mhc_mult3), T.float32],
+            gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32],
+            mhc_scale: T.Tensor[(3,), T.float32],
+            mhc_base: T.Tensor[(mhc_mult3,), T.float32],
+            residual: T.Tensor[(num_tokens, mhc_mult, hidden_size), T.bfloat16],
+            post_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
+            comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
+            layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
+        ) -> None:
+            compute(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                mhc_scale,
+                mhc_base,
+                residual,
+                post_mix,
+                comb_mix,
+                layer_input,
+                None,
+            )
+
+        return mhc_pre_big_fuse
+
+    @T.prim_func
+    def mhc_pre_big_fuse_with_norm(
+        gemm_out_mul: T.Tensor[(n_splits, num_tokens, mhc_mult3), T.float32],
+        gemm_out_sqrsum: T.Tensor[(n_splits, num_tokens), T.float32],
+        mhc_scale: T.Tensor[(3,), T.float32],
+        mhc_base: T.Tensor[(mhc_mult3,), T.float32],
+        residual: T.Tensor[(num_tokens, mhc_mult, hidden_size), T.bfloat16],
+        post_mix: T.Tensor[(num_tokens, mhc_mult), T.float32],
+        comb_mix: T.Tensor[(num_tokens, mhc_mult * mhc_mult), T.float32],
+        layer_input: T.Tensor[(num_tokens, hidden_size), T.bfloat16],
+        output_norm_weight: T.Tensor[(hidden_size,), T.bfloat16],
+    ) -> None:
+        compute(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            mhc_scale,
+            mhc_base,
+            residual,
+            post_mix,
+            comb_mix,
+            layer_input,
+            output_norm_weight,
+        )
+
+    return mhc_pre_big_fuse_with_norm

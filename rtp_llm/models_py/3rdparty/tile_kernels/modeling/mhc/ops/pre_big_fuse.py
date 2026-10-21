@@ -66,6 +66,9 @@ def mhc_pre_big_fuse(
     mhc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int | None = None,
+    *,
+    output_norm_weight: torch.Tensor | None = None,
+    output_norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
@@ -139,6 +142,11 @@ def mhc_pre_big_fuse(
             f"{backend!r}; expected deepgemm or tilelang."
         )
 
+    if output_norm_weight is not None:
+        assert output_norm_weight.dtype == torch.bfloat16
+        assert output_norm_weight.shape == (hidden_size,)
+        assert output_norm_weight.is_contiguous()
+        assert output_norm_weight.device == residual.device
     _mhc_pre_big_fuse(
         hidden_size,
         rms_eps,
@@ -149,6 +157,7 @@ def mhc_pre_big_fuse(
         n_splits=n_splits,
         mhc_mult=mhc_mult,
         use_pdl=policy.device_supports_pdl(residual.device),
+        output_norm_eps=output_norm_eps if output_norm_weight is not None else None,
     )(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -158,6 +167,7 @@ def mhc_pre_big_fuse(
         post_mix,
         comb_mix,
         layer_input,
+        *(() if output_norm_weight is None else (output_norm_weight,)),
     )
 
     post_mix = post_mix.view(*outer_shape, mhc_mult, 1)

@@ -31,6 +31,13 @@ def record_function_range(name: str):
     return torch.profiler.record_function(name)
 
 
+def hc_record_function_range(name: str):
+    """Keep HC attribution on CPU without duplicating ranges on GPU streams."""
+    if not record_function_ranges_enabled() or not torch.autograd._profiler_enabled():
+        return _NOOP_RECORD_FUNCTION_RANGE
+    return torch._C._profiler._RecordFunctionFast(name)
+
+
 def _noop_layer_forward_range(_layer_idx: int) -> ContextManager[Any]:
     return _NOOP_RECORD_FUNCTION_RANGE
 

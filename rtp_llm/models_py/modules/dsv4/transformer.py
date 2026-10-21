@@ -20,7 +20,7 @@ from rtp_llm.models_py.modules import RMSNorm
 from rtp_llm.models_py.modules.base.common.embedding import EmbeddingTorch
 from rtp_llm.models_py.modules.dsv4 import _profiler
 from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
-from rtp_llm.models_py.modules.dsv4.block import Block
+from rtp_llm.models_py.modules.dsv4.block import Block, forward_decode_layer
 from rtp_llm.models_py.modules.dsv4.cp import CPContext, build_cp_context
 from rtp_llm.models_py.modules.dsv4.hc import build_hc_head
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
@@ -553,11 +553,23 @@ class V4Transformer(nn.Module):
         begin_decode = getattr(self, "begin_decode", None)
         if begin_decode is not None:
             begin_decode(attn_metadata)
+        prepared_input = None
         layer_forward_range = _profiler.make_layer_forward_range()
         for layer_idx, layer in enumerate(self.layers):
             with layer_forward_range(layer_idx):
-                h = layer.forward_decode(
-                    h, attn_metadata, input_ids_2d, kv_cache=kv_cache
+                next_layer = (
+                    self.layers[layer_idx + 1]
+                    if layer_idx + 1 < len(self.layers)
+                    else None
+                )
+                h, prepared_input = forward_decode_layer(
+                    layer,
+                    next_layer,
+                    h,
+                    attn_metadata,
+                    input_ids_2d,
+                    kv_cache,
+                    prepared_input=prepared_input,
                 )
         h = self._hc_head_reduce(h)  # [B, q_len, dim]
         # Framework RMSNorm wants 2D — flatten to [T_total, dim] and

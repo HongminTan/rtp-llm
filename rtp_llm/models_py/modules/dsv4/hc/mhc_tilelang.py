@@ -40,6 +40,7 @@ _tk_mhc_pre = None
 _tk_mhc_post = None
 _tk_mhc_head_fused = None
 _tk_mhc_head = None
+_tk_mhc_fused_post_pre = None
 
 
 def _import_tk():
@@ -48,6 +49,7 @@ def _import_tk():
     Raises on import failure — caller wraps with shape context.
     """
     global _tk_mhc_pre, _tk_mhc_post, _tk_mhc_head_fused, _tk_mhc_head
+    global _tk_mhc_fused_post_pre
     # Importing tilelang_kernels triggers its module-level env-prep
     # (libz3 preload + TVM tmpdir setup), which must run before any tilelang
     # JIT import below.
@@ -62,6 +64,7 @@ def _import_tk():
     _tk_mhc_post = mod.mhc_post
     _tk_mhc_head_fused = getattr(mod, "mhc_head_fuse", None)
     _tk_mhc_head = mod.mhc_head
+    _tk_mhc_fused_post_pre = mod.mhc_fused_post_pre
     return _tk_mhc_pre, _tk_mhc_post, _tk_mhc_head_fused, _tk_mhc_head
 
 
@@ -185,6 +188,8 @@ def tk_mhc_pre(
     sinkhorn_eps: float,
     sinkhorn_iters: int,
     hc_mult: int = 4,
+    output_norm_weight: torch.Tensor | None = None,
+    output_norm_eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """TK ``mhc_pre`` wrapper.
 
@@ -213,12 +218,46 @@ def tk_mhc_pre(
             pre_eps=pre_eps,
             sinkhorn_eps=sinkhorn_eps,
             sinkhorn_repeat=sinkhorn_iters,
+            output_norm_weight=output_norm_weight,
+            output_norm_eps=output_norm_eps,
         )
         return out, post_mix, comb_mix
     except Exception as e:
         raise RuntimeError(
             "TileLang mhc_pre failed: " + _shape_ctx(residual, hc_mult=hc_mult)
         ) from e
+
+
+def tk_mhc_fused_post_pre(
+    x,
+    residual,
+    post,
+    comb,
+    next_hc,
+    *,
+    output_norm_weight,
+    output_norm_eps,
+):
+    """Compute the post/pre boundary for a supported decode input."""
+    if _tk_mhc_fused_post_pre is None:
+        _import_tk()
+    residual_cur, post_cur, comb_cur, layer_input = _tk_mhc_fused_post_pre(
+        x,
+        residual,
+        post,
+        comb,
+        next_hc.fn,
+        next_hc.scale,
+        next_hc.base,
+        rms_eps=next_hc.norm_eps,
+        mhc_pre_eps=next_hc.hc_eps,
+        mhc_sinkhorn_eps=next_hc.hc_eps,
+        mhc_post_mult_value=2.0,
+        sinkhorn_repeat=next_hc.hc_sinkhorn_iters,
+        output_norm_weight=output_norm_weight,
+        output_norm_eps=output_norm_eps,
+    )
+    return residual_cur, (layer_input, post_cur, comb_cur)
 
 
 def tk_mhc_post(

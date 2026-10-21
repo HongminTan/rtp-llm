@@ -10,6 +10,10 @@ _logger = logging.getLogger(__name__)
 DEEPGEMM = "deepgemm"
 TILELANG = "tilelang"
 
+# Balance Tensor Core prenorm throughput against fused scalar FMA overhead.
+# Tune this limit using measurements for the target GPU and model.
+MHC_FMA_MAX_TOKENS = 16
+
 _TILELANG_HIDDEN_BLOCK = 256
 
 
