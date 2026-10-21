@@ -403,9 +403,9 @@ class MegaCSARoutingTest(unittest.TestCase):
         class _Layer:
             layer_id = 0
 
-            def forward_decode(self, hidden, *_args, **_kwargs):
+            def forward_decode_with_hc(self, hidden, *_args, **_kwargs):
                 events.append("layer")
-                return hidden
+                return hidden, None
 
         class _V4:
             hc_mult = 1

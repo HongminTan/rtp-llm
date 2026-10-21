@@ -330,6 +330,31 @@ class TestHCImpl(unittest.TestCase):
                         20,
                         n_splits=n_splits,
                     )
+                    from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm
+
+                    norm = RMSNorm(
+                        torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16),
+                        1e-5,
+                    )
+                    normalized = op.mhc_pre_big_fuse(
+                        residual,
+                        weight,
+                        scale,
+                        base,
+                        eps,
+                        eps,
+                        eps,
+                        2.0,
+                        20,
+                        n_splits=n_splits,
+                        output_norm_weight=norm.weight.data,
+                        output_norm_eps=norm.variance_epsilon,
+                    )[2]
+                    expected_norm = norm(output)
+                    norm_error = (
+                        normalized.float() - expected_norm.float()
+                    ).norm() / expected_norm.float().norm()
+                    self.assertLess(norm_error.item(), 0.005)
                     actual_post = mhc_post(
                         sublayer.unsqueeze(0),
                         residual.unsqueeze(0),
@@ -343,6 +368,161 @@ class TestHCImpl(unittest.TestCase):
                             result.float() - expected.float()
                         ).norm() / expected.float().norm()
                         self.assertLess(relative_error.item(), 0.005)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @torch.inference_mode()
+    def test_fused_post_pre_matches_unfused_cuda(self):
+        from rtp_llm.models_py.modules.dsv4.hc.mhc_tilelang import _import_tk
+
+        _import_tk()
+        functional = importlib.import_module(
+            "rtp_llm.models_py.3rdparty.tile_kernels.modeling.mhc.functional"
+        )
+        for tokens, hidden in ((1, 128), (1, 4096), (16, 4096), (16, 7168)):
+            with self.subTest(tokens=tokens, hidden=hidden):
+                torch.manual_seed(tokens)
+                residual = torch.randn(
+                    1, tokens, 4, hidden, device="cuda", dtype=torch.bfloat16
+                )
+                x = torch.randn(1, tokens, hidden, device="cuda", dtype=torch.bfloat16)
+                post = torch.rand(1, tokens, 4, 1, device="cuda") * 2
+                comb = torch.rand(1, tokens, 4, 4, device="cuda").softmax(-1)
+                fn = torch.randn(24, 4 * hidden, device="cuda") / (4 * hidden) ** 0.5
+                scale = torch.tensor([0.8, 1.2, 0.7], device="cuda")
+                base = torch.randn(24, device="cuda") * 0.1
+                ref_residual = functional.mhc_post(x, residual, post, comb)
+                ref_input, (ref_post, ref_comb) = functional.mhc_pre(
+                    ref_residual,
+                    fn,
+                    scale,
+                    base,
+                    post_mult_value=2.0,
+                    sinkhorn_repeat=20,
+                )
+
+                from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm
+
+                norm = RMSNorm(
+                    torch.randn(hidden, device="cuda", dtype=torch.bfloat16), 1e-5
+                )
+                ref_input = norm(ref_input.reshape(-1, hidden)).view_as(ref_input)
+
+                def run():
+                    return functional.mhc_fused_post_pre(
+                        x,
+                        residual,
+                        post,
+                        comb,
+                        fn,
+                        scale,
+                        base,
+                        rms_eps=1e-6,
+                        mhc_pre_eps=1e-6,
+                        mhc_sinkhorn_eps=1e-6,
+                        mhc_post_mult_value=2.0,
+                        sinkhorn_repeat=20,
+                        output_norm_weight=norm.weight.data,
+                        output_norm_eps=norm.variance_epsilon,
+                    )
+
+                actual = run()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = run()
+                for _ in range(3):
+                    graph.replay()
+                for outputs in (actual, captured):
+                    for got, expected in zip(
+                        outputs, (ref_residual, ref_post, ref_comb, ref_input)
+                    ):
+                        error = (
+                            got.float() - expected.float()
+                        ).norm() / expected.float().norm()
+                        self.assertLess(error.item(), 0.005)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    @torch.inference_mode()
+    def test_fused_decode_boundaries_match_unfused_cuda(self):
+        from types import SimpleNamespace
+
+        from rtp_llm.models_py.modules.dsv4.block import Block, forward_decode_layer
+
+        layers = []
+        for layer_id in range(2):
+            layer = Block.__new__(Block)
+            torch.nn.Module.__init__(layer)
+            layer.layer_id = layer_id
+            layer._mega_csa_adapter = layer._mega_hca_adapter = None
+            from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm
+
+            layer.attn_norm = RMSNorm(
+                torch.randn(4096, device="cuda", dtype=torch.bfloat16), 1e-5
+            )
+            layer.ffn_norm = RMSNorm(
+                torch.randn(4096, device="cuda", dtype=torch.bfloat16), 1e-6
+            )
+            layer.attn = SimpleNamespace(
+                forward_decode=lambda x, *args, **kwargs: x * 0.5
+            )
+            layer.ffn = lambda x, *args, **kwargs: x * 0.25
+            for name in ("attn_hc", "ffn_hc"):
+                fn, base, scale = _weights(4, 4096, device="cuda")
+                setattr(
+                    layer,
+                    name,
+                    TileLangHCUnit(
+                        fn,
+                        base,
+                        scale,
+                        dim=4096,
+                        hc_mult=4,
+                        hc_sinkhorn_iters=20,
+                        norm_eps=1e-6,
+                        hc_eps=1e-6,
+                    ),
+                )
+            layers.append(layer)
+        for tokens in (1, 8, 16, 17):
+            with self.subTest(tokens=tokens):
+                original = torch.randn(
+                    1, tokens, 4, 4096, device="cuda", dtype=torch.bfloat16
+                )
+                ids = torch.zeros(1, tokens, device="cuda", dtype=torch.long)
+                expected = original.clone()
+                for layer in layers:
+                    for hc, norm, factor in (
+                        (layer.attn_hc, layer.attn_norm, 0.5),
+                        (layer.ffn_hc, layer.ffn_norm, 0.25),
+                    ):
+                        inp, post, comb = hc.pre(expected)
+                        out = norm(inp.reshape(-1, 4096)).view_as(inp) * factor
+                        expected = hc.post(out, expected, post, comb)
+
+                def run():
+                    actual, prepared_input = original.clone(), None
+                    for i, layer in enumerate(layers):
+                        actual, prepared_input = forward_decode_layer(
+                            layer,
+                            layers[i + 1] if i + 1 < len(layers) else None,
+                            actual,
+                            None,
+                            ids,
+                            None,
+                            prepared_input=prepared_input,
+                        )
+                    return actual
+
+                eager = run()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = run()
+                for _ in range(2):
+                    graph.replay()
+                for actual in (eager, captured):
+                    error = (
+                        actual.float() - expected.float()
+                    ).norm() / expected.float().norm()
+                    self.assertLess(error.item(), 0.005)
 
     def test_tilelang_post_reuses_residual_buffer_in_place(self) -> None:
         # Pins the memory-saving wiring (no CUDA needed): _post_impl must pass

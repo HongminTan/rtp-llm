@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from .ops.expand import expand_to_mhc
+from .ops.fused_post_pre import mhc_fused_post_pre
 from .ops.head_compute_mix import mhc_head_compute_mix
 from .ops.head_fuse import mhc_head_fuse
 from .ops.norm_fn import mhc_pre_norm_fn
@@ -42,6 +43,8 @@ def mhc_pre(
     sinkhorn_eps: float = 1e-6,
     sinkhorn_repeat: int = 10,
     n_splits: int | None = None,
+    output_norm_weight: torch.Tensor | None = None,
+    output_norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """MHC pre-processing for one sublayer (attention or FFN).
 
@@ -62,6 +65,8 @@ def mhc_pre(
         sinkhorn_eps: epsilon for Sinkhorn normalization
         sinkhorn_repeat: number of Sinkhorn iterations
         n_splits: number of splits for split-K GEMM; None selects adaptively
+        output_norm_weight: optional sublayer RMSNorm weight of shape [hidden_size]
+        output_norm_eps: epsilon for the sublayer RMSNorm
 
     Returns:
         layer_input: tensor of shape [..., hidden_size], input to the sublayer
@@ -79,8 +84,13 @@ def mhc_pre(
             mhc_post_mult_value=post_mult_value,
             sinkhorn_repeat=sinkhorn_repeat,
             n_splits=n_splits,
+            output_norm_weight=output_norm_weight,
+            output_norm_eps=output_norm_eps,
         )
         return layer_input, (post_mix, comb_mix)
+
+    if output_norm_weight is not None:
+        raise ValueError("Output RMSNorm fusion requires inference mode")
 
     mixes = mhc_pre_norm_fn(
         residual,

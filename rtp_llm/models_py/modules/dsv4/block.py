@@ -19,6 +19,12 @@ from rtp_llm.models_py.modules.dsv4.fp8.attention import (
     CommitOnlyAttentionFP8,
 )
 from rtp_llm.models_py.modules.dsv4.hc import build_hc_unit
+from rtp_llm.models_py.modules.dsv4.hc.decode import (
+    HCStage,
+    PreparedHCInput,
+    prepare_input,
+    try_post_prepare,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
@@ -56,6 +62,37 @@ def _prefill_fast_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
     ):
         return norm(x, output=x)
     return norm(x)
+
+
+def forward_decode_layer(
+    layer,
+    next_layer,
+    hidden,
+    attn_metadata,
+    input_ids,
+    kv_cache,
+    *,
+    prepared_input: PreparedHCInput | None = None,
+) -> tuple[torch.Tensor, PreparedHCInput | None]:
+    from rtp_llm.models_py.modules.dsv4 import _record_tensor
+
+    next_stage = None
+    if (
+        next_layer is not None
+        and next_layer._mega_csa_adapter is None
+        and next_layer._mega_hca_adapter is None
+        and not _record_tensor.should_record_layer(next_layer.layer_id)
+    ):
+        next_stage = HCStage(next_layer.attn_hc, next_layer.attn_norm)
+    return layer.forward_decode_with_hc(
+        hidden,
+        attn_metadata,
+        input_ids,
+        kv_cache=kv_cache,
+        prepared_input=prepared_input,
+        next_stage=next_stage,
+        fuse_boundaries=True,
+    )
 
 
 class Block(nn.Module):
@@ -384,24 +421,38 @@ class Block(nn.Module):
 
     def forward_decode(
         self,
+        x: torch.Tensor,
+        attn_metadata: "DSv4DecodeAttnMetadata",  # type: ignore[name-defined]
+        input_ids: torch.Tensor,
+        kv_cache=None,
+        attn_fn=None,
+    ) -> torch.Tensor:
+        """Decode a block, optionally replacing its attention call with attn_fn."""
+        output, _ = self.forward_decode_with_hc(
+            x, attn_metadata, input_ids, kv_cache=kv_cache, attn_fn=attn_fn
+        )
+        return output
+
+    def forward_decode_with_hc(
+        self,
         x: torch.Tensor,  # [B, 1, hc, dim]
         attn_metadata: "DSv4DecodeAttnMetadata",  # type: ignore[name-defined]
         input_ids: torch.Tensor,  # [B, 1]
         kv_cache=None,
         attn_fn=None,
-    ) -> torch.Tensor:
-        """Decode-only block forward — mirrors prefill ``forward`` but
-        delegates attention to ``Attention.forward_decode``. Prefill
-        ``forward`` is byte-identical for PD-disagg cleanliness.
-
-        ``attn_fn`` overrides the attention call (normed input -> attention
-        output) while keeping this block's hyper-connection choreography as
-        the single authority; the DSpARK draft substitutes its non-causal
-        fixed-block attention this way instead of copying the block body.
-        """
+        *,
+        prepared_input: PreparedHCInput | None = None,
+        next_stage: HCStage | None = None,
+        fuse_boundaries: bool = False,
+    ) -> tuple[torch.Tensor, PreparedHCInput | None]:
+        """Return the residual and optional normalized HC inputs for the next block."""
         from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 
         _dbg_layer = _rt.should_record_layer(self.layer_id)
+        fuse_boundaries = fuse_boundaries and not _dbg_layer and attn_fn is None
+        attn_stage = HCStage(self.attn_hc, self.attn_norm)
+        ffn_stage = HCStage(self.ffn_hc, self.ffn_norm)
+        ffn_pre = None
         mega_adapter = self._mega_csa_adapter or self._mega_hca_adapter
         use_mega_attention = (
             attn_fn is None
@@ -418,17 +469,18 @@ class Block(nn.Module):
         else:
             # Attention path
             residual = x
-            x_pre, post, comb = self.attn_hc.pre(
-                x,
-                dbg_tag=(
-                    f"L{self.layer_id:02d}_decode_attn_hc_pre" if _dbg_layer else None
-                ),
-            )
-            # Framework RMSNorm wants 2D. Attention keeps the original 3D shape.
-            bsz, q_len, dim_ = x_pre.shape
-            x_pre = self.attn_norm(x_pre.reshape(bsz * q_len, dim_)).view(
-                bsz, q_len, dim_
-            )
+            if prepared_input is None:
+                prepared_input = prepare_input(
+                    attn_stage,
+                    x,
+                    dbg_tag=(
+                        f"L{self.layer_id:02d}_decode_attn_hc_pre"
+                        if _dbg_layer
+                        else None
+                    ),
+                )
+            x_pre = prepared_input.normalized_input
+            post, comb = prepared_input.post_mix, prepared_input.comb_mix
             if _dbg_layer:
                 _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_attn_in", x_pre)
             if attn_fn is not None:
@@ -441,25 +493,49 @@ class Block(nn.Module):
                 _rt.record_if_level(
                     2, f"L{self.layer_id:02d}_decode_attn_out", attn_out
                 )
-            x = self.attn_hc.post(attn_out, residual, post, comb)
+            boundary = (
+                try_post_prepare(
+                    attn_stage,
+                    ffn_stage,
+                    attn_out,
+                    residual,
+                    post,
+                    comb,
+                )
+                if fuse_boundaries
+                else None
+            )
+            if boundary is None:
+                x = self.attn_hc.post(attn_out, residual, post, comb)
+            else:
+                x, ffn_pre = boundary
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_attn_residual", x)
 
         # FFN path — MoE has no per-step state, reuse existing forward
         residual = x
-        x_pre, post, comb = self.ffn_hc.pre(
-            x,
-            dbg_tag=f"L{self.layer_id:02d}_decode_ffn_hc_pre" if _dbg_layer else None,
-        )
-        bsz, q_len, dim_ = x_pre.shape
-        x_pre = self.ffn_norm(x_pre.reshape(bsz * q_len, dim_)).view(bsz, q_len, dim_)
+        if ffn_pre is None:
+            ffn_pre = prepare_input(
+                ffn_stage,
+                x,
+                dbg_tag=(
+                    f"L{self.layer_id:02d}_decode_ffn_hc_pre" if _dbg_layer else None
+                ),
+            )
+        x_pre = ffn_pre.normalized_input
+        post, comb = ffn_pre.post_mix, ffn_pre.comb_mix
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_ffn_in", x_pre)
         ffn_out = self.ffn(x_pre, input_ids, is_decode_forward=True)
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_ffn_out", ffn_out)
-        x = self.ffn_hc.post(ffn_out, residual, post, comb)
-        return x
+        if fuse_boundaries and next_stage is not None:
+            boundary = try_post_prepare(
+                ffn_stage, next_stage, ffn_out, residual, post, comb
+            )
+            if boundary is not None:
+                return boundary
+        return self.ffn_hc.post(ffn_out, residual, post, comb), None
 
     def forward_prefill_fast(
         self,

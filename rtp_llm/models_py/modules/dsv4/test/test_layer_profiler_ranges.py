@@ -32,10 +32,15 @@ class _DecodeLayer:
     def __init__(self, layer_idx, events):
         self.layer_id = layer_idx
         self._events = events
+        self._mega_csa_adapter = self._mega_hca_adapter = None
+        self.attn_hc = self.attn_norm = None
 
     def forward_decode(self, hidden, *_args, **_kwargs):
         self._events.append(("layer", self.layer_id))
         return hidden + self.layer_id + 1
+
+    def forward_decode_with_hc(self, hidden, *args, **kwargs):
+        return self.forward_decode(hidden, *args, **kwargs), None
 
 
 class _PrefillLayer:
@@ -49,6 +54,88 @@ class _PrefillLayer:
 
 
 class LayerProfilerRangeTest(unittest.TestCase):
+    def test_decode_hc_ranges_name_normalized_pre_and_fused_boundaries(self):
+        from rtp_llm.models_py.modules.base.cuda.norm import RMSNorm
+        from rtp_llm.models_py.modules.dsv4.hc import mhc_tilelang
+        from rtp_llm.models_py.modules.dsv4.hc.decode import (
+            HCStage,
+            prepare_input,
+            try_post_prepare,
+        )
+        from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import TileLangHCUnit
+
+        def unit(layer, name):
+            return TileLangHCUnit(
+                torch.zeros(24, 512),
+                torch.zeros(24),
+                torch.ones(3),
+                dim=128,
+                hc_mult=4,
+                hc_sinkhorn_iters=20,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+                layer_id=layer,
+                name=name,
+            )
+
+        attn, ffn, next_attn = unit(0, "attn"), unit(0, "ffn"), unit(1, "attn")
+        norm = RMSNorm(torch.ones(128, dtype=torch.bfloat16))
+
+        def pre(residual, *_args, **_kwargs):
+            return residual.sum(-2), (torch.zeros(1, 1, 4, 1), torch.zeros(1, 1, 4, 4))
+
+        def boundary(x, residual, post, comb, *_args, **_kwargs):
+            return residual + 1, post, comb, x + 1
+
+        with patch.object(mhc_tilelang, "_can_use_tk", return_value=True), patch.object(
+            mhc_tilelang, "_tk_mhc_pre", pre
+        ), patch.object(mhc_tilelang, "_tk_mhc_fused_post_pre", boundary), patch.object(
+            _profiler, "_RANGES_ENABLED", True
+        ):
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+            ) as prof:
+                residual = torch.zeros(1, 1, 4, 128, dtype=torch.bfloat16)
+                x, post, comb = prepare_input(HCStage(attn, norm), residual)
+                try_post_prepare(
+                    HCStage(attn, norm), HCStage(ffn, norm), x, residual, post, comb
+                )
+                try_post_prepare(
+                    HCStage(ffn, norm),
+                    HCStage(next_attn, norm),
+                    x,
+                    residual,
+                    post,
+                    comb,
+                )
+                # An ineligible batch must not emit a fused range.
+                large = torch.zeros(1, 17, 4, 128, dtype=torch.bfloat16)
+                self.assertIsNone(
+                    try_post_prepare(
+                        HCStage(attn, norm), HCStage(ffn, norm), x, large, post, comb
+                    )
+                )
+                with _profiler.disable_record_function_ranges():
+                    prepare_input(HCStage(attn, norm), residual)
+                    try_post_prepare(
+                        HCStage(attn, norm), HCStage(ffn, norm), x, residual, post, comb
+                    )
+            events = [
+                event for event in prof.events() if event.name.startswith("dsv4.hc.")
+            ]
+            for event in events:
+                self.assertEqual(event.scope, torch.profiler.RecordScope.FUNCTION.value)
+                self.assertFalse(event.is_user_annotation)
+            names = [event.name for event in events]
+            self.assertEqual(
+                names,
+                [
+                    "dsv4.hc.L00.attn.pre_norm",
+                    "dsv4.hc.L00.attn.post_pre_norm->L00.ffn",
+                    "dsv4.hc.L00.ffn.post_pre_norm->L01.attn",
+                ],
+            )
+
     def test_factory_is_noop_without_active_profiler(self):
         with patch.object(_profiler, "_RANGES_ENABLED", True), patch.object(
             torch.autograd, "_profiler_enabled", return_value=False
@@ -130,8 +217,11 @@ class LayerProfilerRangeTest(unittest.TestCase):
             ) as prof:
                 layer_range = _profiler.make_layer_forward_range()
                 with layer_range(9):
-                    torch.add(x, 1)
-                    torch.cuda.synchronize()
+                    with _profiler.hc_record_function_range(
+                        "dsv4.hc.L09.attn.pre_norm"
+                    ):
+                        torch.add(x, 1)
+                        torch.cuda.synchronize()
             prof.export_chrome_trace(str(trace_path))
 
             trace = json.loads(trace_path.read_text())
@@ -142,6 +232,14 @@ class LayerProfilerRangeTest(unittest.TestCase):
 
         self.assertEqual(
             [event.get("cat") for event in layer_events],
+            ["cpu_op"],
+        )
+        self.assertEqual(
+            [
+                event.get("cat")
+                for event in events
+                if event.get("name") == "dsv4.hc.L09.attn.pre_norm"
+            ],
             ["cpu_op"],
         )
         self.assertTrue(any(event.get("cat") == "kernel" for event in events))

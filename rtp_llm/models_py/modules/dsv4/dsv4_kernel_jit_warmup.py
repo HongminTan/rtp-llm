@@ -1167,7 +1167,8 @@ def _collect_dsv4_mhc_prenorm_shapes(model: Any) -> Dict[tuple[int, int], dict]:
     """Collect mHC DeepGEMM prenorm GEMM shapes from live TileLang HC units."""
 
     shapes: Dict[tuple[int, int], dict] = {}
-    for module_name, module in model.named_modules():
+    modules = dict(model.named_modules())
+    for module_name, module in modules.items():
         if module.__class__.__name__ != "TileLangHCUnit":
             continue
         fn = getattr(module, "fn", None)
@@ -1183,6 +1184,9 @@ def _collect_dsv4_mhc_prenorm_shapes(model: Any) -> Dict[tuple[int, int], dict]:
         base = getattr(module, "base", None)
         key = (n_value, k_value)
         if key not in shapes:
+            parent_name, _, hc_name = module_name.rpartition(".")
+            norm_name = {"attn_hc": "attn_norm", "ffn_hc": "ffn_norm"}.get(hc_name)
+            norm = getattr(modules[parent_name], norm_name, None) if norm_name else None
             shapes[key] = {
                 "name": module_name,
                 "fn": fn,
@@ -1191,6 +1195,9 @@ def _collect_dsv4_mhc_prenorm_shapes(model: Any) -> Dict[tuple[int, int], dict]:
                 "dim": int(getattr(module, "dim", 0) or 0),
                 "hc_mult": int(getattr(module, "hc_mult", 4) or 4),
                 "norm_eps": float(getattr(module, "norm_eps", 1.0e-6)),
+                "output_norm_eps": float(
+                    getattr(norm, "variance_epsilon", module.norm_eps)
+                ),
                 "hc_eps": float(getattr(module, "hc_eps", 1.0e-6)),
                 "hc_sinkhorn_iters": int(
                     getattr(module, "hc_sinkhorn_iters", 20) or 20
@@ -1974,25 +1981,43 @@ def warmup_mhc_prenorm_gemm_jit(
                         ),
                         device=device,
                     )
-                    _run_tilelang_warmup_launch_with_retry(
-                        "DSV4 mHC TileLangFuse",
-                        f"shape={key} num_splits={num_splits} m={m_value}",
-                        partial(
-                            _launch_dummy_mhc_pre_big_fuse,
-                            key=key,
-                            info=info,
-                            m_value=m_value,
-                            num_splits=num_splits,
+                    for with_output_norm in (False, True):
+                        _run_tilelang_warmup_launch_with_retry(
+                            "DSV4 mHC TileLangFuse",
+                            f"shape={key} num_splits={num_splits} m={m_value}",
+                            partial(
+                                _launch_dummy_mhc_pre_big_fuse,
+                                key=key,
+                                info=info,
+                                m_value=m_value,
+                                num_splits=num_splits,
+                                device=device,
+                                with_output_norm=with_output_norm,
+                            ),
                             device=device,
-                        ),
-                        device=device,
-                    )
+                        )
                 else:
+                    for with_output_norm in (False, True):
+                        _run_tilelang_warmup_launch_with_retry(
+                            "DSV4 mHC TileLangPre",
+                            f"shape={key} backend={backend} num_splits={num_splits} m={m_value}",
+                            partial(
+                                _launch_dummy_mhc_pre_wrapper,
+                                key=key,
+                                info=info,
+                                m_value=m_value,
+                                device=device,
+                                with_output_norm=with_output_norm,
+                            ),
+                            device=device,
+                        )
+            for m_value in (1, 8):
+                if m_value <= min(max_m, mhc_prenorm_backend.MHC_FMA_MAX_TOKENS):
                     _run_tilelang_warmup_launch_with_retry(
-                        "DSV4 mHC TileLangPre",
-                        f"shape={key} backend={backend} num_splits={num_splits} m={m_value}",
+                        "DSV4 mHC FusedBoundary",
+                        f"shape={key} m={m_value}",
                         partial(
-                            _launch_dummy_mhc_pre_wrapper,
+                            _launch_dummy_mhc_fused_post_pre,
                             key=key,
                             info=info,
                             m_value=m_value,
@@ -2496,6 +2521,37 @@ def _launch_dummy_mhc_prenorm_gemm(
     del x, out, sqrsum
 
 
+def _launch_dummy_mhc_fused_post_pre(*, key, info, m_value, device):
+    from rtp_llm.models_py.modules.dsv4.hc.mhc_tilelang import _import_tk
+
+    _import_tk()
+    fused = import_module(
+        "rtp_llm.models_py.3rdparty.tile_kernels.modeling.mhc.ops.fused_post_pre"
+    ).mhc_fused_post_pre
+    hc = int(info.get("hc_mult", 4))
+    hidden = key[1] // hc
+    residual = torch.zeros((m_value, hc, hidden), dtype=torch.bfloat16, device=device)
+    x = torch.zeros((m_value, hidden), dtype=torch.bfloat16, device=device)
+    post = torch.ones((m_value, hc, 1), device=device)
+    comb = torch.eye(hc, device=device).expand(m_value, hc, hc).contiguous()
+    fused(
+        x,
+        residual,
+        post,
+        comb,
+        info["fn"],
+        info["scale"],
+        info["base"],
+        rms_eps=float(info["norm_eps"]),
+        mhc_pre_eps=float(info["hc_eps"]),
+        mhc_sinkhorn_eps=float(info["hc_eps"]),
+        mhc_post_mult_value=2.0,
+        sinkhorn_repeat=int(info["hc_sinkhorn_iters"]),
+        output_norm_weight=torch.ones(hidden, dtype=torch.bfloat16, device=device),
+        output_norm_eps=info["output_norm_eps"],
+    )
+
+
 def _launch_dummy_mhc_pre_big_fuse(
     *,
     key: tuple[int, int],
@@ -2503,6 +2559,7 @@ def _launch_dummy_mhc_pre_big_fuse(
     m_value: int,
     num_splits: int,
     device: torch.device,
+    with_output_norm: bool = False,
 ) -> None:
     from rtp_llm.models_py.modules.dsv4 import tilelang_kernels  # noqa: F401
 
@@ -2545,6 +2602,11 @@ def _launch_dummy_mhc_pre_big_fuse(
     layer_input = torch.empty(
         (m_value, hidden_size), dtype=torch.bfloat16, device=device
     )
+    output_norm_weight = (
+        torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+        if with_output_norm
+        else None
+    )
     _mhc_pre_big_fuse(
         hidden_size,
         norm_eps,
@@ -2555,6 +2617,7 @@ def _launch_dummy_mhc_pre_big_fuse(
         n_splits=int(num_splits),
         mhc_mult=mhc_mult,
         use_pdl=mhc_prenorm_backend.device_supports_pdl(device),
+        output_norm_eps=info["output_norm_eps"] if with_output_norm else None,
     )(
         gemm_out_mul,
         gemm_out_sqrsum,
@@ -2564,6 +2627,7 @@ def _launch_dummy_mhc_pre_big_fuse(
         post_mix,
         comb_mix,
         layer_input,
+        *(() if output_norm_weight is None else (output_norm_weight,)),
     )
     del (
         gemm_out_mul,
@@ -2583,6 +2647,7 @@ def _launch_dummy_mhc_pre_wrapper(
     info: dict,
     m_value: int,
     device: torch.device,
+    with_output_norm: bool = False,
 ) -> None:
     from rtp_llm.models_py.modules.dsv4.hc.mhc_tilelang import tk_mhc_pre
 
@@ -2626,6 +2691,12 @@ def _launch_dummy_mhc_pre_wrapper(
         sinkhorn_eps=hc_eps,
         sinkhorn_iters=sinkhorn_iters,
         hc_mult=mhc_mult,
+        output_norm_weight=(
+            torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+            if with_output_norm
+            else None
+        ),
+        output_norm_eps=info["output_norm_eps"],
     )
     if out is None:
         raise RuntimeError(
