@@ -111,7 +111,22 @@ class CudaFp8GEMMLinear(LinearBase):
             self._deepgemm_linear, "cached_scales_max_len", 0
         )
 
-    def _should_use_flashinfer(self, input: torch.Tensor) -> bool:
+    def quantize_input(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._deepgemm_linear.quantize_input(input)
+
+    def forward_quantized(
+        self,
+        input_fp8: torch.Tensor,
+        input_scales: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if out is None and self._should_use_flashinfer(input_fp8, input_scales):
+            return self._flashinfer_linear.forward_quantized(input_fp8, input_scales)
+        return self._deepgemm_linear.forward_quantized(input_fp8, input_scales, out=out)
+
+    def _should_use_flashinfer(
+        self, input: torch.Tensor, input_scales: Optional[torch.Tensor] = None
+    ) -> bool:
         if self._flashinfer_linear is None:
             return False
         if input.dim() != 2:
@@ -122,10 +137,11 @@ class CudaFp8GEMMLinear(LinearBase):
             return False
         if input.dtype == torch.bfloat16:
             return True
+        scales = self.input_scales if input_scales is None else input_scales
         if (
             input.dtype == torch.float8_e4m3fn
-            and self.input_scales is not None
-            and self.input_scales.dtype == torch.float32
+            and scales is not None
+            and scales.dtype == torch.float32
         ):
             return True
         return False

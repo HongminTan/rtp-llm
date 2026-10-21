@@ -53,10 +53,16 @@ def decode_compute_qkv(
     )
     freqs_cis = attn.freqs_cis.index_select(0, position_ids).contiguous()
 
+    if attn._can_reuse_qkv_input_quant():
+        shared_quant = attn.wq_a.quantize_input(x.reshape(-1, x.shape[-1]))
+        q_a_out = attn._lin_from_shared_quant(attn.wq_a, shared_quant, x.shape)
+        kv_in = attn._lin_from_shared_quant(attn.wkv, shared_quant, x.shape)
+    else:
+        q_a_out = attn._lin(attn.wq_a, x)
+        kv_in = attn._lin(attn.wkv, x)
+
     # Q path
-    qr = attn._rmsnorm_weighted(
-        attn._lin(attn.wq_a, x), attn.q_norm
-    )  # [B, 1, q_lora_rank]
+    qr = attn._rmsnorm_weighted(q_a_out, attn.q_norm)  # [B, 1, q_lora_rank]
     q = attn._lin(attn.wq_b, qr).unflatten(
         -1, (attn.n_heads, attn.head_dim)
     )  # [B, S, H, D]
@@ -64,7 +70,7 @@ def decode_compute_qkv(
 
     # KV path (single MQA head) — per-token RoPE using the same table lookup.
     kv = fused_rmsnorm_rope(
-        attn._lin(attn.wkv, x),
+        kv_in,
         attn.kv_norm,
         freqs_cis,
         rd,
