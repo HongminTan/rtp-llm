@@ -1,5 +1,4 @@
 import torch
-from torch.utils.checkpoint import checkpoint
 
 from ....mhc.norm_fn_kernel import (
     _mhc_fn_normw_merge_bwd,
@@ -88,22 +87,17 @@ class MHCPreNormFn(torch.autograd.Function):
             device=x.device,
         )
 
-        # TileLang implementation doesn't support split-k, so we set n_splits to 1
-        # You may want to adopt the DeepGEMM implementation with split-k for better performance
-        n_splits = 1
-        out_mul_splitted = out_mul_splitted[:1]
-        sqrsum_splitted = sqrsum_splitted[:1]
-
         fn = round_to_tf32(fn)
 
-        fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(mhc_mult3, 1, mhc_hidden_size)
+        fwd_mul_kernel = _mhc_pre_norm_fn_fwd_mul(
+            mhc_mult3, 1, mhc_hidden_size, n_splits=n_splits
+        )
         fwd_mul_kernel(
             x.view(-1, mhc_hidden_size),
             fn,
-            out_mul_splitted.view(-1, 1, mhc_mult3),
-            sqrsum_splitted.view(-1, 1),
+            out_mul_splitted.view(n_splits, -1, 1, mhc_mult3),
+            sqrsum_splitted.view(n_splits, -1, 1),
         )
-        # END of TileLang implementation of pre-norm-fn forward matmul
 
         out_mul = torch.empty_like(out_mul_splitted[0])
         sqrsum = torch.empty_like(sqrsum_splitted[0])
@@ -182,8 +176,21 @@ def mhc_pre_norm_fn(
     mhc_norm_weight: torch.Tensor | None,
     mhc_norm_eps: float,
     fuse_grad_acc: bool = True,
-    n_splits: int = 16,
+    n_splits: int | None = None,
 ) -> torch.Tensor:
+    from rtp_llm.models_py.modules.dsv4 import mhc_prenorm_backend
+
+    if n_splits is None:
+        n_splits = mhc_prenorm_backend.resolve_n_splits(
+            mhc_hidden_size=mhc_fn.shape[1],
+            num_tokens=residual.numel() // mhc_fn.shape[1],
+            num_sms=mhc_prenorm_backend.device_num_sms(residual.device),
+            backend=mhc_prenorm_backend.TILELANG,
+        )
+    else:
+        mhc_prenorm_backend.validate_n_splits(
+            mhc_fn.shape[1], n_splits, mhc_prenorm_backend.TILELANG
+        )
     if mhc_norm_weight is not None:
         mhc_fn = _MHCFnNormwMerge.apply(mhc_fn, mhc_norm_weight)
     return MHCPreNormFn.apply(
