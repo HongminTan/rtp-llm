@@ -685,6 +685,9 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             {
                 "_wo_a_stk_w": torch.empty((8, 1024, 4096), dtype=torch.float32),
                 "_wo_a_stk_s": torch.empty((8, 1024, 8), dtype=torch.int32),
+                "n_heads": 64,
+                "head_dim": 512,
+                "rope_head_dim": 64,
             },
         )
         root.add_module("attn", Attention())
@@ -692,12 +695,18 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
         root.add_module("no_wo_a", nn.Linear(1, 1))
 
         attention_fp32 = nn.Module()
+        attention_fp32.n_heads = 16
+        attention_fp32.head_dim = 512
+        attention_fp32.rope_head_dim = 64
         attention_fp32.register_buffer("_wo_a_stk_w", torch.empty((2, 1024, 4096)))
         attention_fp32.register_buffer("_wo_a_stk_s", torch.ones((2, 8, 32)))
         root.add_module("attn_fp32", attention_fp32)
 
         shapes = _collect_dsv4_batched_fp8_einsum_shapes(root)
         self.assertEqual(sorted(shapes.keys()), [(2, 1024, 4096), (8, 1024, 4096)])
+        self.assertEqual(shapes[(2, 1024, 4096)]["heads_per_group"], 8)
+        self.assertEqual(shapes[(2, 1024, 4096)]["head_dim"], 512)
+        self.assertEqual(shapes[(2, 1024, 4096)]["rope_head_dim"], 64)
         self.assertFalse(shapes[(2, 1024, 4096)]["scale_ue8m0"])
         self.assertTrue(shapes[(8, 1024, 4096)]["scale_ue8m0"])
         self.assertEqual(shapes[(8, 1024, 4096)]["name"], "attn")
@@ -781,6 +790,91 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             for m in grid
         }
         self.assertIn(96, block_ms)
+
+    def test_wo_a_warmup_covers_small_m_and_quant_layouts(self):
+        from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
+            FLASHINFER_M_THRESHOLD,
+        )
+
+        key = (8, 1024, 4096)
+        launches = []
+
+        def quantize(o, freqs, **kwargs):
+            launches.append(
+                ("quant", o.shape[0], kwargs["flatten_groups"], kwargs["scale_ue8m0"])
+            )
+            return torch.empty(0), torch.empty(0)
+
+        def einsum(expr, a, b, out, **kwargs):
+            launches.append(("einsum", out.shape[0]))
+
+        info = {
+            "weight": torch.empty(0),
+            "scale": torch.empty(0),
+            "heads_per_group": 8,
+            "head_dim": 512,
+            "rope_head_dim": 64,
+            "scale_ue8m0": False,
+            "swapab_supported": lambda m: 0 < key[0] * m < FLASHINFER_M_THRESHOLD,
+            "swapab_project": lambda a, s, m, q: launches.append(("swapab", m)),
+        }
+        quant_module = types.ModuleType("quant_stub")
+        quant_module.fused_inv_rope_fp8_quant = quantize
+        gemm_module = types.ModuleType("deep_gemm")
+        gemm_module.fp8_einsum = einsum
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton": quant_module,
+                "deep_gemm": gemm_module,
+            },
+        ):
+            for max_m in (1, 2, 4):
+                with self.subTest(max_m=max_m):
+                    launches.clear()
+                    grid = warmup_module._generate_wo_a_warmup_m_grid(
+                        key=key,
+                        info=info,
+                        max_m=max_m,
+                        num_sms=132,
+                    )
+                    self.assertEqual(grid, tuple(range(1, max_m + 1)))
+                    for m in grid:
+                        warmup_module._launch_dummy_batched_fp8_einsum(
+                            key=key,
+                            info=info,
+                            m_value=m,
+                            device=torch.device("cpu"),
+                        )
+                    self.assertEqual(
+                        [call[1] for call in launches if call[0] == "einsum"],
+                        list(grid),
+                    )
+                    self.assertEqual(
+                        [call[1] for call in launches if call[0] == "swapab"],
+                        list(range(1, min(max_m, 3) + 1)),
+                    )
+                    self.assertEqual(
+                        [call for call in launches if call[0] == "quant"],
+                        [
+                            call
+                            for m in grid
+                            for call in (
+                                [("quant", m, False, False)]
+                                + ([("quant", m, True, False)] if m < 4 else [])
+                            )
+                        ],
+                    )
+            info["scale_ue8m0"] = True
+            info["swapab_supported"] = None
+            launches.clear()
+            warmup_module._launch_dummy_batched_fp8_einsum(
+                key=key,
+                info=info,
+                m_value=1,
+                device=torch.device("cpu"),
+            )
+            self.assertEqual(launches, [("quant", 1, False, True), ("einsum", 1)])
 
     def test_mhc_prenorm_warmup_specs_cover_reachable_num_splits(self):
         policy = warmup_module.mhc_prenorm_backend

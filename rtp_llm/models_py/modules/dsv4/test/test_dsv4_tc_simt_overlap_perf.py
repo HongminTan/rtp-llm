@@ -1,4 +1,7 @@
-"""Benchmark-only UT for DSV4 TensorCore/SIMT overlap candidates."""
+"""Benchmark DSV4 TensorCore/SIMT overlap using the production quantization API.
+
+Each quantized tile owns its outputs; CUDA events order the two streams.
+"""
 
 from __future__ import annotations
 
@@ -17,9 +20,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton import (
     fused_inv_rope_fp8_quant,
 )
-from rtp_llm.models_py.modules.dsv4._fused_rmsnorm_rope_triton import (
-    fused_rmsnorm_rope,
-)
+from rtp_llm.models_py.modules.dsv4._fused_rmsnorm_rope_triton import fused_rmsnorm_rope
 from rtp_llm.models_py.modules.dsv4.rope import apply_rotary_emb_batched
 
 try:
@@ -199,10 +200,7 @@ def _parse_timeline(trace_path: str, iters: int) -> TimelineStats:
     span_us = max(end for _, end in intervals) - min(start for start, _ in intervals)
     kernel_sum_us = sum(float(e["dur"]) for e in kernels)
     kernel_union_us = _merged_interval_duration(intervals)
-    streams = {
-        str(e.get("args", {}).get("stream", e.get("tid", "")))
-        for e in kernels
-    }
+    streams = {str(e.get("args", {}).get("stream", e.get("tid", ""))) for e in kernels}
     scale = max(iters, 1)
     return TimelineStats(
         span_us=span_us / scale,
@@ -315,7 +313,8 @@ def _is_deepgemm_env_error(exc: BaseException) -> bool:
         "NVCC compilation failed" in msg
         or "DeepGEMM" in msg
         or "deep_gemm" in msg
-        or "No such file or directory" in msg and "g++" in msg
+        or "No such file or directory" in msg
+        and "g++" in msg
     )
 
 
@@ -334,13 +333,6 @@ def _make_wo_a_weight(G: int, R: int, K: int, seed: int = 0):
     scale_rep = scale_fp32.index_select(-2, idx).contiguous()
     s_stk = get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_rep)
     return weight_fp8, s_stk
-
-
-def _make_scale_buf(n_groups: int, rows: int, packed_sf_k: int, device) -> torch.Tensor:
-    tma_m = ((rows + 3) // 4) * 4
-    return torch.empty(
-        n_groups * packed_sf_k * tma_m, dtype=torch.int32, device=device
-    ).as_strided((n_groups, rows, packed_sf_k), (packed_sf_k * tma_m, 1, tma_m))
 
 
 def _wo_a_einsum(
@@ -400,17 +392,10 @@ def _run_out_proj_overlap(
     simt_stream.wait_stream(current)
     tc_stream.wait_stream(current)
 
-    K = HEADS_PER_GROUP * HEAD_DIM
-    packed_sf_k = HEADS_PER_GROUP
-    fp8_ring = [
-        torch.empty((N_GROUPS, tile_m, K), dtype=torch.float8_e4m3fn, device=o.device)
-        for _ in range(ring_depth)
-    ]
-    scale_ring = [
-        _make_scale_buf(N_GROUPS, tile_m, packed_sf_k, o.device) for _ in range(ring_depth)
-    ]
     wo_a_ring = [
-        torch.empty((tile_m, N_GROUPS, WO_A_RANK), dtype=torch.bfloat16, device=o.device)
+        torch.empty(
+            (tile_m, N_GROUPS, WO_A_RANK), dtype=torch.bfloat16, device=o.device
+        )
         for _ in range(ring_depth)
     ]
     quant_done = [torch.cuda.Event(blocking=False) for _ in range(ring_depth)]
@@ -424,23 +409,23 @@ def _run_out_proj_overlap(
         if tile_idx >= ring_depth:
             simt_stream.wait_event(tc_done[slot])
         with torch.cuda.stream(simt_stream):
-            fused_inv_rope_fp8_quant(
+            fp8, scale = fused_inv_rope_fp8_quant(
                 o[start:end],
                 freqs[start:end],
                 n_groups=N_GROUPS,
                 heads_per_group=HEADS_PER_GROUP,
                 nope_dim=NOPE_DIM,
                 rope_head_dim=ROPE_DIM,
-                fp8_buf=fp8_ring[slot],
-                scale_buf=scale_ring[slot],
             )
             quant_done[slot].record(simt_stream)
         with torch.cuda.stream(tc_stream):
             tc_stream.wait_event(quant_done[slot])
+            fp8.record_stream(tc_stream)
+            scale.record_stream(tc_stream)
             wo_a_view = wo_a_ring[slot][:n]
             _wo_a_einsum(
-                fp8_ring[slot][:, :n].transpose(0, 1),
-                scale_ring[slot][:, :n].transpose(0, 1),
+                fp8,
+                scale,
                 w_a,
                 s_a,
                 wo_a_view,
@@ -457,10 +442,17 @@ def _bench_out_projection(M: int, tile: object) -> Optional[BenchResult]:
     if deep_gemm is None:
         return None
     torch.manual_seed(1000 + M)
-    o = (torch.randn(M, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda") * 0.3).contiguous()
+    o = (
+        torch.randn(M, N_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda") * 0.3
+    ).contiguous()
     freqs = _make_freqs(M)
-    w_a, s_a = _make_wo_a_weight(N_GROUPS, WO_A_RANK, HEADS_PER_GROUP * HEAD_DIM, seed=1)
-    w_b = torch.randn(WO_B_OUT, N_GROUPS * WO_A_RANK, dtype=torch.bfloat16, device="cuda") * 0.02
+    w_a, s_a = _make_wo_a_weight(
+        N_GROUPS, WO_A_RANK, HEADS_PER_GROUP * HEAD_DIM, seed=1
+    )
+    w_b = (
+        torch.randn(WO_B_OUT, N_GROUPS * WO_A_RANK, dtype=torch.bfloat16, device="cuda")
+        * 0.02
+    )
     baseline = lambda: _run_out_proj_baseline(o, freqs, w_a, s_a, w_b)
     if tile == "no_split":
         candidate = baseline
@@ -475,7 +467,9 @@ def _bench_out_projection(M: int, tile: object) -> Optional[BenchResult]:
     torch.cuda.synchronize()
     max_abs, mean_abs = _diff(ref, cand)
     if max_abs > 8e-2:
-        raise AssertionError(f"out projection mismatch M={M} tile={tile_name}: {max_abs}")
+        raise AssertionError(
+            f"out projection mismatch M={M} tile={tile_name}: {max_abs}"
+        )
     baseline_us, candidate_us, measure_extra = _measure_pair(
         baseline,
         candidate,
@@ -502,7 +496,12 @@ def _qk_tensors(M: int):
     torch.manual_seed(2000 + M)
     x = torch.randn(M, MODEL_DIM, dtype=torch.bfloat16, device="cuda") * 0.1
     qr = torch.randn(M, Q_LORA_RANK, dtype=torch.bfloat16, device="cuda") * 0.1
-    wq_b = torch.randn(N_HEADS * HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device="cuda") * 0.02
+    wq_b = (
+        torch.randn(
+            N_HEADS * HEAD_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device="cuda"
+        )
+        * 0.02
+    )
     wkv = torch.randn(HEAD_DIM, MODEL_DIM, dtype=torch.bfloat16, device="cuda") * 0.02
     kv_norm = torch.rand(HEAD_DIM, dtype=torch.bfloat16, device="cuda") + 0.5
     freqs = _make_freqs(M)
@@ -542,8 +541,12 @@ def _run_qk_tc_tc_overlap(x, qr, wq_b, wkv, kv_norm, freqs, resources=None):
         ev_k.record(s_k)
     cur.wait_event(ev_q)
     cur.wait_event(ev_k)
-    q = fused_rmsnorm_rope(q_raw.view(M, 1, N_HEADS, HEAD_DIM).contiguous(), None, freqs, ROPE_DIM)
-    kv = fused_rmsnorm_rope(kv_raw.view(M, 1, HEAD_DIM).contiguous(), kv_norm, freqs, ROPE_DIM)
+    q = fused_rmsnorm_rope(
+        q_raw.view(M, 1, N_HEADS, HEAD_DIM).contiguous(), None, freqs, ROPE_DIM
+    )
+    kv = fused_rmsnorm_rope(
+        kv_raw.view(M, 1, HEAD_DIM).contiguous(), kv_norm, freqs, ROPE_DIM
+    )
     return q, kv
 
 
@@ -572,14 +575,18 @@ def _run_qk_tc_simt_overlap(x, qr, wq_b, wkv, kv_norm, freqs, resources=None):
         ev_q_raw.record(s_q)
     with torch.cuda.stream(s_simt):
         s_simt.wait_event(ev_q_raw)
-        q = fused_rmsnorm_rope(q_raw.view(M, 1, N_HEADS, HEAD_DIM).contiguous(), None, freqs, ROPE_DIM)
+        q = fused_rmsnorm_rope(
+            q_raw.view(M, 1, N_HEADS, HEAD_DIM).contiguous(), None, freqs, ROPE_DIM
+        )
         ev_q_done.record(s_simt)
     with torch.cuda.stream(s_k):
         kv_raw = F.linear(x, wkv)
         ev_k_raw.record(s_k)
     cur.wait_event(ev_q_done)
     cur.wait_event(ev_k_raw)
-    kv = fused_rmsnorm_rope(kv_raw.view(M, 1, HEAD_DIM).contiguous(), kv_norm, freqs, ROPE_DIM)
+    kv = fused_rmsnorm_rope(
+        kv_raw.view(M, 1, HEAD_DIM).contiguous(), kv_norm, freqs, ROPE_DIM
+    )
     return q, kv
 
 
@@ -606,9 +613,13 @@ def _bench_qk(M: int, candidate_name: str) -> BenchResult:
             "ev_k_raw": torch.cuda.Event(blocking=False),
         }
     if base_name == "tc_tc":
-        candidate = lambda: _run_qk_tc_tc_overlap(x, qr, wq_b, wkv, kv_norm, freqs, resources)
+        candidate = lambda: _run_qk_tc_tc_overlap(
+            x, qr, wq_b, wkv, kv_norm, freqs, resources
+        )
     else:
-        candidate = lambda: _run_qk_tc_simt_overlap(x, qr, wq_b, wkv, kv_norm, freqs, resources)
+        candidate = lambda: _run_qk_tc_simt_overlap(
+            x, qr, wq_b, wkv, kv_norm, freqs, resources
+        )
     q_ref, kv_ref = baseline()
     q_c, kv_c = candidate()
     torch.cuda.synchronize()
@@ -757,7 +768,9 @@ def _bench_indexer(M: int, persistent: bool = False) -> BenchResult:
     x = torch.randn(M, MODEL_DIM, dtype=torch.bfloat16, device="cuda") * 0.1
     qr = torch.randn(M, Q_LORA_RANK, dtype=torch.bfloat16, device="cuda") * 0.1
     wq_b = torch.randn(IDX_OUT, Q_LORA_RANK, dtype=torch.bfloat16, device="cuda") * 0.02
-    weights_proj = torch.randn(IDX_HEADS, MODEL_DIM, dtype=torch.bfloat16, device="cuda") * 0.02
+    weights_proj = (
+        torch.randn(IDX_HEADS, MODEL_DIM, dtype=torch.bfloat16, device="cuda") * 0.02
+    )
     freqs = _make_freqs(M)
     baseline = lambda: _run_indexer_serial(x, qr, wq_b, weights_proj, freqs)
     resources = (
@@ -770,14 +783,18 @@ def _bench_indexer(M: int, persistent: bool = False) -> BenchResult:
         if persistent
         else None
     )
-    candidate = lambda: _run_indexer_overlap(x, qr, wq_b, weights_proj, freqs, resources)
+    candidate = lambda: _run_indexer_overlap(
+        x, qr, wq_b, weights_proj, freqs, resources
+    )
     q0, w0 = baseline()
     q1, w1 = candidate()
     torch.cuda.synchronize()
     max_abs = max(_diff(q0, q1)[0], _diff(w0, w1)[0])
     if max_abs > 1e-2:
         raise AssertionError(f"indexer mismatch M={M}: {max_abs}")
-    case = "wq_b_rope_weights_proj_persistent" if persistent else "wq_b_rope_weights_proj"
+    case = (
+        "wq_b_rope_weights_proj_persistent" if persistent else "wq_b_rope_weights_proj"
+    )
     baseline_us, candidate_us, measure_extra = _measure_pair(
         baseline,
         candidate,
@@ -806,7 +823,11 @@ def _print_table(results: List[BenchResult], section: str) -> None:
         print(f"\n[{section}] no results")
         return
     print(f"\n[{section}]")
-    print("  {:>8} {:>10} {:>20} {:>12} {:>12} {:>9}".format("M", "tile", "case", "base_us", "cand_us", "speedup"))
+    print(
+        "  {:>8} {:>10} {:>20} {:>12} {:>12} {:>9}".format(
+            "M", "tile", "case", "base_us", "cand_us", "speedup"
+        )
+    )
     for r in rows:
         print(
             "  {:8d} {:>10} {:>20} {:12.2f} {:12.2f} {:8.3f}x".format(
@@ -823,7 +844,9 @@ class DSV4TcSimtOverlapPerfTest(unittest.TestCase):
         results: List[BenchResult] = []
         started = time.time()
 
-        skip_out_projection = os.environ.get("DSV4_OVERLAP_SKIP_OUT_PROJECTION", "0") == "1"
+        skip_out_projection = (
+            os.environ.get("DSV4_OVERLAP_SKIP_OUT_PROJECTION", "0") == "1"
+        )
         if skip_out_projection:
             print("[out_projection] skipped: DSV4_OVERLAP_SKIP_OUT_PROJECTION=1")
         elif deep_gemm is None:
@@ -893,7 +916,11 @@ class DSV4TcSimtOverlapPerfTest(unittest.TestCase):
                     results.append(
                         BenchResult(
                             "compressor",
-                            "wkv_wgate_tc_tc_persistent" if persistent else "wkv_wgate_tc_tc",
+                            (
+                                "wkv_wgate_tc_tc_persistent"
+                                if persistent
+                                else "wkv_wgate_tc_tc"
+                            ),
                             M,
                             "n/a",
                             0.0,
@@ -911,7 +938,11 @@ class DSV4TcSimtOverlapPerfTest(unittest.TestCase):
                     results.append(
                         BenchResult(
                             "indexer",
-                            "wq_b_rope_weights_proj_persistent" if persistent else "wq_b_rope_weights_proj",
+                            (
+                                "wq_b_rope_weights_proj_persistent"
+                                if persistent
+                                else "wq_b_rope_weights_proj"
+                            ),
                             M,
                             "n/a",
                             0.0,

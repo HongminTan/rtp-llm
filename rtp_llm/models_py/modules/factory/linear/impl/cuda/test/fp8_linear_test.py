@@ -881,8 +881,8 @@ class CudaFp8GEMMDispatchTest(CudaFp8LinearTestBase, unittest.TestCase):
             "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear.is_sm90",
             return_value=True,
         ), mock.patch(
-            "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear._has_flashinfer_sm90_fp8_gemm",
-            return_value=True,
+            "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear.get_flashinfer_sm90_fp8_gemm",
+            return_value=mock.Mock(),
         ):
             self.assertTrue(
                 CudaFp8FlashinferLinear.can_handle(
@@ -899,8 +899,8 @@ class CudaFp8GEMMDispatchTest(CudaFp8LinearTestBase, unittest.TestCase):
             "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear.is_sm90",
             return_value=False,
         ), mock.patch(
-            "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear._has_flashinfer_sm90_fp8_gemm",
-            return_value=True,
+            "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_flashinfer_linear.get_flashinfer_sm90_fp8_gemm",
+            return_value=mock.Mock(),
         ):
             self.assertFalse(
                 CudaFp8FlashinferLinear.can_handle(

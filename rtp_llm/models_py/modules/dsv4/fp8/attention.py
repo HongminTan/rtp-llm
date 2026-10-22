@@ -946,6 +946,7 @@ class AttentionFP8(nn.Module):
         self.wo_a_s = wo_a_s
         K_local = n_heads_local * head_dim // n_groups_local
         use_ue8m0 = is_deep_gemm_e8m0_used()
+        self._wo_a_scale_ue8m0 = use_ue8m0
         self._wo_a_project_impl = (
             self._wo_a_einsum_ue8m0 if use_ue8m0 else self._wo_a_einsum_fp32
         )
@@ -959,6 +960,22 @@ class AttentionFP8(nn.Module):
         )
         self.register_buffer("_wo_a_stk_w", _stk_w, persistent=False)
         self.register_buffer("_wo_a_stk_s", _stk_s, persistent=False)
+        # SM90 small-M wo_a: FlashInfer's swapAB block-scale GEMM over the
+        # flattened [G*R, K] weight; only the block-diagonal output is used.
+        self._wo_a_swapab_gemm = None
+        if not use_ue8m0:
+            from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
+                FLASHINFER_M_THRESHOLD,
+                get_flashinfer_sm90_fp8_gemm,
+            )
+
+            self._wo_a_swapab_max_rows = FLASHINFER_M_THRESHOLD
+
+            if (
+                _stk_w.is_cuda
+                and torch.cuda.get_device_capability(_stk_w.device)[0] == 9
+            ):
+                self._wo_a_swapab_gemm = get_flashinfer_sm90_fp8_gemm()
 
         # wo_b row-split along K (cols), all_reduce after forward
         self.wo_b = _fp8_w_s(
@@ -1962,6 +1979,36 @@ class AttentionFP8(nn.Module):
         self._wo_a_project_impl(o_fp8, o_scale, out)
         return out.view(B, S, G, self.o_lora_rank)
 
+    def _wo_a_swapab_supported(self, M: int) -> bool:
+        # Flattening groups gives FlashInfer G*M input rows. Use its swapAB
+        # dispatch range; keep grouped einsum outside that range.
+        return (
+            self._wo_a_swapab_gemm is not None
+            and 0 < M * self.n_groups < self._wo_a_swapab_max_rows
+        )
+
+    def _wo_a_project_swapab(
+        self, o_fp8: torch.Tensor, o_scale: torch.Tensor, B: int, S: int
+    ) -> torch.Tensor:
+        """``o_fp8 [G*M, K]`` (row ``g*M + m``) with FP32 MN-major scales.
+
+        Compute all input/weight group pairs, then retain matching groups.
+        The additional cross-group products trade extra work for the small-row
+        swapAB kernel."""
+        G, R = self.n_groups, self.o_lora_rank
+        M = o_fp8.shape[0] // G
+        full = torch.empty(G * M, G * R, dtype=torch.bfloat16, device=o_fp8.device)
+        self._wo_a_swapab_gemm(
+            o_fp8,
+            self._wo_a_stk_w.view(G * R, -1),
+            o_scale,
+            self._wo_a_stk_s.view(G * R // 128, -1),
+            out=full,
+        )
+        out = torch.empty(M, G, R, dtype=torch.bfloat16, device=o_fp8.device)
+        out.copy_(full.view(G, M, G, R).diagonal(dim1=0, dim2=2).permute(0, 2, 1))
+        return out.view(B, S, G, R)
+
     def _wo_a_einsum_ue8m0(
         self, o_fp8: torch.Tensor, o_scale: torch.Tensor, out: torch.Tensor
     ) -> None:
@@ -1976,11 +2023,9 @@ class AttentionFP8(nn.Module):
     def _wo_a_einsum_fp32(
         self, o_fp8: torch.Tensor, o_scale: torch.Tensor, out: torch.Tensor
     ) -> None:
-        packed = o_scale.contiguous().view(torch.uint8).to(torch.int32)
-        o_scale_f32 = (packed - 127).to(torch.float32).exp2()
         deep_gemm.fp8_einsum(
             "bhr,hdr->bhd",
-            (o_fp8, o_scale_f32),
+            (o_fp8, o_scale),
             (self._wo_a_stk_w, self._wo_a_stk_s),
             out,
             recipe=(1, 128, 128),
@@ -5681,9 +5726,7 @@ class AttentionFP8(nn.Module):
     ) -> None:
         """Inverse-RoPE + grouped wo_a + wo_b into an existing ``[T, dim]`` tensor.
 
-        The fused Triton kernel
-        (``fused_inv_rope_fp8_quant``) emits the exact ``(fp8 [M,G,K],
-        scale [M,G,K/512])`` layout ``deep_gemm.fp8_einsum`` consumes.
+        Quantization emits the scale format consumed by the selected GEMM.
         """
         o_3d = o.view(-1, self.n_heads, self.head_dim)
         seqlen = o_3d.shape[0]
@@ -5695,6 +5738,7 @@ class AttentionFP8(nn.Module):
                 heads_per_group=self.n_heads // self.n_groups,
                 nope_dim=self.head_dim - self.rope_head_dim,
                 rope_head_dim=self.rope_head_dim,
+                scale_ue8m0=self._wo_a_scale_ue8m0,
             )
         with record_function_range("dsv4.fp8.attn.out.wo_a"):
             o_proj = self._wo_a_project_from_fp8(o_fp8, o_scale, 1, seqlen)
