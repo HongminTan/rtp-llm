@@ -1288,6 +1288,11 @@ def _collect_dsv4_batched_fp8_einsum_shapes(
                 "weight": weight,
                 "scale": scale,
                 "scale_ue8m0": scale_ue8m0,
+                "swapab_supported": getattr(module, "_wo_a_swapab_supported", None),
+                "swapab_project": getattr(module, "_wo_a_project_swapab", None),
+                "heads_per_group": module.n_heads // groups,
+                "head_dim": module.head_dim,
+                "rope_head_dim": module.rope_head_dim,
             }
 
     logging.info(
@@ -1814,6 +1819,31 @@ def warmup_dense_gemm_jit(
     _DENSE_GEMM_JIT_WARMED_KEYS.add(warmup_key)
 
 
+def _generate_wo_a_warmup_m_grid(*, key, info, max_m, num_sms):
+    if info["scale_ue8m0"]:
+        grid = _generate_dense_gemm_warmup_m_grid(
+            max_m=int(max_m),
+            n_value=int(key[1]),
+            k_value=int(key[2]),
+            kind="fp8_batched",
+            num_sms=num_sms,
+            num_groups=int(key[0]),
+        )
+    else:
+        grid = _dense_gemm_m_grid(int(max_m))
+    supports_swapab = info.get("swapab_supported")
+    if supports_swapab is not None:
+        from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
+            FLASHINFER_M_THRESHOLD,
+        )
+
+        small_m_max = min(int(max_m), (FLASHINFER_M_THRESHOLD - 1) // key[0])
+        grid = sorted(
+            set(grid).union(m for m in range(1, small_m_max + 1) if supports_swapab(m))
+        )
+    return tuple(grid)
+
+
 @torch.inference_mode()
 def warmup_batched_fp8_einsum_jit(
     shapes: Dict[tuple[int, int, int], dict],
@@ -1821,7 +1851,7 @@ def warmup_batched_fp8_einsum_jit(
     max_m: int,
     device: torch.device,
 ) -> None:
-    """Compile reachable DeepGEMM wo_a batched FP8 einsum layouts."""
+    """Warm up fused wo_a quantization and reachable GEMM layouts."""
 
     if not model_warm_up_enabled():
         return
@@ -1833,17 +1863,11 @@ def warmup_batched_fp8_einsum_jit(
     num_sms = _get_deep_gemm_num_sms(device)
     shape_keys = tuple(sorted(shapes.keys()))
     m_grids = {
-        key: (
-            _generate_dense_gemm_warmup_m_grid(
-                max_m=int(max_m),
-                n_value=int(key[1]),
-                k_value=int(key[2]),
-                kind="fp8_batched",
-                num_sms=num_sms,
-                num_groups=int(key[0]),
-            )
-            if shapes[key]["scale_ue8m0"]
-            else tuple(_dense_gemm_m_grid(int(max_m)))
+        key: _generate_wo_a_warmup_m_grid(
+            key=key,
+            info=shapes[key],
+            max_m=max_m,
+            num_sms=num_sms,
         )
         for key in shape_keys
     }
@@ -2396,26 +2420,34 @@ def _create_dummy_fp8_input(
     return a, scale
 
 
-def _create_dummy_batched_fp8_einsum_input(
-    *,
-    m_value: int,
-    groups: int,
-    k_value: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    a = torch.zeros(
-        (m_value, groups, k_value), dtype=torch.float8_e4m3fn, device=device
+def _quantize_dummy_wo_a_input(*, key, info, m_value, device, flatten_groups):
+    from rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton import (
+        fused_inv_rope_fp8_quant,
     )
-    packed_sf_k = _ceil_div(k_value, 512)
-    tma_m = _align(m_value, 4)
-    scale_group_major = torch.empty(
-        groups * packed_sf_k * tma_m, dtype=torch.int32, device=device
-    ).as_strided(
-        (groups, m_value, packed_sf_k),
-        (packed_sf_k * tma_m, 1, tma_m),
+
+    heads_per_group = info["heads_per_group"]
+    head_dim = info["head_dim"]
+    rope_head_dim = info["rope_head_dim"]
+    o = torch.zeros(
+        (m_value, key[0] * heads_per_group, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
     )
-    scale_group_major.fill_(0x7F7F7F7F)
-    return a, scale_group_major.transpose(0, 1)
+    freqs = torch.ones(
+        (m_value, rope_head_dim // 2),
+        dtype=torch.complex64,
+        device=device,
+    )
+    return fused_inv_rope_fp8_quant(
+        o,
+        freqs,
+        n_groups=key[0],
+        heads_per_group=heads_per_group,
+        nope_dim=head_dim - rope_head_dim,
+        rope_head_dim=rope_head_dim,
+        scale_ue8m0=info["scale_ue8m0"],
+        flatten_groups=flatten_groups,
+    )
 
 
 def _launch_dummy_gemm(
@@ -2480,16 +2512,14 @@ def _launch_dummy_batched_fp8_einsum(
     import deep_gemm
 
     groups, n_value, k_value = key
-    a, a_scale = _create_dummy_batched_fp8_einsum_input(
-        m_value=m_value,
-        groups=groups,
-        k_value=k_value,
-        device=device,
-    )
     scale_ue8m0 = info["scale_ue8m0"]
-    if not scale_ue8m0:
-        packed = a_scale.contiguous().view(torch.uint8).to(torch.int32)
-        a_scale = (packed - 127).to(torch.float32).exp2()
+    a, a_scale = _quantize_dummy_wo_a_input(
+        key=key,
+        info=info,
+        m_value=m_value,
+        device=device,
+        flatten_groups=False,
+    )
     out = torch.empty((m_value, groups, n_value), dtype=torch.bfloat16, device=device)
     deep_gemm.fp8_einsum(
         "bhr,hdr->bhd",
@@ -2499,6 +2529,17 @@ def _launch_dummy_batched_fp8_einsum(
         recipe=(1, 1 if scale_ue8m0 else 128, 128),
     )
     del a, a_scale, out
+
+    swapab_supported = info.get("swapab_supported")
+    if swapab_supported is not None and swapab_supported(m_value):
+        a, a_scale = _quantize_dummy_wo_a_input(
+            key=key,
+            info=info,
+            m_value=m_value,
+            device=device,
+            flatten_groups=True,
+        )
+        info["swapab_project"](a, a_scale, m_value, 1)
 
 
 def _launch_dummy_mhc_prenorm_gemm(

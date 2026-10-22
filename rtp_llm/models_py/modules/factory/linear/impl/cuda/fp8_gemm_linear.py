@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import FLASHINFER_M_THRESHOLD
 from rtp_llm.models_py.modules.factory.linear import LinearBase
 from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_deepgemm_linear import (
     CudaFp8DeepGEMMLinear,
@@ -16,8 +17,6 @@ from rtp_llm.ops import HWKernelConfig
 
 class CudaFp8GEMMLinear(LinearBase):
     """CUDA FP8 GEMM wrapper."""
-
-    FLASHINFER_M_THRESHOLD = CudaFp8FlashinferLinear.FLASHINFER_M_THRESHOLD
 
     @classmethod
     def can_handle(
@@ -133,7 +132,7 @@ class CudaFp8GEMMLinear(LinearBase):
             return False
 
         m, k = input.shape
-        if m >= self.FLASHINFER_M_THRESHOLD or k != self.K:
+        if m >= FLASHINFER_M_THRESHOLD or k != self.K:
             return False
         if input.dtype == torch.bfloat16:
             return True

@@ -4,29 +4,15 @@ from typing import Optional
 
 import torch
 
+from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import get_flashinfer_sm90_fp8_gemm
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
 from rtp_llm.models_py.modules.factory.linear import LinearBase
 from rtp_llm.models_py.utils.arch import is_sm90
 from rtp_llm.ops import HWKernelConfig
 
 
-def _has_flashinfer_sm90_fp8_gemm() -> bool:
-    return _get_flashinfer_sm90_fp8_gemm() is not None
-
-
-def _get_flashinfer_sm90_fp8_gemm():
-    try:
-        from flashinfer.gemm import fp8_blockscale_gemm_sm90
-
-        return fp8_blockscale_gemm_sm90
-    except Exception:
-        return None
-
-
 class CudaFp8FlashinferLinear(LinearBase):
     """CUDA FP8 block-scaled Linear using flashinfer's SM90 kernel."""
-
-    FLASHINFER_M_THRESHOLD = 32
 
     @classmethod
     def can_handle(
@@ -46,7 +32,7 @@ class CudaFp8FlashinferLinear(LinearBase):
             return False
         if not is_sm90():
             return False
-        return _has_flashinfer_sm90_fp8_gemm()
+        return get_flashinfer_sm90_fp8_gemm() is not None
 
     @torch.inference_mode()
     def __init__(
@@ -61,7 +47,7 @@ class CudaFp8FlashinferLinear(LinearBase):
         super().__init__(
             weight, weight_scales, input_scales, bias, quant_config, weight_scale_2
         )
-        self._fi_gemm = _get_flashinfer_sm90_fp8_gemm()
+        self._fi_gemm = get_flashinfer_sm90_fp8_gemm()
         if self._fi_gemm is None:
             raise RuntimeError(
                 "flashinfer.gemm.fp8_blockscale_gemm_sm90 is unavailable. "

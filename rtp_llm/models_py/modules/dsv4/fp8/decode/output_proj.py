@@ -1,18 +1,6 @@
-"""DSv4 decode output projection — extracted from ``Attention._forward_decode_body``.
-
-Mirrors :meth:`rtp_llm.models_py.modules.dsv4.fp8.attention.AttentionFP8._prefill_output_proj`
-for the decode path (per-request batched ``[B, q_len, H, D]``).
-
-Pipeline:
-    1. Inverse partial RoPE (unrotate the ``[rope_head_dim:]`` slice).
-    2. Per-group per-token FP8 quant (UE8M0 scale layout).
-    3. ``wo_a`` grouped einsum via ``deep_gemm.fp8_einsum``.
-    4. ``wo_b`` linear.
-    5. Optional TP ``all_reduce``.
-
-The CUDA fast path fuses steps 1+2 into a single Triton kernel
-(``fused_inv_rope_fp8_quant``). The eager fallback (CPU / empty) mirrors
-the original per-op path, kept for warmup / unit tests.
+"""DSv4 decode output projection: inverse RoPE, FP8 quantization, wo_a,
+wo_b, and optional TP reduction. Quantization emits the layout required by
+the selected wo_a backend.
 """
 
 from __future__ import annotations
@@ -41,20 +29,14 @@ def decode_output_proj(
     bsz: int,
     q_len: int,
 ) -> torch.Tensor:
-    """Inverse-RoPE + grouped ``wo_a`` + ``wo_b`` + (TP) all-reduce.
+    """Project attention output using the selected FP8 backend on CUDA.
 
-    Fast path (CUDA, non-empty): ``fused_inv_rope_fp8_quant`` collapses
-    ``apply_rotary_emb_batched`` (5 launches) + per-group
-    ``per_token_group_quant_fp8`` (G launches) into ONE Triton kernel
-    emitting ``(fp8 [M, G, K], scale [M, G, K/512])`` with packed UE8M0
-    scales. The selected wo_a backend consumes or unpacks those scales.
-
-    Eager fallback (CPU / empty): explicit inv-rotary + bf16-dequant +
-    ``einsum("bsgd,grd->bsgr")``, preserved for framework warmup forwards.
+    CPU and empty inputs use inverse RoPE and a BF16 grouped projection.
     """
     rd = attn.rope_head_dim
 
     if o.is_cuda and o.numel() > 0:
+        use_swapab = attn._wo_a_swapab_supported(bsz * q_len)
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
             o,
             freqs_cis,
@@ -62,8 +44,13 @@ def decode_output_proj(
             heads_per_group=attn.n_heads // attn.n_groups,
             nope_dim=attn.head_dim - attn.rope_head_dim,
             rope_head_dim=attn.rope_head_dim,
+            scale_ue8m0=attn._wo_a_scale_ue8m0,
+            flatten_groups=use_swapab,
         )
-        o = attn._wo_a_project_from_fp8(o_fp8, o_scale, bsz, q_len)
+        if use_swapab:
+            o = attn._wo_a_project_swapab(o_fp8, o_scale, bsz, q_len)
+        else:
+            o = attn._wo_a_project_from_fp8(o_fp8, o_scale, bsz, q_len)
     else:
         if freqs_cis.dim() == 2 and int(freqs_cis.shape[0]) == bsz:
             apply_rotary_emb_batched(o[..., -rd:], freqs_cis, inverse=True)
