@@ -19,12 +19,6 @@ import threading
 from contextlib import contextmanager, suppress
 from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
 
-# P3 (audit §3.5 / §7.4 P0): wo_a batched output projection.
-# Replaces the per-group ``for g in range(G)`` loop (G launches of
-# ``fp8_gemm_nt``) with one ``deep_gemm.fp8_einsum("bhr,hdr->bhd", ...)``
-# call.  Matches vLLM's ``deepseek_v4_attention.py:325`` exactly (same
-# API, same recipe).  Validated by ``test/test_wo_a_batched_vs_loop.py``
-# — bit-identical output + 3.5-4.4× speedup at decode B∈{1..256}.
 import deep_gemm  # noqa: E402
 import torch
 import torch.nn as nn
@@ -331,6 +325,46 @@ if _FLASH_MLA_SPARSE_Q_CHUNK <= 0:
         "DSV4_FLASH_MLA_SPARSE_Q_CHUNK must be positive for streaming "
         "attention output projection"
     )
+
+
+def _stack_fp8_rows(
+    layer_weights: Dict[Any, torch.Tensor],
+    first: Tuple[Any, Any],
+    second: Tuple[Any, Any],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Stack FP8 weights and their checkpoint UE8M0 block scales along N.
+
+    Malformed weights raise ValueError. Valid pairs with different K or an
+    unaligned first N return None. On success, replace the
+    dictionary entries with views into the returned weight and scale tensors.
+    """
+    (w1_tag, s1_tag), (w2_tag, s2_tag) = first, second
+    w1, s1 = layer_weights[w1_tag], layer_weights[s1_tag]
+    w2, s2 = layer_weights[w2_tag], layer_weights[s2_tag]
+    for w, scale in ((w1, s1), (w2, s2)):
+        if w.dim() != 2 or w.dtype != torch.float8_e4m3fn:
+            raise ValueError("stacked weights must be 2D FP8 E4M3 tensors")
+        n, k = w.shape
+        if scale.dtype != torch.float8_e8m0fnu:
+            raise ValueError("stacked scales must use checkpoint UE8M0 encoding")
+        expected_shape = ((n + 127) // 128, (k + 127) // 128)
+        if scale.shape != expected_shape or scale.device != w.device:
+            raise ValueError("scale shape or device does not match its FP8 weight")
+    if w1.device != w2.device:
+        raise ValueError("stacked weights must be on the same device")
+    if w1.shape[0] % 128 or w1.shape[1] != w2.shape[1]:
+        return None
+    scale_rows = w1.shape[0] // 128
+    weight, scale = torch.cat([w1, w2]), torch.cat([s1, s2])
+    layer_weights[w1_tag], layer_weights[w2_tag] = (
+        weight[: w1.shape[0]],
+        weight[w1.shape[0] :],
+    )
+    layer_weights[s1_tag], layer_weights[s2_tag] = (
+        scale[:scale_rows],
+        scale[scale_rows:],
+    )
+    return weight, scale
 
 
 def _prepare_wo_a_stacked(
@@ -872,43 +906,33 @@ class AttentionFP8(nn.Module):
 
         from rtp_llm.utils.model_weight import W
 
-        # Q / KV / O — FP8 linears go through LinearFactory →
-        # CudaFp8DeepGEMMLinear → DeepGEMM fp8_gemm_nt.
         def _fp8_w_s(w_tag, s_tag, row_slice=None, col_slice=None):
-            """Pull (weight, scale) by W tag with optional TP slicing,
-            then build a CudaFp8DeepGEMMLinear via ``_v4_fp8_linear``.
-
-            Scale slicing depends on layout:
-              * legacy raw UE8M0 [N//128, K//128]: row/col strides are
-                block-128 → ``slice.start // 128``.
-              * framework packed int32 [N, K//128//4]: N is fully
-                expanded (slice by full N stride) and K is packed 4×
-                (slice by ``slice.start // 512``)."""
+            """TP-slice checkpoint FP8 weights and their 128x128 UE8M0 scales."""
             w = layer_weights[w_tag]
             s = layer_weights[s_tag]
-            scale_is_packed_int32 = s.dtype == torch.int32
+            assert s.dtype == torch.float8_e8m0fnu
             if row_slice is not None:
+                assert row_slice.start % 128 == 0 and row_slice.stop % 128 == 0
                 w = w[row_slice]
-                if scale_is_packed_int32:
-                    s = s[row_slice]
-                else:
-                    s = s[row_slice.start // 128 : row_slice.stop // 128]
+                s = s[row_slice.start // 128 : row_slice.stop // 128]
             if col_slice is not None:
+                assert col_slice.start % 128 == 0 and col_slice.stop % 128 == 0
                 w = w[:, col_slice]
-                if scale_is_packed_int32:
-                    assert col_slice.start % 512 == 0 and col_slice.stop % 512 == 0, (
-                        f"col_slice {col_slice} not aligned to 512 for "
-                        f"packed int32 scale; framework path requires "
-                        f"K-slices on 512-byte boundaries"
-                    )
-                    s = s[:, col_slice.start // 512 : col_slice.stop // 512]
-                else:
-                    s = s[:, col_slice.start // 128 : col_slice.stop // 128]
+                s = s[:, col_slice.start // 128 : col_slice.stop // 128]
             if row_slice is not None or col_slice is not None:
                 w = w.contiguous()
                 s = s.contiguous()
             return _v4_fp8_linear(w, s)
 
+        # wq_a and wkv (MQA single KV head, replicated) read the same input:
+        # one GEMM over their stacked rows serves both.
+        if layer_weights[W.v4_attn_wq_a_w].shape[0] != self.q_lora_rank:
+            raise ValueError("wq_a output width must match q_lora_rank")
+        stacked = _stack_fp8_rows(
+            layer_weights,
+            (W.v4_attn_wq_a_w, W.v4_attn_wq_a_s),
+            (W.v4_attn_wkv_w, W.v4_attn_wkv_s),
+        )
         self.wq_a = _fp8_w_s(W.v4_attn_wq_a_w, W.v4_attn_wq_a_s)
         # wq_b is row-split along N (n_heads * head_dim)
         self.wq_b = _fp8_w_s(
@@ -918,6 +942,15 @@ class AttentionFP8(nn.Module):
         )
         # MQA single KV head — replicate.
         self.wkv = _fp8_w_s(W.v4_attn_wkv_w, W.v4_attn_wkv_s)
+        self.wqkv_a = None
+        if stacked is not None and self._can_reuse_qkv_input_quant():
+            candidate = _v4_fp8_linear(*stacked)
+            if (
+                hasattr(candidate, "forward_quantized")
+                and getattr(candidate, "K", None) == self.wq_a.K
+                and getattr(candidate, "scale_ue8m0", None) == self.wq_a.scale_ue8m0
+            ):
+                self.wqkv_a = candidate
 
         # wo_a grouped projection: row-split along (n_groups*o_lora_rank).
         # Prepare scales for the selected FP8 projection backend.
@@ -1968,6 +2001,16 @@ class AttentionFP8(nn.Module):
     ) -> torch.Tensor:
         y = layer.forward_quantized(*quantized_input)
         return y.view(*shape[:-1], y.shape[-1])
+
+    def _qkv_a_from_shared_quant(
+        self,
+        quantized_input: Tuple[torch.Tensor, torch.Tensor],
+        shape: torch.Size,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(wq_a, wkv)`` outputs from one GEMM over the stacked weight, as
+        row-strided views of the stacked output."""
+        y = self._lin_from_shared_quant(self.wqkv_a, quantized_input, shape)
+        return y[..., : self.q_lora_rank], y[..., self.q_lora_rank :]
 
     def _wo_a_project_from_fp8(
         self, o_fp8: torch.Tensor, o_scale: torch.Tensor, B: int, S: int
@@ -5279,6 +5322,12 @@ class AttentionFP8(nn.Module):
                     shared_input_quant = self.wq_a.quantize_input(x_2d)
         else:
             shared_input_quant = None
+        stacked_proj = None
+        if shared_input_quant is not None and self.wqkv_a is not None:
+            with record_function_range("dsv4.fp8.attn.qkv.qkv_a_proj"):
+                stacked_proj = self._qkv_a_from_shared_quant(
+                    shared_input_quant, x_3d.shape
+                )
 
         def compute_qr() -> torch.Tensor:
             # q_lora_a + norm only — small ``[1, T, q_lora_rank]`` (fed to the
@@ -5286,7 +5335,9 @@ class AttentionFP8(nn.Module):
             # ``_materialize_prefill_q`` so the 16 GiB Q buffer can reuse the
             # union workspace storage after the compressors finish.
             with record_function_range("dsv4.fp8.attn.qkv.q_lora_a_norm"):
-                if shared_input_quant is not None:
+                if stacked_proj is not None:
+                    q_proj = stacked_proj[0]
+                elif shared_input_quant is not None:
                     q_proj = self._lin_from_shared_quant(
                         self.wq_a, shared_input_quant, x_3d.shape
                     )
@@ -5298,7 +5349,9 @@ class AttentionFP8(nn.Module):
 
         def compute_kv() -> torch.Tensor:
             with record_function_range("dsv4.fp8.attn.qkv.kv_proj_rope"):
-                if shared_input_quant is not None:
+                if stacked_proj is not None:
+                    kv_in = stacked_proj[1]
+                elif shared_input_quant is not None:
                     kv_in = self._lin_from_shared_quant(
                         self.wkv, shared_input_quant, x_3d.shape
                     )
