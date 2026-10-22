@@ -2115,6 +2115,9 @@ class AttentionFP8(nn.Module):
         from rtp_llm.models_py.modules.dsv4.fp8.decode.compute_qkv import (
             decode_compute_qkv,
         )
+        from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
+            get_decode_freqs_cis,
+        )
         from rtp_llm.models_py.modules.dsv4.fp8.decode.output_proj import (
             decode_output_proj,
         )
@@ -2125,7 +2128,12 @@ class AttentionFP8(nn.Module):
         position_ids = attn_metadata.position_ids[:T]  # [T] int32
 
         self._ensure_freqs_cis_bound()
-        qkv = decode_compute_qkv(self, x, position_ids)
+        qkv = decode_compute_qkv(
+            self,
+            x,
+            position_ids,
+            freqs_cis=get_decode_freqs_cis(attn_metadata, self.freqs_cis),
+        )
         with suppress(Exception):
             from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
                 CSA_KV,
@@ -2334,6 +2342,9 @@ class AttentionFP8(nn.Module):
         both scatter into their pools; the indexer's topk buffer holds
         raw (pre +win) compressed local indices which the shared
         dual-pool epilogue consumes."""
+        from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
+            get_decode_freqs_cis,
+        )
         from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
             CSA_KV,
             CSA_STATE,
@@ -2358,6 +2369,7 @@ class AttentionFP8(nn.Module):
             attn_metadata.topk_buffer_compressed[:bsz],
             position_ids=position_ids,
             compressor_meta=indexer_compressor_meta,
+            freqs_cis=get_decode_freqs_cis(attn_metadata, self.indexer.freqs_cis),
         )
         csa_compressor_meta = self._decode_compressor_meta_from_metadata(
             attn_metadata,

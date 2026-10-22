@@ -527,6 +527,12 @@ class V4Transformer(nn.Module):
 
     def begin_decode(self, attn_metadata: object) -> None:
         """Advance model-wide decode state before entering the layer loop."""
+        from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
+            DSv4DecodeAttnMetadataFP8,
+        )
+
+        if isinstance(attn_metadata, DSv4DecodeAttnMetadataFP8):
+            attn_metadata.freqs_cis_by_table.clear()
         if self._mega_csa_runtime is not None:
             self._mega_csa_runtime.begin_decode(attn_metadata)
 

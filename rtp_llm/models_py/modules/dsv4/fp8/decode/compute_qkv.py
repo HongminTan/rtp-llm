@@ -1,17 +1,8 @@
-"""DSv4 decode Q/KV projection — extracted from ``AttentionFP8._forward_decode_body``.
-
-Mirrors ``AttentionFP8._prefill_compute_qkv`` for the decode path
-(per-request batched, including target-verify ``q_len > 1``).
-
-The Attention module is passed in as ``attn`` and treated as a bag of
-weights + tiny helpers (``_lin`` / ``_rmsnorm_weighted``) — this matches
-the existing free-function pattern in :mod:`.decode_attn_metadata`, and
-keeps ``attention.py`` thin.
-"""
+"""DSV4 decode Q/KV projection, normalization and RoPE for [B, S] tokens."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -40,18 +31,33 @@ class DecodeQKV(NamedTuple):
 def decode_compute_qkv(
     attn: "AttentionFP8",
     x: torch.Tensor,  # [B, S, dim] bf16
-    position_ids: torch.Tensor,  # [T] int32 absolute position per token
+    position_ids: torch.Tensor,  # [B*S] absolute token positions
+    *,
+    freqs_cis: Optional[torch.Tensor] = None,
 ) -> DecodeQKV:
     """Decode Q/KV path — RMSNorm + LoRA Q + KV linear + fused RMSNorm-RoPE.
 
-    ``position_ids`` is flat over the token-major ``[B, S]`` layout. For
-    normal decode ``S == 1``; target verify passes the full verify span.
+    Optional ``freqs_cis`` skips lookup in ``attn.freqs_cis``. It must be a
+    contiguous complex64 tensor [B*S, rope_head_dim//2] on x.device, matching
+    position_ids and the token order of x.reshape(-1, x.shape[-1]).
     """
     rd = attn.rope_head_dim
-    position_ids = position_ids.reshape(-1).to(
-        device=attn.freqs_cis.device, dtype=torch.long
-    )
-    freqs_cis = attn.freqs_cis.index_select(0, position_ids).contiguous()
+    if freqs_cis is not None:
+        expected_shape = (x.shape[0] * x.shape[1], rd // 2)
+        if (
+            freqs_cis.shape != expected_shape
+            or freqs_cis.dtype != torch.complex64
+            or freqs_cis.device != x.device
+            or not freqs_cis.is_contiguous()
+        ):
+            raise ValueError(
+                f"freqs_cis must be contiguous complex64 {expected_shape} on {x.device}"
+            )
+    if freqs_cis is None:
+        positions = position_ids.reshape(-1).to(
+            device=attn.freqs_cis.device, dtype=torch.long
+        )
+        freqs_cis = attn.freqs_cis.index_select(0, positions)
 
     if attn._can_reuse_qkv_input_quant():
         shared_quant = attn.wq_a.quantize_input(x.reshape(-1, x.shape[-1]))
@@ -65,7 +71,7 @@ def decode_compute_qkv(
         kv_in = attn._lin(attn.wkv, x)
 
     # Q path
-    qr = attn._rmsnorm_weighted(q_a_out, attn.q_norm)  # [B, 1, q_lora_rank]
+    qr = attn._rmsnorm_weighted(q_a_out, attn.q_norm)  # [B, S, q_lora_rank]
     q = attn._lin(attn.wq_b, qr).unflatten(
         -1, (attn.n_heads, attn.head_dim)
     )  # [B, S, H, D]
