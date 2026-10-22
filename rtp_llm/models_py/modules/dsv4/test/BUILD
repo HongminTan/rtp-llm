@@ -95,6 +95,12 @@ dsv4_py_test(
 )
 
 dsv4_sm100_py_test(
+    name = "test_fp8_attention_projection",
+    extra_srcs = ["test_fused_inv_rope_fp8_quant.py"],
+    deps = _MODEL_TEST_DEPS,
+)
+
+dsv4_sm100_py_test(
     name = "test_prefill_fast_path_cuda",
     extra_srcs = ["test_prefill_fast_path.py"],
     deps = _MODEL_TEST_DEPS + ["//rtp_llm/models_py:models"],

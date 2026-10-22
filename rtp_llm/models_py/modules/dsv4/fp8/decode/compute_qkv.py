@@ -55,8 +55,11 @@ def decode_compute_qkv(
 
     if attn._can_reuse_qkv_input_quant():
         shared_quant = attn.wq_a.quantize_input(x.reshape(-1, x.shape[-1]))
-        q_a_out = attn._lin_from_shared_quant(attn.wq_a, shared_quant, x.shape)
-        kv_in = attn._lin_from_shared_quant(attn.wkv, shared_quant, x.shape)
+        if attn.wqkv_a is not None:
+            q_a_out, kv_in = attn._qkv_a_from_shared_quant(shared_quant, x.shape)
+        else:
+            q_a_out = attn._lin_from_shared_quant(attn.wq_a, shared_quant, x.shape)
+            kv_in = attn._lin_from_shared_quant(attn.wkv, shared_quant, x.shape)
     else:
         q_a_out = attn._lin(attn.wq_a, x)
         kv_in = attn._lin(attn.wkv, x)

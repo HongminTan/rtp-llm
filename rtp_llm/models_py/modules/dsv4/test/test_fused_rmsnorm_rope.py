@@ -1,20 +1,4 @@
-"""UT for fused Q/KV-RMSNorm + partial RoPE (single Triton kernel).
-
-Audit doc §7.4 P0 / row 1 of P0 priority list. The decode path on
-``attention.py`` calls ``fused_rmsnorm_rope`` as a single Triton launch
-per Q and per KV, replacing the prior split pipeline (eager
-``apply_rotary_emb_batched`` after an RMSNorm).
-
-This UT imports the production wrapper directly (so the contiguity
-contract and any wrapper-level changes are exercised here), then verifies:
-  1) Numerical accuracy vs the eager torch reference within bf16 tolerance
-  2) Wall-clock GPU time improvement vs the eager reference
-
-Run:
-  cd .../github-opensource && CUDA_VISIBLE_DEVICES=7 \
-    /opt/conda310/bin/python3 \
-    rtp_llm/models_py/modules/dsv4/test/test_fused_rmsnorm_rope.py
-"""
+"""Numerical tests and eager-reference benchmarks for fused RMSNorm and RoPE."""
 
 from __future__ import annotations
 
@@ -122,8 +106,23 @@ def test_kv_correctness():
     assert d_ref.max() < 5e-2, f"KV max diff {d_ref.max()} exceeds tol"
 
 
+def test_row_strided_input_matches_contiguous():
+    """KV read as a column slice of a stacked [wq_a | wkv] GEMM output."""
+    torch.manual_seed(5)
+    B, S, head_dim, rd, eps = 3, 2, 512, 64, 1e-6
+    stacked = torch.randn(B, S, 1024 + head_dim, dtype=torch.bfloat16, device="cuda")
+    kv = stacked[..., 1024:]
+    weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda").abs() + 0.5
+    freqs = _make_freqs(B * S, rd)
+
+    ref = fused_rmsnorm_rope(kv.contiguous(), weight, freqs, rd, eps=eps)
+    cand = fused_rmsnorm_rope(kv, weight, freqs, rd, eps=eps)
+    assert cand.is_contiguous()
+    assert torch.equal(cand, ref)
+
+
 def test_output_buffer_and_inplace_correctness():
-    """Wrapper output modes used by future decode workspace reuse."""
+    """Check preallocated output and in-place execution against default output."""
     torch.manual_seed(3)
     B, H, head_dim, rd, eps = 4, 64, 128, 64, 1e-6
     q = torch.randn(B, 1, H, head_dim, dtype=torch.bfloat16, device="cuda") * 0.5
@@ -353,6 +352,7 @@ if __name__ == "__main__":
     print("== Correctness ==")
     test_q_correctness()
     test_kv_correctness()
+    test_row_strided_input_matches_contiguous()
     test_output_buffer_and_inplace_correctness()
     test_prefill_attention_inplace_matches_out_of_place()
     test_group_heads_correctness()

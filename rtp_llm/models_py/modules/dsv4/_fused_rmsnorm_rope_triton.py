@@ -1,12 +1,4 @@
-"""Fused RMSNorm + partial RoPE Triton kernel for DeepSeek-V4 decode.
-
-Audit doc §7.4 P0 (row 1): replaces the 2-launch torch RMSNorm + eager
-``apply_rotary_emb_batched`` sequence on the Q/KV decode/prefill path
-with a single Triton launch. Correctness and perf (1.25-1.75x vs the
-eager baseline across T in {64,128,256,4096,65536}) are validated in
-``rtp_llm/models_py/modules/dsv4/test/test_fused_rmsnorm_rope.py`` —
-that UT is the source of truth for both kernel and wrapper.
-"""
+"""Fused RMSNorm and partial RoPE for DeepSeek-V4 Q/KV in decode and prefill."""
 
 from __future__ import annotations
 
@@ -27,9 +19,6 @@ def _is_blackwell_device(device: torch.device | int | None = None) -> bool:
     return major >= 10
 
 
-# ---------------------------------------------------------------------------
-# Candidate fused kernel — RMSNorm over last D + partial RoPE on last RD dims.
-# ---------------------------------------------------------------------------
 @triton.jit
 def _fused_rmsnorm_rope_kernel(
     x_ptr,
@@ -196,15 +185,19 @@ def fused_rmsnorm_rope(
                    Mapping: each freq slot covers ``N_tokens // N_freq``
                    consecutive tokens in the ravelled x layout.
 
-    Returns a tensor of the same shape & dtype as ``x``.  By default a new
-    output tensor is allocated.  ``out`` can provide a preallocated contiguous
-    output buffer, ``out`` may alias ``x``, and ``inplace=True`` writes back
-    into ``x``.  ``group_heads`` groups Q-style rows sharing the same frequency
+    Rows of ``x`` may be strided (e.g. a column slice of a stacked GEMM
+    output) as long as its leading dims flatten to rows.
+
+    Returns a tensor of the same shape and dtype as ``x``. By default the
+    output is newly allocated and contiguous. ``out`` must be contiguous;
+    it can alias ``x`` only when ``x`` is also contiguous. ``inplace=True``
+    writes back into ``x`` and preserves its strides. ``group_heads`` groups
+    Q-style rows sharing the same frequency
     slot; valid values are 1, 2, 4, and 8.
     """
     assert x.is_cuda
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
-    assert x.is_contiguous()
+    assert x.stride(-1) == 1, "rows of x may be strided, but not its last dim"
     assert freqs_cis.is_contiguous()
     assert not (out is not None and inplace), "out and inplace are mutually exclusive"
     orig_shape = x.shape
@@ -220,7 +213,7 @@ def fused_rmsnorm_rope(
         assert out.dtype == x.dtype and out.is_cuda and out.is_contiguous()
         out_flat = out.view(-1, D)
     else:
-        out_flat = torch.empty_like(x_flat)
+        out_flat = torch.empty(x_flat.shape, dtype=x.dtype, device=x.device)
     if N == 0:
         return out_flat.view(*orig_shape)
 
