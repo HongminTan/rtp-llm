@@ -167,6 +167,71 @@ def test_stacked_qkv_matches_separate():
         )
 
 
+def test_decode_qkv_pre_gathered_freqs_match_lookup():
+    from rtp_llm.models_py.modules.dsv4.fp8.attention import AttentionFP8
+    from rtp_llm.models_py.modules.dsv4.fp8.decode.compute_qkv import decode_compute_qkv
+    from rtp_llm.models_py.modules.dsv4.fp8.indexer import IndexerFP8
+
+    torch.manual_seed(3)
+    b, seq, k, rank, heads, dim, rd = 2, 3, 256, 128, 2, 128, 64
+
+    def linear(n, k):
+        weight = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
+        scale = torch.full(
+            (n // 128, k // 128), 120, device="cuda", dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu)
+        return _v4_fp8_linear(weight, scale)
+
+    angles = torch.randn(32, rd // 2, device="cuda")
+    attn = SimpleNamespace(
+        rope_head_dim=rd,
+        head_dim=dim,
+        n_heads=heads,
+        eps=1e-6,
+        freqs_cis=torch.polar(torch.ones_like(angles), angles),
+        wq_a=linear(rank, k),
+        wkv=linear(dim, k),
+        wq_b=linear(heads * dim, rank),
+        wqkv_a=None,
+        q_norm=torch.ones(rank, device="cuda", dtype=torch.bfloat16),
+        kv_norm=torch.ones(dim, device="cuda", dtype=torch.bfloat16),
+        _can_reuse_qkv_input_quant=lambda: True,
+    )
+    attn._lin_from_shared_quant = lambda *args: AttentionFP8._lin_from_shared_quant(
+        attn, *args
+    )
+    attn._lin = lambda *args: AttentionFP8._lin(attn, *args)
+    attn._rmsnorm_weighted = lambda *args: AttentionFP8._rmsnorm_weighted(attn, *args)
+    x = torch.randn(b, seq, k, device="cuda", dtype=torch.bfloat16)
+    positions = torch.tensor([2, 3, 4, 11, 12, 13], device="cuda", dtype=torch.int32)
+    freqs = attn.freqs_cis.index_select(0, positions.long())
+    reference = decode_compute_qkv(attn, x, positions)
+    actual = decode_compute_qkv(attn, x, positions, freqs_cis=freqs)
+    for got, expected in zip(actual, reference):
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+    # Per-request rows must not broadcast over a multi-token verify span.
+    for call in (
+        lambda: decode_compute_qkv(attn, x, positions, freqs_cis=freqs[:b]),
+        lambda: IndexerFP8.forward_decode_vectorized(
+            SimpleNamespace(rope_head_dim=rd),
+            x,
+            reference.qr,
+            positions[::seq],
+            torch.empty(0, device="cuda"),
+            position_ids=positions,
+            freqs_cis=freqs[:b],
+        ),
+    ):
+        try:
+            call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("per-request frequency rows were accepted for verify")
+
+
 if __name__ == "__main__":
     test_end_to_end_via_einsum()
     test_stacked_qkv_matches_separate()
+    test_decode_qkv_pre_gathered_freqs_match_lookup()

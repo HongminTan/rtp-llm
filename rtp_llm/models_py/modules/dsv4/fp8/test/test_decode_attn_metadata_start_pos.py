@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-import types
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
+from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
+    allocate_decode_metadata_fp8,
+    build_decode_metadata_fp8,
+    get_decode_freqs_cis,
+    update_decode_metadata_in_place_fp8,
+)
+from rtp_llm.models_py.modules.dsv4.fp8.decode.paged_topk_translator import (
+    translate_local_to_global_slots,
+)
+from rtp_llm.models_py.modules.dsv4.fp8.decode.pool_slot_mapping import (
+    compute_kv_pool_slot_mapping,
+)
 from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
     CSA_KV,
     CSA_STATE,
@@ -20,35 +28,7 @@ from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
     INDEXER_STATE,
     SWA_KV,
 )
-from rtp_llm.models_py.modules.dsv4.fp8.decode.paged_topk_translator import (
-    translate_local_to_global_slots,
-)
-from rtp_llm.models_py.modules.dsv4.fp8.decode.pool_slot_mapping import (
-    compute_kv_pool_slot_mapping,
-)
-
-_THIS_DIR = Path(__file__).resolve().parent
-_DECODE_DIR = _THIS_DIR.parent / "decode"
-
-
-def _load_module(name: str, path: Path) -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load {name} from {path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_meta_mod = _load_module(
-    "dsv4_fp8_decode_attn_metadata_under_test",
-    _DECODE_DIR / "decode_attn_metadata.py",
-)
-
-allocate_decode_metadata_fp8 = _meta_mod.allocate_decode_metadata_fp8
-build_decode_metadata_fp8 = _meta_mod.build_decode_metadata_fp8
-update_decode_metadata_in_place_fp8 = _meta_mod.update_decode_metadata_in_place_fp8
+from rtp_llm.models_py.modules.dsv4.transformer import V4Transformer
 
 
 def _alloc(q_len: int, max_bs: int = 4, max_seq_len: int = 65600):
@@ -280,6 +260,78 @@ class TestDecodeMetadataStartPos(unittest.TestCase):
         self.assertEqual(meta.position_ids[:1].tolist(), [0])
         self.assertEqual(meta.slot_mapping_swa[:1].tolist(), [0])
         self.assertEqual(_ptr_snapshot(meta), ptrs)
+
+    def test_decode_freqs_cis_gathers_once_per_table(self):
+        model = SimpleNamespace(_mega_csa_runtime=None)
+        meta = _alloc(q_len=1, max_seq_len=1024)
+        update_decode_metadata_in_place_fp8(meta, _i32([4, 127]), forbid_realloc=True)
+        table_a = torch.randn(1024, 32, dtype=torch.complex64, device="cuda")
+        table_b = torch.randn(1024, 32, dtype=torch.complex64, device="cuda")
+
+        V4Transformer.begin_decode(model, meta)
+        rows_a = get_decode_freqs_cis(meta, table_a)
+        rows_b = get_decode_freqs_cis(meta, table_b)
+        self.assertIs(get_decode_freqs_cis(meta, table_a), rows_a)
+
+        self.assertEqual(len(meta.freqs_cis_by_table), 2)
+        self.assertTrue(torch.equal(rows_a, table_a[[4, 127]]))
+        self.assertTrue(torch.equal(rows_b, table_b[[4, 127]]))
+        update_decode_metadata_in_place_fp8(meta, _i32([9, 300]), forbid_realloc=True)
+        V4Transformer.begin_decode(model, meta)
+        self.assertTrue(
+            torch.equal(get_decode_freqs_cis(meta, table_a), table_a[[9, 300]])
+        )
+
+    def test_decode_freqs_cis_replays_with_updated_positions(self):
+        model = SimpleNamespace(_mega_csa_runtime=None)
+        meta = _alloc(q_len=1, max_seq_len=1024)
+        table = torch.randn(1024, 32, dtype=torch.complex64, device="cuda")
+        out = torch.empty(2, 32, dtype=torch.complex64, device="cuda")
+
+        def forward():
+            V4Transformer.begin_decode(model, meta)
+            out.copy_(get_decode_freqs_cis(meta, table))
+
+        update_decode_metadata_in_place_fp8(meta, _i32([4, 127]), forbid_realloc=True)
+        # Warm up eagerly before capture, as the CUDA graph runner does.
+        forward()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+
+        update_decode_metadata_in_place_fp8(meta, _i32([9, 300]), forbid_realloc=True)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(out, table[[9, 300]]))
+
+    def test_verify_freqs_cis_replays_with_updated_prefixes(self):
+        model = SimpleNamespace(_mega_csa_runtime=None)
+        meta = _alloc(q_len=4, max_seq_len=1024)
+        attn = SimpleNamespace(
+            is_prefill=True,
+            is_target_verify=True,
+            sequence_lengths=_i32([900, 901]),
+            prefix_lengths=_i32([10, 127]),
+        )
+        table = torch.randn(1024, 32, dtype=torch.complex64, device="cuda")
+        out = torch.empty(8, 32, dtype=torch.complex64, device="cuda")
+
+        def forward():
+            V4Transformer.begin_decode(model, meta)
+            out.copy_(get_decode_freqs_cis(meta, table))
+
+        update_decode_metadata_in_place_fp8(meta, attn, forbid_realloc=True)
+        forward()
+        self.assertTrue(torch.equal(out, table[[10, 11, 12, 13, 127, 128, 129, 130]]))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+
+        attn.prefix_lengths.copy_(_i32([12, 128]))
+        update_decode_metadata_in_place_fp8(meta, attn, forbid_realloc=True)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(out, table[[12, 13, 14, 15, 128, 129, 130, 131]]))
 
     def test_normal_decode_uses_sequence_lengths(self):
         meta = _alloc(q_len=1)

@@ -616,8 +616,30 @@ class IndexerFP8(PoolBackedModule):
         out_topk_buffer: torch.Tensor,
         position_ids: Optional[torch.Tensor] = None,
         compressor_meta: Optional[CompressorMeta] = None,
+        *,
+        freqs_cis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Run decode indexing with optional pre-gathered RoPE rows.
+
+        ``freqs_cis`` must be contiguous complex64 [B*q_len, rope_head_dim//2]
+        on x.device, from this indexer's frequency table and ordered like
+        x.reshape(-1, x.shape[-1]). With position_ids, rows correspond to
+        compressor_meta.positions (the same flattened token positions).
+        Otherwise q_len must be 1 and rows correspond to start_pos per request.
+        When omitted, gather these rows from self.freqs_cis.
+        """
         bsz, q_len = int(x.size(0)), int(x.size(1))
+        if freqs_cis is not None:
+            expected_shape = (bsz * q_len, self.rope_head_dim // 2)
+            if (
+                freqs_cis.shape != expected_shape
+                or freqs_cis.dtype != torch.complex64
+                or freqs_cis.device != x.device
+                or not freqs_cis.is_contiguous()
+            ):
+                raise ValueError(
+                    f"freqs_cis must be contiguous complex64 {expected_shape} on {x.device}"
+                )
         if position_ids is None:
             assert q_len == 1, "decode q_len > 1 requires flat position_ids"
         ratio = self.compress_ratio
@@ -634,17 +656,20 @@ class IndexerFP8(PoolBackedModule):
             )
 
             if position_ids is None:
-                freqs = self.freqs_cis[start_pos.long()]
+                if freqs_cis is None:
+                    freqs_cis = self.freqs_cis.index_select(0, start_pos.long())
                 q = self._compute_indexer_q(
-                    qr, freqs, batched_rope=True, apply_rope=False
+                    qr, freqs_cis, batched_rope=True, apply_rope=False
                 )
                 compressed_len = ((start_pos + 1) // ratio).view(bsz, 1, 1)
             else:
                 assert compressor_meta is not None
-                pos_flat = compressor_meta.positions.reshape(-1)
-                freqs = self.freqs_cis.index_select(0, pos_flat).contiguous()
+                if freqs_cis is None:
+                    freqs_cis = self.freqs_cis.index_select(
+                        0, compressor_meta.positions.reshape(-1)
+                    )
                 q = self._compute_indexer_q(
-                    qr, freqs, batched_rope=False, apply_rope=False
+                    qr, freqs_cis, batched_rope=False, apply_rope=False
                 )
                 assert compressor_meta.compressed_lens_per_token is not None
                 compressed_len = compressor_meta.compressed_lens_per_token.view(
@@ -666,7 +691,7 @@ class IndexerFP8(PoolBackedModule):
             q_fp8, w_fold = indexer_q_rope_fp8_quant_fold(
                 _as_bf16_contig(q),
                 _as_bf16_contig(weights),
-                freqs,
+                freqs_cis,
                 self.rope_head_dim,
             )
             ctx_lens_2d = compressed_len.view(bsz, q_len)

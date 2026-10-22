@@ -239,6 +239,33 @@ class DSv4DecodeAttnMetadataFP8:
         default_factory=dict
     )  # ratio -> [B] int32
 
+    # Per-forward RoPE rows, shared only by consumers of the same table.
+    freqs_cis_by_table: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
+
+
+def get_decode_freqs_cis(
+    metadata: "DSv4DecodeAttnMetadataFP8", freqs_cis: torch.Tensor
+) -> torch.Tensor:
+    """Gather current token positions once per table within a decode forward.
+
+    After updating positions, the caller must run V4Transformer.begin_decode
+    before the layer loop to clear prior results. Positions and table contents
+    must remain unchanged during that forward. Holding the table reference
+    prevents its id from being reused while the cache entry is alive.
+    CUDA graph replay executes the captured gather with updated position data;
+    it does not execute this Python lookup again.
+    """
+    entry = metadata.freqs_cis_by_table.get(id(freqs_cis))
+    if entry is None:
+        num_tokens = metadata.batch_size * metadata.q_len_per_req
+        positions = metadata.position_ids_long[:num_tokens]
+        rows = freqs_cis.index_select(0, positions)
+        metadata.freqs_cis_by_table[id(freqs_cis)] = (freqs_cis, rows)
+        return rows
+    return entry[1]
+
 
 def get_or_build_sched_meta(
     metadata: "DSv4DecodeAttnMetadataFP8",
