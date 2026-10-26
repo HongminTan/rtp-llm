@@ -83,7 +83,9 @@ class Fp8Fp4MoeLayer(nn.Module):
                 inter_dim=shared_inter_dim,
                 swiglu_limit=config.swiglu_limit,
             )
-            self._shared_executor.prepare(self.shared_experts)
+            self._shared_executor.prepare(
+                self.shared_experts, comm_sm_counts=self.fused_moe.router.comm_sm_counts
+            )
 
     def forward(
         self,
@@ -124,6 +126,9 @@ class Fp8Fp4MoeLayer(nn.Module):
             and self.fused_moe.supports_gate_pack
             and self.gate.can_prepare_gate_payload(x, flat_ids)
         )
+        executor = self._shared_executor
+        after_dispatch = None if executor is None else executor.after_dispatch
+        before_combine = None if executor is None else executor.before_combine
 
         def prepare_routes() -> None:
             nonlocal gate_payload, topk_weights, topk_ids
@@ -147,6 +152,8 @@ class Fp8Fp4MoeLayer(nn.Module):
                     hidden_states=x,
                     gate_payload=gate_payload,
                     activation="silu",
+                    after_dispatch=after_dispatch,
+                    before_combine=before_combine,
                 )
             assert topk_weights is not None and topk_ids is not None
             return self.fused_moe(
@@ -154,9 +161,11 @@ class Fp8Fp4MoeLayer(nn.Module):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation="silu",
+                after_dispatch=after_dispatch,
+                before_combine=before_combine,
             )
 
-        if self._shared_executor is None:
+        if executor is None:
             prepare_routes()
             with record_function_range("moe.routed_experts"):
                 output = run_routed_experts()
@@ -172,26 +181,23 @@ class Fp8Fp4MoeLayer(nn.Module):
                 observer("final_y", output.reshape(-1, self.dim))
             return output
 
-        # Match the original MegaMoE scheduling: its standalone shared expert
-        # starts before the BF16 gate GEMM and fused route/input pack, maximizing
-        # overlap. Ordinary gate paths keep gate selection ahead of shared work.
-        if not use_gate_pack:
-            prepare_routes()
-        with record_function_range("moe.shared_expert_start"):
-            self._shared_executor.start(self.shared_experts, x)
         try:
+            executor.begin(x)
+            if not use_gate_pack:
+                prepare_routes()
+            with record_function_range("moe.shared_expert_start"):
+                executor.run_shared(x)
             if use_gate_pack:
                 prepare_routes()
             with record_function_range("moe.routed_experts"):
                 routed = run_routed_experts()
-        except Exception:
+            if observer is not None:
+                observer("routed_y", routed)
             with record_function_range("moe.shared_expert_finish"):
-                self._shared_executor.finish()
+                shared = executor.finish()
+        except Exception:
+            executor.abort()
             raise
-        if observer is not None:
-            observer("routed_y", routed)
-        with record_function_range("moe.shared_expert_finish"):
-            shared = self._shared_executor.finish()
         if observer is not None:
             observer("shared_y", shared)
         with record_function_range("moe.add_shared"):

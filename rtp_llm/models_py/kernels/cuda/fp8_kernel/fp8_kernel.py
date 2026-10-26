@@ -147,16 +147,26 @@ def sgl_per_token_group_quant_fp8(
             scale_ue8m0=scale_ue8m0,
         )
     else:
-        if column_major_scales or scale_tma_aligned or scale_ue8m0:
-            raise ValueError("output_scale only supports row-major FP32 scales")
+        if scale_ue8m0:
+            raise ValueError("output_scale does not support packed UE8M0 scales")
         scale_shape = (*out_shape[:-1], out_shape[-1] // group_size)
+        if column_major_scales:
+            # TMA alignment pads each scale column to a multiple of 4 floats.
+            col_stride = output_scale.stride(-1)
+            layout_matches = (
+                output_scale.stride(-2) == 1
+                and col_stride >= out_shape[-2]
+                and (not scale_tma_aligned or col_stride % 4 == 0)
+            )
+        else:
+            layout_matches = output_scale.is_contiguous()
         if (
             output_scale.shape != scale_shape
             or output_scale.dtype != torch.float32
             or output_scale.device != x.device
-            or not output_scale.is_contiguous()
+            or not layout_matches
         ):
-            raise ValueError("output_scale must be contiguous FP32 block scales")
+            raise ValueError("output_scale does not match the requested FP32 layout")
         x_s = output_scale
     if x.shape[0] > 0:
         quant_kernel = os.environ.get("DSV4_FP8_QUANT_KERNEL", "auto").strip().lower()

@@ -10,8 +10,8 @@ import triton.language as tl
 from torch import dtype as _dtype
 from torch.profiler import ProfilerActivity, profile, record_function
 
-from rtp_llm.models_py.utils.arch import is_hip
 from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
+from rtp_llm.models_py.utils.arch import is_hip
 from rtp_llm.ops.compute_ops import (
     per_token_group_quant_fp8,
     per_token_group_quant_int8,
@@ -377,6 +377,46 @@ class PerTokenGroupQuantTest(TestCase):
                 scale_tma_aligned=params[5],
             ):
                 self._run_quant_test(*params)
+
+    def test_mn_major_output_scale_buffer(self):
+        torch.manual_seed(0)
+        for num_tokens in (1, 5, 33):
+            x = torch.randn((num_tokens, 512), device="cuda", dtype=torch.bfloat16)
+            ref_q, ref_s = sgl_per_token_group_quant_fp8(
+                x, 128, eps=1e-4, column_major_scales=True, scale_tma_aligned=True
+            )
+            aligned = (num_tokens + 3) // 4 * 4
+            scale = torch.empty((4, aligned + 4), device="cuda").T[:num_tokens]
+            q, s = sgl_per_token_group_quant_fp8(
+                x,
+                128,
+                eps=1e-4,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                output_scale=scale,
+            )
+            self.assertIs(s, scale)
+            self.assertTrue(torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8)))
+            self.assertTrue(torch.equal(s, ref_s))
+        with self.assertRaises(ValueError):
+            sgl_per_token_group_quant_fp8(
+                x,
+                128,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                output_scale=torch.empty((num_tokens, 4), device="cuda"),
+            )
+        # Columns padded past the token count but not to a multiple of 4.
+        with self.assertRaises(ValueError):
+            sgl_per_token_group_quant_fp8(
+                x,
+                128,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                output_scale=torch.empty((4, num_tokens + 1), device="cuda").T[
+                    :num_tokens
+                ],
+            )
 
     def test_v2_input_offset_above_int32_elements(self):
         if _is_hip:

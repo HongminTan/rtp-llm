@@ -8,9 +8,12 @@ and only fuses the final add+cast when possible.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -22,10 +25,17 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.config import (
 from rtp_llm.models_py.modules.factory.fused_moe.utils.mega_moe.warmup_sync import (
     cuda_graph_warmup_forward_enabled,
 )
+from rtp_llm.models_py.utils.arch import get_num_device_sms, get_sm
 from rtp_llm.models_py.utils.profiler import record_function_range
 
 from .expert import require_silu_mul_split
 from .quantized_linear import create_fp8_linear
+
+if TYPE_CHECKING:
+    from rtp_llm.models_py.modules.dsv4._green_context import GreenContextPartition
+
+logger = logging.getLogger(__name__)
+_GREEN_CONTEXT_FAILURES_LOGGED: set[tuple[int, type[Exception], str]] = set()
 
 
 @dataclass(frozen=True)
@@ -177,9 +187,6 @@ class FusedSharedExpertFastPath:
     The merged w13 weight is prepared outside the forward hot path.
     """
 
-    _W13_WEIGHT_NAME = "_fused_moe_shared_w13_weight"
-    _W13_SCALE_NAME = "_fused_moe_shared_w13_scale"
-
     def __init__(
         self,
         max_tokens_per_rank: int | None = None,
@@ -193,8 +200,6 @@ class FusedSharedExpertFastPath:
         self.swiglu_limit = swiglu_limit
         self._workspace: _SharedExpertWorkspace | None = None
         self._prepared_shared_experts: nn.Module | None = None
-        self._w13_parts: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._w2_parts: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @staticmethod
     def _linear_parts(linear: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -204,37 +209,23 @@ class FusedSharedExpertFastPath:
             raise RuntimeError("shared expert FP8 linear does not expose weight/scale")
         return weight, scale
 
-    @staticmethod
-    def can_run(shared_experts: nn.Module, x: torch.Tensor) -> bool:
-        if not (x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2):
-            return False
-        return all(hasattr(shared_experts, name) for name in ("w13", "w2"))
+    def _require_prepared(self) -> nn.Module:
+        if self._prepared_shared_experts is None:
+            raise RuntimeError(
+                "shared expert fast path must be prepared before execution"
+            )
+        return self._prepared_shared_experts
 
-    @classmethod
-    def has_merged_w13(cls, shared_experts: nn.Module) -> bool:
-        return hasattr(shared_experts, "w13") or (
-            hasattr(shared_experts, cls._W13_WEIGHT_NAME)
-            and hasattr(shared_experts, cls._W13_SCALE_NAME)
-        )
-
-    @classmethod
-    def _set_shared_buffer(
-        cls,
-        shared_experts: nn.Module,
-        name: str,
-        value: torch.Tensor,
-    ) -> None:
-        if name in shared_experts._buffers:
-            shared_experts._buffers[name] = value
-        else:
-            shared_experts.register_buffer(name, value, persistent=False)
+    def can_run(self, x: torch.Tensor) -> bool:
+        self._require_prepared()
+        return x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
 
     def prepare(self, shared_experts: nn.Module) -> None:
         """Validate the loader-prepared merged w13; no runtime concatenation."""
         if not hasattr(shared_experts, "w13"):
             raise RuntimeError("shared expert requires loader-prepared w13")
         w13_w, w13_s = self._linear_parts(shared_experts.w13)
-        w2_w, w2_s = self._linear_parts(shared_experts.w2)
+        self._linear_parts(shared_experts.w2)
         if w13_w.dim() != 2:
             raise RuntimeError(f"shared w13 weight must be 2D, got {w13_w.dim()}D")
         if w13_s.dim() != 2:
@@ -244,8 +235,6 @@ class FusedSharedExpertFastPath:
         inferred_inter_dim = int(w13_w.shape[0]) // 2
         self.inter_dim = inferred_inter_dim
         self._prepared_shared_experts = shared_experts
-        self._w13_parts = (w13_w, w13_s)
-        self._w2_parts = (w2_w, w2_s)
 
     @staticmethod
     def _tma_aligned_rows(rows: int, element_size: int) -> int:
@@ -255,24 +244,20 @@ class FusedSharedExpertFastPath:
 
     @staticmethod
     def _scale_storage(
-        num_packed_groups: int,
+        num_groups: int,
         capacity: int,
         device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
         aligned_capacity = FusedSharedExpertFastPath._tma_aligned_rows(
             max(capacity, 1),
-            torch.empty((), dtype=torch.int32).element_size(),
+            torch.empty((), dtype=dtype).element_size(),
         )
-        return torch.empty(
-            (num_packed_groups, aligned_capacity),
-            dtype=torch.int32,
-            device=device,
-        )
+        return torch.empty((num_groups, aligned_capacity), dtype=dtype, device=device)
 
     @staticmethod
     def _scale_view(storage: torch.Tensor, tokens: int) -> torch.Tensor:
-        if storage.dtype == torch.float32:
-            return storage[:tokens]
+        """TMA-aligned MN-major ``[tokens, groups]`` view of the scale storage."""
         aligned_tokens = FusedSharedExpertFastPath._tma_aligned_rows(
             max(tokens, 1),
             storage.element_size(),
@@ -324,17 +309,17 @@ class FusedSharedExpertFastPath:
         )
         if use_ue8m0:
             x_scale_storage = self._scale_storage(
-                (D // 128 + 3) // 4, capacity, x.device
+                (D // 128 + 3) // 4, capacity, x.device, torch.int32
             )
             hidden_scale_storage = self._scale_storage(
-                (inter // 128 + 3) // 4, capacity, x.device
+                (inter // 128 + 3) // 4, capacity, x.device, torch.int32
             )
         else:
-            x_scale_storage = torch.empty(
-                (capacity, D // 128), dtype=torch.float32, device=x.device
+            x_scale_storage = self._scale_storage(
+                D // 128, capacity, x.device, torch.float32
             )
-            hidden_scale_storage = torch.empty(
-                (capacity, inter // 128), dtype=torch.float32, device=x.device
+            hidden_scale_storage = self._scale_storage(
+                inter // 128, capacity, x.device, torch.float32
             )
         gate_up_bf16 = torch.empty(
             (capacity, 2 * inter),
@@ -396,43 +381,35 @@ class FusedSharedExpertFastPath:
         workspace.views[tokens] = cached
         return cached
 
-    def run(self, shared_experts: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        if not self.can_run(shared_experts, x):
+    def run(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.can_run(x):
             raise RuntimeError(
                 "fused shared expert requires CUDA bf16 2D input and FP8 "
                 "loader-merged shared w13/w2 weights"
             )
-        return self._run_prepared(shared_experts, x)
+        return self.run_output(self.run_hidden(x))
 
-    def _run_prepared(self, shared_experts: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        if self._prepared_shared_experts is not shared_experts:
-            self.prepare(shared_experts)
-        w13_parts = self._w13_parts
-        w2_parts = self._w2_parts
-        assert w13_parts is not None and w2_parts is not None
+    def _prepared_views(
+        self, x: torch.Tensor
+    ) -> tuple[_SharedExpertWorkspace, _SharedExpertWorkspaceViews]:
         workspace = self._ensure_workspace(x)
-        T = x.size(0)
+        return workspace, self._workspace_views(workspace, x.size(0))
 
-        views = self._workspace_views(workspace, T)
-        x_fp8 = views.x_fp8
-        x_scale = views.x_scale
-        gate_up = views.gate_up_bf16
-        hidden_fp8 = views.hidden_fp8
-        hidden_scale = views.hidden_scale
-        out = views.out_bf16
-        if T == 0:
-            return out
+    @staticmethod
+    def _quantize_input(
+        workspace: _SharedExpertWorkspace,
+        views: _SharedExpertWorkspaceViews,
+        x: torch.Tensor,
+    ) -> None:
+        if workspace.use_ue8m0:
+            from rtp_llm.models_py.triton_kernels.moe.shared_expert import (
+                quant_bf16_fp8_packed_ue8m0,
+            )
 
-        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import fp8_gemm_nt
-        from rtp_llm.models_py.triton_kernels.moe.shared_expert import (
-            quant_bf16_fp8_packed_ue8m0,
-        )
-        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
-            silu_mul_fp8_quant_f32_scale,
-            silu_mul_fp8_quant_packed,
-        )
-
-        if not workspace.use_ue8m0:
+            quant_bf16_fp8_packed_ue8m0(
+                x, views.x_fp8, views.x_scale, group_size=128, eps=1.0e-4
+            )
+        else:
             from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
                 sgl_per_token_group_quant_fp8,
             )
@@ -441,62 +418,134 @@ class FusedSharedExpertFastPath:
                 x.contiguous(),
                 group_size=128,
                 eps=1.0e-4,
-                column_major_scales=False,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-                output_q=x_fp8,
-                output_scale=x_scale,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                output_q=views.x_fp8,
+                output_scale=views.x_scale,
             )
-            fp8_gemm_nt((x_fp8, x_scale), w13_parts, gate_up)
-            silu_mul_fp8_quant_f32_scale(
-                gate_up,
-                clamp_limit=self.swiglu_limit,
-                group_size=128,
-                output_q=hidden_fp8,
-                output_scale=hidden_scale,
-            )
-            fp8_gemm_nt((hidden_fp8, hidden_scale), w2_parts, out)
-            return out
 
-        quant_bf16_fp8_packed_ue8m0(x, x_fp8, x_scale, group_size=128, eps=1.0e-4)
-        fp8_gemm_nt(
-            (x_fp8, x_scale),
-            w13_parts,
-            gate_up,
-            disable_ue8m0_cast=False,
+    def _swiglu(
+        self, workspace: _SharedExpertWorkspace, views: _SharedExpertWorkspaceViews
+    ) -> None:
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
+            silu_mul_fp8_quant_packed,
         )
-        silu_mul_fp8_quant_packed(
-            gate_up,
+
+        silu_mul_fp8_quant = (
+            silu_mul_fp8_quant_packed
+            if workspace.use_ue8m0
+            else silu_mul_fp8_quant_f32_scale
+        )
+        silu_mul_fp8_quant(
+            views.gate_up_bf16,
             clamp_limit=self.swiglu_limit,
             group_size=128,
-            output_q=hidden_fp8,
-            output_scale=hidden_scale,
+            output_q=views.hidden_fp8,
+            output_scale=views.hidden_scale,
         )
-        fp8_gemm_nt(
-            (hidden_fp8, hidden_scale),
-            w2_parts,
-            out,
-            disable_ue8m0_cast=False,
+
+    def run_hidden(self, x: torch.Tensor) -> _SharedExpertWorkspaceViews:
+        """Quantize ``x``, run w13 and quantized SwiGLU into the workspace.
+
+        Returned views alias the shared workspace. Consume them with
+        ``run_output`` before another invocation reuses that workspace;
+        callers must order work across streams and must not run concurrently.
+        """
+        shared_experts = self._require_prepared()
+        workspace, views = self._prepared_views(x)
+        if x.size(0) == 0:
+            return views
+        self._quantize_input(workspace, views, x)
+        shared_experts.w13.forward_quantized(
+            views.x_fp8, views.x_scale, out=views.gate_up_bf16
         )
-        return out
+        self._swiglu(workspace, views)
+        return views
 
-
-class FusedSharedExpertExecutor(FusedSharedExpertFastPath):
-    """Backward-facing name for the fused shared expert workspace runner."""
+    def run_output(self, views: _SharedExpertWorkspaceViews) -> torch.Tensor:
+        """Run w2; the returned tensor aliases the same reusable workspace."""
+        shared_experts = self._require_prepared()
+        if views.out_bf16.size(0) == 0:
+            return views.out_bf16
+        return shared_experts.w2.forward_quantized(
+            views.hidden_fp8, views.hidden_scale, out=views.out_bf16
+        )
 
 
 class SharedExpertExecutor(ABC):
+    """One non-reentrant shared-expert invocation at a time.
+
+    Prepare the module, then call begin before the gate, run_shared, after_dispatch,
+    before_combine and finish. Gate packing may run after run_shared instead.
+    begin and stage hooks may change the current CUDA stream. finish or abort
+    restores the stream saved by begin; waits order GPU work without blocking
+    the host. Workspace-backed outputs must be consumed before workspace reuse.
+    """
+
     name: str
 
-    def prepare(self, shared_experts: nn.Module) -> None:
-        return None
+    def __init__(self) -> None:
+        self._active = False
+        self._entry_stream: torch.cuda.Stream | None = None
+        self._prepared_shared_experts: nn.Module | None = None
+
+    def prepare(
+        self,
+        shared_experts: nn.Module,
+        *,
+        comm_sm_counts: Callable[[int], tuple[int, int] | None] | None = None,
+    ) -> None:
+        if self._active:
+            raise RuntimeError(
+                "cannot prepare a shared expert executor during execution"
+            )
+        self._prepared_shared_experts = shared_experts
+
+    def _require_prepared(self) -> nn.Module:
+        if self._prepared_shared_experts is None:
+            raise RuntimeError(
+                "shared expert executor must be prepared before execution"
+            )
+        return self._prepared_shared_experts
+
+    def begin(self, x: torch.Tensor) -> None:
+        """Begin before routing; subsequent work may use a partition stream."""
+        if self._active:
+            raise RuntimeError(
+                "shared expert executor does not support reentrant calls"
+            )
+        self._require_prepared()
+        self._active = True
+        self._entry_stream = torch.cuda.current_stream(x.device) if x.is_cuda else None
+
+    def _end(self) -> None:
+        if self._entry_stream is not None:
+            torch.cuda.set_stream(self._entry_stream)
+        self._entry_stream = None
+        self._active = False
+
+    def after_dispatch(self) -> None:
+        """Join shared input work before routed expert GEMMs are enqueued."""
+        pass
+
+    def before_combine(self) -> None:
+        """Submit shared output work before combine is enqueued."""
+        pass
 
     @abstractmethod
-    def start(self, shared_experts: nn.Module, x: torch.Tensor) -> None:
+    def run_shared(self, x: torch.Tensor) -> None:
+        """Submit shared computation according to this executor's schedule."""
         raise NotImplementedError
 
     @abstractmethod
     def finish(self) -> torch.Tensor:
+        """Join submitted work, restore the entry stream and return the result."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def abort(self) -> None:
+        """Order submitted work before reuse, restore the stream and discard state."""
         raise NotImplementedError
 
 
@@ -507,14 +556,22 @@ class SequentialSharedExpertExecutor(SharedExpertExecutor):
         self,
         fast_path: FusedSharedExpertFastPath | None = None,
     ) -> None:
+        super().__init__()
         self._out: torch.Tensor | None = None
         self._fast_path = fast_path
 
-    def prepare(self, shared_experts: nn.Module) -> None:
+    def prepare(
+        self,
+        shared_experts: nn.Module,
+        *,
+        comm_sm_counts: Callable[[int], tuple[int, int] | None] | None = None,
+    ) -> None:
+        super().prepare(shared_experts, comm_sm_counts=comm_sm_counts)
         if self._fast_path is not None:
             self._fast_path.prepare(shared_experts)
 
-    def start(self, shared_experts: nn.Module, x: torch.Tensor) -> None:
+    def run_shared(self, x: torch.Tensor) -> None:
+        shared_experts = self._require_prepared()
         with record_function_range("moe.shared_expert"):
             self._out = _run_shared_expert(shared_experts, x, self._fast_path)
 
@@ -522,30 +579,73 @@ class SequentialSharedExpertExecutor(SharedExpertExecutor):
         assert self._out is not None
         out = self._out
         self._out = None
+        self._end()
         return out
 
+    def abort(self) -> None:
+        self._out = None
+        self._end()
 
-class OverlapSharedExpertExecutor(SharedExpertExecutor):
-    """Run shared expert on an aux stream while routed MoE runs on current stream."""
+
+class Sm100OverlapSharedExpertExecutor(SharedExpertExecutor):
+    """Overlap the complete shared expert with routed MoE until finish."""
 
     name = "overlap"
 
-    def __init__(
-        self,
-        fast_path: FusedSharedExpertFastPath | None = None,
-    ) -> None:
-        self._active_stream: torch.cuda.Stream | None = None
-        self._producer_stream: torch.cuda.Stream | None = None
+    def __init__(self, fast_path: FusedSharedExpertFastPath | None = None) -> None:
+        super().__init__()
+        self._fast_path = fast_path
+        self._stream: torch.cuda.Stream | None = None
+        self._current: torch.cuda.Stream | None = None
         self._input: torch.Tensor | None = None
         self._out: torch.Tensor | None = None
-        self._fast_path = fast_path
 
-    def prepare(self, shared_experts: nn.Module) -> None:
+    def prepare(
+        self,
+        shared_experts: nn.Module,
+        *,
+        comm_sm_counts: Callable[[int], tuple[int, int] | None] | None = None,
+    ) -> None:
+        super().prepare(shared_experts, comm_sm_counts=comm_sm_counts)
         if self._fast_path is not None:
             self._fast_path.prepare(shared_experts)
         device = _find_module_cuda_device(shared_experts)
         if device is not None:
             _ensure_shared_expert_stream(device)
+
+    def _fork_stream(self, x: torch.Tensor) -> None:
+        self._stream = _get_shared_expert_stream(
+            x.device, allow_create=not torch.cuda.is_current_stream_capturing()
+        )
+        self._current = torch.cuda.current_stream(x.device)
+        self._stream.wait_stream(self._current)
+        self._input = x
+
+    def _wait(self) -> None:
+        if self._stream is not None:
+            assert self._current is not None
+            current = torch.cuda.current_stream(self._stream.device)
+            current.wait_stream(self._stream)
+            if current != self._current:
+                self._current.wait_stream(self._stream)
+
+    def _clear(self) -> None:
+        self._out = None
+        self._input = None
+        self._stream = None
+        self._current = None
+        self._end()
+
+    def finish(self) -> torch.Tensor:
+        self._wait()
+        assert self._out is not None
+        out = self._out
+        self._clear()
+        return out
+
+    def abort(self) -> None:
+        self._wait()
+        self._clear()
 
     def _can_overlap(self, x: torch.Tensor) -> bool:
         if not (x.is_cuda and torch.cuda.is_available()):
@@ -555,54 +655,212 @@ class OverlapSharedExpertExecutor(SharedExpertExecutor):
         )
         if x.shape[0] > threshold:
             return False
-        if torch.cuda.is_current_stream_capturing():
-            return False
-        if cuda_graph_warmup_forward_enabled():
-            return False
-        if os.environ.get("MOEDBG", "0") != "0":
-            return False
-        return True
+        return (
+            not torch.cuda.is_current_stream_capturing()
+            and not cuda_graph_warmup_forward_enabled()
+            and os.environ.get("MOEDBG", "0") == "0"
+        )
 
-    def start(self, shared_experts: nn.Module, x: torch.Tensor) -> None:
+    def run_shared(self, x: torch.Tensor) -> None:
+        shared_experts = self._require_prepared()
         if not self._can_overlap(x):
-            self._active_stream = None
-            self._producer_stream = None
-            self._input = None
             with record_function_range("moe.shared_expert"):
                 self._out = _run_shared_expert(shared_experts, x, self._fast_path)
             return
-        stream = _get_shared_expert_stream(x.device, allow_create=True)
-        producer_stream = torch.cuda.current_stream(x.device)
-        stream.wait_stream(producer_stream)
-        self._active_stream = stream
-        self._producer_stream = producer_stream
-        self._input = x
+        self._fork_stream(x)
+        with torch.cuda.stream(self._stream), record_function_range(
+            "moe.shared_expert"
+        ):
+            self._out = _run_shared_expert(shared_experts, x, self._fast_path)
+
+
+class Sm90OverlapSharedExpertExecutor(SharedExpertExecutor):
+    """Overlap the shared expert with routing and communication on SM90.
+
+    quant, w13 and SwiGLU overlap the gate and dispatch; w2 overlaps combine.
+    In each window the shared expert and the main-stream kernels run in
+    complementary green-context partitions: the shared partition holds the
+    SMs the communication kernel leaves free for this forward's tokens, so
+    neither side can occupy the other's SMs. Routed expert GEMMs run on the
+    original stream with every SM, after the dispatch window joins; the add
+    waits for the combine window. A window without free SMs runs its
+    shared-expert part on the current stream.
+    """
+
+    name = "overlap"
+
+    def __init__(self, fast_path: FusedSharedExpertFastPath | None = None) -> None:
+        super().__init__()
+        self._fast_path = fast_path
+        self._comm_sm_counts: Callable[[int], tuple[int, int] | None] | None = None
+        self._windows: list[GreenContextPartition | None] = []
+        self._dispatch_window: GreenContextPartition | None = None
+        self._combine_window: GreenContextPartition | None = None
+        self._overlap = False
+        self._current: torch.cuda.Stream | None = None
+        self._views: _SharedExpertWorkspaceViews | None = None
+        self._out: torch.Tensor | None = None
+
+    def prepare(
+        self,
+        shared_experts: nn.Module,
+        *,
+        comm_sm_counts: Callable[[int], tuple[int, int] | None] | None = None,
+    ) -> None:
+        super().prepare(shared_experts, comm_sm_counts=comm_sm_counts)
+        self._comm_sm_counts = None
+        self._windows = []
+        if self._fast_path is not None:
+            self._fast_path.prepare(shared_experts)
+        device = _find_module_cuda_device(shared_experts)
+        if comm_sm_counts is None or device is None or comm_sm_counts(1) is None:
+            return
         try:
-            with torch.cuda.stream(stream):
-                with record_function_range("moe.shared_expert"):
-                    self._out = _run_shared_expert(shared_experts, x, self._fast_path)
-        except Exception:
-            producer_stream.wait_stream(stream)
-            self._active_stream = None
-            self._producer_stream = None
-            self._input = None
-            raise
+            from rtp_llm.models_py.modules.dsv4._green_context import (
+                get_or_create_partition_pairs,
+            )
+
+            self._windows = get_or_create_partition_pairs(device)
+        except (ImportError, RuntimeError) as exc:
+            index = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
+            key = (index, type(exc), str(exc))
+            if key not in _GREEN_CONTEXT_FAILURES_LOGGED:
+                logger.warning(
+                    "Green context initialization failed on cuda:%s (%s: %s); "
+                    "falling back to sequential shared-expert execution",
+                    index,
+                    type(exc).__name__,
+                    exc,
+                )
+                _GREEN_CONTEXT_FAILURES_LOGGED.add(key)
+            return
+        self._comm_sm_counts = comm_sm_counts
+
+    def _window(self, comm_sms: int) -> GreenContextPartition | None:
+        """Largest window whose shared partition fits beside ``comm_sms``."""
+        free_sms = get_num_device_sms() - comm_sms
+        return next(
+            (
+                window
+                for window in reversed(self._windows)
+                if window is not None and window.compute_sms <= free_sms
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _enter(window: GreenContextPartition, current: torch.cuda.Stream) -> None:
+        """Start a window after ``current`` and move the main stream into it."""
+        window.compute_stream.wait_stream(current)
+        window.comm_stream.wait_stream(current)
+        torch.cuda.set_stream(window.comm_stream)
+
+    @staticmethod
+    def _leave(window: GreenContextPartition, current: torch.cuda.Stream) -> None:
+        """Join both partitions of a window into ``current`` and return to it."""
+        current.wait_stream(window.comm_stream)
+        current.wait_stream(window.compute_stream)
+        torch.cuda.set_stream(current)
+
+    @staticmethod
+    @contextmanager
+    def _on_shared(window: GreenContextPartition | None) -> Iterator[None]:
+        """Run shared-expert kernels in the window's shared partition."""
+        if window is None:
+            yield
+            return
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            configure_deep_gemm_num_sms,
+        )
+
+        with torch.cuda.stream(window.compute_stream), configure_deep_gemm_num_sms(
+            window.compute_sms
+        ):
+            yield
+
+    def begin(self, x: torch.Tensor) -> None:
+        super().begin(x)
+        if (
+            self._comm_sm_counts is None
+            or self._fast_path is None
+            or not self._fast_path.can_run(x)
+            or os.environ.get("MOEDBG", "0") != "0"
+        ):
+            return
+        comm_sms = self._comm_sm_counts(x.size(0))
+        if comm_sms is None:
+            return
+        dispatch_sms, combine_sms = comm_sms
+        self._dispatch_window = self._window(dispatch_sms)
+        self._combine_window = self._window(combine_sms)
+        self._overlap = (
+            self._dispatch_window is not None or self._combine_window is not None
+        )
+        if not self._overlap:
+            return
+        self._current = torch.cuda.current_stream(x.device)
+        if self._dispatch_window is not None:
+            self._enter(self._dispatch_window, self._current)
+
+    def run_shared(self, x: torch.Tensor) -> None:
+        shared_experts = self._require_prepared()
+        if not self._overlap:
+            with record_function_range("moe.shared_expert"):
+                self._out = _run_shared_expert(shared_experts, x, self._fast_path)
+            return
+        assert self._fast_path is not None
+        with record_function_range("moe.shared_expert"), self._on_shared(
+            self._dispatch_window
+        ):
+            self._views = self._fast_path.run_hidden(x)
+
+    def after_dispatch(self) -> None:
+        if self._overlap and self._dispatch_window is not None:
+            assert self._current is not None
+            self._leave(self._dispatch_window, self._current)
+
+    def before_combine(self) -> None:
+        if not self._overlap:
+            return
+        assert self._fast_path is not None and self._current is not None
+        assert self._views is not None
+        window = self._combine_window
+        if window is not None:
+            self._enter(window, self._current)
+        with record_function_range("moe.shared_expert_w2"), self._on_shared(window):
+            self._out = self._fast_path.run_output(self._views)
 
     def finish(self) -> torch.Tensor:
+        if self._overlap and self._combine_window is not None:
+            assert self._current is not None
+            self._leave(self._combine_window, self._current)
         assert self._out is not None
-        if self._active_stream is not None:
-            current_stream = torch.cuda.current_stream(self._out.device)
-            current_stream.wait_stream(self._active_stream)
-            producer_stream = self._producer_stream
-            assert producer_stream is not None
-            if producer_stream != current_stream:
-                producer_stream.wait_stream(self._active_stream)
         out = self._out
-        self._input = None
-        self._out = None
-        self._active_stream = None
-        self._producer_stream = None
+        self._clear()
         return out
+
+    def abort(self) -> None:
+        if self._overlap:
+            assert self._current is not None
+            for window in (self._dispatch_window, self._combine_window):
+                if window is not None:
+                    self._current.wait_stream(window.comm_stream)
+                    self._current.wait_stream(window.compute_stream)
+            torch.cuda.set_stream(self._current)
+        self._clear()
+
+    def _clear(self) -> None:
+        self._overlap = False
+        self._dispatch_window = None
+        self._combine_window = None
+        self._current = None
+        self._views = None
+        self._out = None
+        self._end()
 
 
 def _run_shared_expert(
@@ -610,9 +868,9 @@ def _run_shared_expert(
     x: torch.Tensor,
     fast_path: FusedSharedExpertFastPath | None,
 ) -> torch.Tensor:
-    if fast_path is not None and fast_path.can_run(shared_experts, x):
+    if fast_path is not None and fast_path.can_run(x):
         try:
-            return fast_path._run_prepared(shared_experts, x)
+            return fast_path.run(x)
         except Exception:
             if strict_fused_moe_enabled():
                 raise
@@ -631,7 +889,12 @@ def get_shared_expert_executor(
     swiglu_limit: float = 0.0,
 ) -> SharedExpertExecutor:
     mode = shared_expert_mode()
-    fast_path = FusedSharedExpertExecutor(
+    sm = get_sm() if torch.cuda.is_available() else None
+    sm90 = sm is not None and sm[0] == 9
+    if mode == "auto":
+        # Overlap is enabled on SM90, where its schedule was measured.
+        mode = "overlap" if sm90 else "sequential"
+    fast_path = FusedSharedExpertFastPath(
         max_tokens_per_rank=max_tokens_per_rank,
         dim=dim,
         inter_dim=inter_dim,
@@ -639,8 +902,16 @@ def get_shared_expert_executor(
     )
     if mode == "sequential":
         return SequentialSharedExpertExecutor(fast_path)
-    if mode in ("auto", "overlap"):
-        return OverlapSharedExpertExecutor(fast_path)
+    if mode == "overlap":
+        if sm90:
+            return Sm90OverlapSharedExpertExecutor(fast_path)
+        if sm is not None and sm[0] == 10:
+            return Sm100OverlapSharedExpertExecutor(fast_path)
+        architecture = "no CUDA device" if sm is None else f"SM{sm[0]}{sm[1]}"
+        raise ValueError(
+            f"MOE_SHARED_EXPERT_MODE=overlap does not support {architecture}; "
+            "supported architectures: SM90 (9.x), SM100 (10.x)"
+        )
     raise ValueError(
         f"invalid MOE_SHARED_EXPERT_MODE={mode!r}; expected auto|sequential|overlap"
     )

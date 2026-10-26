@@ -28,6 +28,11 @@ from deep_gemm.utils.layout import (  # noqa: E402
 )
 
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
+from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
+    get_flashinfer_sm90_fp8_gemm,
+    is_flashinfer_activation_scale,
+    use_flashinfer_fp8_gemm,
+)
 from rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton import (
     fused_inv_rope_fp8_quant,
 )
@@ -996,19 +1001,12 @@ class AttentionFP8(nn.Module):
         # SM90 small-M wo_a: FlashInfer's swapAB block-scale GEMM over the
         # flattened [G*R, K] weight; only the block-diagonal output is used.
         self._wo_a_swapab_gemm = None
-        if not use_ue8m0:
-            from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
-                FLASHINFER_M_THRESHOLD,
-                get_flashinfer_sm90_fp8_gemm,
-            )
-
-            self._wo_a_swapab_max_rows = FLASHINFER_M_THRESHOLD
-
-            if (
-                _stk_w.is_cuda
-                and torch.cuda.get_device_capability(_stk_w.device)[0] == 9
-            ):
-                self._wo_a_swapab_gemm = get_flashinfer_sm90_fp8_gemm()
+        if (
+            not use_ue8m0
+            and _stk_w.is_cuda
+            and torch.cuda.get_device_capability(_stk_w.device)[0] == 9
+        ):
+            self._wo_a_swapab_gemm = get_flashinfer_sm90_fp8_gemm()
 
         # wo_b row-split along K (cols), all_reduce after forward
         self.wo_b = _fp8_w_s(
@@ -2025,10 +2023,8 @@ class AttentionFP8(nn.Module):
     def _wo_a_swapab_supported(self, M: int) -> bool:
         # Flattening groups gives FlashInfer G*M input rows. Use its swapAB
         # dispatch range; keep grouped einsum outside that range.
-        return (
-            self._wo_a_swapab_gemm is not None
-            and 0 < M * self.n_groups < self._wo_a_swapab_max_rows
-        )
+        rows = M * self.n_groups
+        return self._wo_a_swapab_gemm is not None and use_flashinfer_fp8_gemm(rows)
 
     def _wo_a_project_swapab(
         self, o_fp8: torch.Tensor, o_scale: torch.Tensor, B: int, S: int
@@ -2040,6 +2036,8 @@ class AttentionFP8(nn.Module):
         swapAB kernel."""
         G, R = self.n_groups, self.o_lora_rank
         M = o_fp8.shape[0] // G
+        if not is_flashinfer_activation_scale(o_scale, *o_fp8.shape):
+            raise ValueError("wo_a scales must be the TMA-aligned MN-major FP32 layout")
         full = torch.empty(G * M, G * R, dtype=torch.bfloat16, device=o_fp8.device)
         self._wo_a_swapab_gemm(
             o_fp8,

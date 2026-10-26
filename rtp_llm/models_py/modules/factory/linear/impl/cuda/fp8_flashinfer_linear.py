@@ -105,7 +105,9 @@ class CudaFp8FlashinferLinear(LinearBase):
         if not self.weight_scales.is_contiguous():
             self.weight_scales = self.weight_scales.contiguous()
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if input.dtype == torch.bfloat16:
             input_fp8, input_scales = sgl_per_token_group_quant_fp8(
                 input,
@@ -119,14 +121,31 @@ class CudaFp8FlashinferLinear(LinearBase):
             input_fp8 = input
             input_scales = self.input_scales
 
-        return self.forward_quantized(input_fp8, input_scales)
+        return self.forward_quantized(input_fp8, input_scales, out=out)
 
     def forward_quantized(
-        self, input_fp8: torch.Tensor, input_scales: torch.Tensor
+        self,
+        input_fp8: torch.Tensor,
+        input_scales: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        output = torch.empty(
-            input_fp8.shape[0], self.N, dtype=torch.bfloat16, device=input_fp8.device
-        )
+        output = out
+        if output is None:
+            output = torch.empty(
+                input_fp8.shape[0],
+                self.N,
+                dtype=torch.bfloat16,
+                device=input_fp8.device,
+            )
+        elif (
+            output.shape != (input_fp8.shape[0], self.N)
+            or output.dtype != torch.bfloat16
+            or output.device != input_fp8.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "out must be a contiguous BF16 [M, N] tensor on the input device"
+            )
         self._fi_gemm(
             input_fp8,
             self.weight,
@@ -135,5 +154,5 @@ class CudaFp8FlashinferLinear(LinearBase):
             out=output,
         )
         if self.bias is not None:
-            output = output + self.bias.to(output.dtype)
+            output.add_(self.bias.to(output.dtype))
         return output

@@ -97,21 +97,25 @@ class CudaFp8DeepGEMMLinearOutContractTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Output tensor must be contiguous"):
                 linear(input_tensor, out=non_contiguous)
 
-    def test_dispatch_wrapper_uses_deepgemm_for_out_buffer(self):
+    def test_dispatch_wrapper_preserves_backend_selection_with_out_buffer(self):
         input_tensor = torch.ones(2, 4, dtype=torch.bfloat16)
         out = torch.empty(2, 3, dtype=torch.bfloat16)
-        deepgemm = Mock(return_value=out)
-        flashinfer = Mock(side_effect=AssertionError("out must bypass FlashInfer"))
-        wrapper = SimpleNamespace(
-            _deepgemm_linear=deepgemm,
-            _flashinfer_linear=flashinfer,
-        )
-
-        returned = CudaFp8GEMMLinear.forward(wrapper, input_tensor, out=out)
-
-        self.assertIs(returned, out)
-        deepgemm.assert_called_once_with(input_tensor, out=out)
-        flashinfer.assert_not_called()
+        for use_flashinfer in (False, True):
+            with self.subTest(use_flashinfer=use_flashinfer):
+                deepgemm = Mock(return_value=out)
+                flashinfer = Mock(return_value=out)
+                wrapper = SimpleNamespace(
+                    _deepgemm_linear=deepgemm,
+                    _flashinfer_linear=flashinfer,
+                    _should_use_flashinfer=Mock(return_value=use_flashinfer),
+                )
+                returned = CudaFp8GEMMLinear.forward(wrapper, input_tensor, out=out)
+                self.assertIs(returned, out)
+                selected, unused = (
+                    (flashinfer, deepgemm) if use_flashinfer else (deepgemm, flashinfer)
+                )
+                selected.assert_called_once_with(input_tensor, out=out)
+                unused.assert_not_called()
 
 
 if __name__ == "__main__":

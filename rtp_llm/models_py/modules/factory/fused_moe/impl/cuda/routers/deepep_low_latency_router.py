@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -23,7 +24,8 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
-from rtp_llm.models_py.utils.arch import get_sm
+from rtp_llm.models_py.utils.arch import get_num_device_sms, get_sm
+from rtp_llm.models_py.utils.math import ceil_div
 
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
@@ -77,6 +79,7 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             wrapper.mode == DeepEPMode.LOW_LATENCY
         ), "DeepEP mode should be LOW_LATENCY"
         self._buffer = wrapper.buffer
+        self._launches_on_current_stream = wrapper.uses_compute_stream
         self._num_topk = wrapper.num_topk
         self._num_max_dispatch_tokens_per_rank = wrapper.ll_num_max_token_per_rank
         self._use_fp8_dispatch = use_fp8_dispatch
@@ -88,6 +91,41 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
     @property
     def handle(self) -> Optional[Tuple[Any, ...]]:
         return self._handle
+
+    def comm_sm_counts(self, num_tokens: int) -> Optional[Tuple[int, int]]:
+        """Dispatch/combine SM budgets for this rank's pre-TP-slice token count.
+
+        Returns None unless the buffer was created to use the caller stream.
+        TP slicing uses this rank's actual local token count.
+        Counts estimate launch-grid demand, not measured resident SM occupancy.
+
+        Mirrors the grid of ACCL-EP 1.2.1.10 internode_ll.cu two-phase kernels,
+        including ACCL_DISPATCH_NUM_WARP_GROUPS / ACCL_COMBINE_NUM_WARP_GROUPS.
+        The shared-expert overlap sizes its green-context partitions with
+        these counts, so recheck them when the launch configuration changes.
+        """
+        if not self._launches_on_current_stream:
+            return None
+        num_sms = get_num_device_sms()
+        tokens_per_rank = ceil_div(num_tokens, self.config.tp_size)
+        slice_start = min(tokens_per_rank * self.config.tp_rank, num_tokens)
+        num_tokens = min(num_tokens - slice_start, tokens_per_rank)
+
+        def expert_grid(env: str) -> int:
+            warp_groups = ceil_div(self._num_experts, num_sms)
+            try:
+                warp_groups = int(os.environ.get(env, warp_groups))
+            except ValueError:
+                pass
+            return ceil_div(self._num_experts, warp_groups)
+
+        dispatch_sms = expert_grid("ACCL_DISPATCH_NUM_WARP_GROUPS")
+        recv_per_sm = ceil_div(num_tokens, num_sms)
+        combine_sms = max(
+            expert_grid("ACCL_COMBINE_NUM_WARP_GROUPS"),
+            ceil_div(num_tokens, recv_per_sm) if recv_per_sm else 1,
+        )
+        return dispatch_sms, combine_sms
 
     def _prepare_pre_tp_slice(
         self,

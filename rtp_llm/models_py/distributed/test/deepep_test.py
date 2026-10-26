@@ -4,9 +4,10 @@ import os
 import random
 import time
 from functools import partial
+from types import SimpleNamespace
 from typing import Any, Dict, Tuple
 from unittest import TestCase, main
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -73,6 +74,49 @@ def calc_ll_num_max_token_per_rank(max_generate_batch_size: int, tp_size: int) -
     # Align to 8
     ll_num_max_token_per_rank = (ll_num_max_token_per_rank + 7) // 8 * 8
     return ll_num_max_token_per_rank
+
+
+class DeepEPStreamConfigTest(TestCase):
+    def test_router_uses_buffer_creation_stream_setting(self):
+        from rtp_llm.models_py.distributed import deepep_wrapper as wrapper_module
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers import (
+            deepep_low_latency_router as router_module,
+        )
+
+        config = SimpleNamespace(
+            ll_num_max_token_per_rank=64,
+            hidden_size=7168,
+            ep_size=2,
+            expert_num=128,
+            local_rank=1,
+            tp_size=1,
+            moe_k=8,
+        )
+        for initial, expected in (("1", True), ("0", False), ("invalid", False)):
+            with self.subTest(initial=initial), patch.dict(
+                os.environ, {"ACCL_LOW_LATENCY_USE_COMPUTE_STREAM": initial}
+            ), patch.object(wrapper_module, "DeepEPBuffer", Mock()), patch.object(
+                wrapper_module, "_DeepEPRuntimeBuffer", None
+            ):
+                wrapper = object.__new__(DeepEPWrapper)
+                wrapper._config = config
+                wrapper._mode = wrapper_module.DeepEPMode.LOW_LATENCY
+                wrapper._buffer = wrapper._init_low_latency_buffer(Mock())
+                self.assertIs(wrapper.uses_compute_stream, expected)
+                os.environ["ACCL_LOW_LATENCY_USE_COMPUTE_STREAM"] = (
+                    "0" if expected else "1"
+                )
+                with patch.object(
+                    router_module.DeepEPWrapper, "get_instance", return_value=wrapper
+                ), patch.object(
+                    router_module.DeepepWrapperConfig,
+                    "from_config_adapter",
+                    return_value=config,
+                ):
+                    router = router_module.DeepEpLowLatencyRouter(
+                        config, SimpleNamespace(is_quantized=False)
+                    )
+                self.assertIs(router._launches_on_current_stream, expected)
 
 
 class DeepEPTest(TestCase):

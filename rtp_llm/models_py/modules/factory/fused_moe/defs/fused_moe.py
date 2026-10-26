@@ -156,6 +156,17 @@ class FusedMoeDataRouter(ABC):
 
         return False
 
+    def comm_sm_counts(self, num_tokens: int) -> Optional[Tuple[int, int]]:
+        """Return (dispatch, combine) SM budgets for a routing invocation.
+
+        ``num_tokens`` is this rank's input row count before router TP slicing.
+        Budgets estimate launch resource demand, not measured SM occupancy.
+        Return None if unknown or if communication does not use the caller's
+        current stream.
+        """
+
+        return None
+
     def prepare_gate_pack(
         self,
         a1: torch.Tensor,
@@ -300,13 +311,18 @@ class FusedMoe(torch.nn.Module):
         extra_expert_args: Optional[Dict[str, Any]] = None,
         extra_finalize_args: Optional[FinalizeArgs] = None,
         skip_tp_allreduce: bool = False,
+        after_dispatch: Optional[Callable[[], None]] = None,
+        before_combine: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
+        """Run routed experts from a gate payload; callbacks as in ``forward``."""
         self._validate_skip_tp_allreduce(skip_tp_allreduce)
         if not self.supports_gate_pack:
             raise RuntimeError(
                 f"strategy {self.strategy_name!r} does not support fused gate packing"
             )
         expert_payload = self.router.prepare_gate_pack(hidden_states, gate_payload)
+        if after_dispatch is not None:
+            after_dispatch()
         return self._execute_payload(
             hidden_states,
             expert_payload,
@@ -317,6 +333,7 @@ class FusedMoe(torch.nn.Module):
             extra_expert_args=extra_expert_args,
             extra_finalize_args=extra_finalize_args,
             skip_tp_allreduce=skip_tp_allreduce,
+            before_combine=before_combine,
         )
 
     def forward(
@@ -333,8 +350,19 @@ class FusedMoe(torch.nn.Module):
         extra_expert_args: Optional[Dict[str, Any]] = None,
         extra_finalize_args: Optional[FinalizeArgs] = None,
         skip_tp_allreduce: bool = False,
+        after_dispatch: Optional[Callable[[], None]] = None,
+        before_combine: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
+        """Run routed experts.
 
+        ``after_dispatch`` and ``before_combine`` are host callbacks invoked
+        once the dispatch, and then the routed experts, are enqueued on the
+        current stream. That GPU work may still be pending; callbacks that use
+        other streams must order themselves against the current stream.
+        These are scheduling hooks: they may replace the current stream for
+        subsequent stages. The caller owns restoration after this forward,
+        including when a hook or a stage raises.
+        """
         self._validate_skip_tp_allreduce(skip_tp_allreduce)
         a1 = hidden_states
 
@@ -345,6 +373,8 @@ class FusedMoe(torch.nn.Module):
             topk_weights,
             topk_ids,
         )
+        if after_dispatch is not None:
+            after_dispatch()
         if expert_payload.expert_topk_ids is None:
             expert_payload.expert_topk_ids = topk_ids
         if expert_payload.expert_topk_weights is None:
@@ -360,6 +390,7 @@ class FusedMoe(torch.nn.Module):
             extra_expert_args=extra_expert_args,
             extra_finalize_args=extra_finalize_args,
             skip_tp_allreduce=skip_tp_allreduce,
+            before_combine=before_combine,
         )
 
     def _validate_skip_tp_allreduce(self, skip_tp_allreduce: bool) -> None:
@@ -381,6 +412,7 @@ class FusedMoe(torch.nn.Module):
         extra_expert_args: Optional[Dict[str, Any]],
         extra_finalize_args: Optional[FinalizeArgs],
         skip_tp_allreduce: bool,
+        before_combine: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         self._validate_skip_tp_allreduce(skip_tp_allreduce)
 
@@ -409,6 +441,8 @@ class FusedMoe(torch.nn.Module):
                 extra_expert_args=extra_expert_args,
             )
         combine_payload.router_context = expert_payload.router_context
+        if before_combine is not None:
+            before_combine()
 
         if (
             expert_payload.expert_topk_weights is None

@@ -108,11 +108,11 @@ class SharedExpertDeepGemmCompatibilityTest(unittest.TestCase):
         x = torch.randn(17, dim, device="cuda", generator=generator).bfloat16()
         runner.prepare(expert)
         for _ in range(3):
-            actual = runner._run_prepared(expert, x)
+            actual = runner.run(x)
         torch.testing.assert_close(actual, reference(x), rtol=0.02, atol=0.002)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured = runner._run_prepared(expert, x)
+            captured = runner.run(x)
         x.mul_(0.75)
         graph.replay()
         torch.testing.assert_close(captured, reference(x), rtol=0.02, atol=0.002)

@@ -8,7 +8,7 @@ def strict_fused_moe_enabled() -> bool:
 
 
 def shared_expert_mode() -> str:
-    return os.environ.get("MOE_SHARED_EXPERT_MODE", "sequential").strip().lower()
+    return os.environ.get("MOE_SHARED_EXPERT_MODE", "auto").strip().lower()
 
 
 def mega_moe_input_packer_mode() -> str:

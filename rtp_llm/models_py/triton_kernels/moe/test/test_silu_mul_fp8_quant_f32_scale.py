@@ -42,6 +42,53 @@ class SiluMulFp8QuantF32ScaleTest(unittest.TestCase):
         )
         self._assert_quantization(q, scales, *self._reference(inputs, 1.5))
 
+    def test_dense_mn_major_scale_matches_row_major(self):
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
+        )
+
+        torch.manual_seed(45)
+        inputs = torch.randn((7, 512), device="cuda", dtype=torch.bfloat16) * 4
+        ref_q, ref_scales = silu_mul_fp8_quant_f32_scale(inputs, clamp_limit=1.5)
+        scales = torch.empty((2, 8), device="cuda").T[:7]
+        q, got = silu_mul_fp8_quant_f32_scale(
+            inputs, clamp_limit=1.5, output_scale=scales
+        )
+        self.assertIs(got, scales)
+        self.assertTrue(torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8)))
+        self.assertTrue(torch.equal(scales, ref_scales))
+
+    def test_dense_rejects_overlapping_scale_columns(self):
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
+        )
+
+        inputs = torch.randn((7, 512), device="cuda", dtype=torch.bfloat16)
+        storage = torch.empty(14, device="cuda", dtype=torch.float32)
+        for column_stride in (0, 1, 6):
+            with self.subTest(column_stride=column_stride):
+                scales = storage.as_strided((7, 2), (1, column_stride))
+                with self.assertRaises(ValueError):
+                    silu_mul_fp8_quant_f32_scale(inputs, output_scale=scales)
+
+    def test_mask_rejects_mn_major_scale(self):
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
+        )
+
+        experts, capacity, inter = 2, 8, 256
+        inputs = torch.randn(
+            (experts, capacity, 2 * inter), device="cuda", dtype=torch.bfloat16
+        )
+        counts = torch.tensor([3, 8], dtype=torch.int32, device="cuda")
+        # Per-expert MN-major: the masked kernel would offset experts by
+        # capacity elements instead of groups * capacity.
+        scales = torch.empty(
+            (experts, inter // 128, capacity), device="cuda"
+        ).transpose(1, 2)
+        with self.assertRaises(ValueError):
+            silu_mul_fp8_quant_f32_scale(inputs, masked_m=counts, output_scale=scales)
+
     def test_mask_partial_tiles_and_preallocated_outputs(self):
         from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
             silu_mul_fp8_quant_f32_scale,

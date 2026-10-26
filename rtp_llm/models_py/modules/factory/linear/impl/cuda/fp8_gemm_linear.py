@@ -4,7 +4,10 @@ from typing import Optional
 
 import torch
 
-from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import FLASHINFER_M_THRESHOLD
+from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
+    is_flashinfer_activation_scale,
+    use_flashinfer_fp8_gemm,
+)
 from rtp_llm.models_py.modules.factory.linear import LinearBase
 from rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_deepgemm_linear import (
     CudaFp8DeepGEMMLinear,
@@ -119,8 +122,10 @@ class CudaFp8GEMMLinear(LinearBase):
         input_scales: torch.Tensor,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if out is None and self._should_use_flashinfer(input_fp8, input_scales):
-            return self._flashinfer_linear.forward_quantized(input_fp8, input_scales)
+        if self._should_use_flashinfer(input_fp8, input_scales):
+            return self._flashinfer_linear.forward_quantized(
+                input_fp8, input_scales, out=out
+            )
         return self._deepgemm_linear.forward_quantized(input_fp8, input_scales, out=out)
 
     def _should_use_flashinfer(
@@ -132,26 +137,20 @@ class CudaFp8GEMMLinear(LinearBase):
             return False
 
         m, k = input.shape
-        if m >= FLASHINFER_M_THRESHOLD or k != self.K:
+        if not use_flashinfer_fp8_gemm(m) or k != self.K:
             return False
         if input.dtype == torch.bfloat16:
             return True
         scales = self.input_scales if input_scales is None else input_scales
-        if (
+        return (
             input.dtype == torch.float8_e4m3fn
             and scales is not None
-            and scales.dtype == torch.float32
-        ):
-            return True
-        return False
+            and is_flashinfer_activation_scale(scales, m, k)
+        )
 
     def forward(
         self, input: torch.Tensor, out: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        # DeepGEMM supports caller-provided output buffers; the small-M
-        # FlashInfer path currently does not.
-        if out is not None:
-            return self._deepgemm_linear(input, out=out)
         if not self._should_use_flashinfer(input):
-            return self._deepgemm_linear(input)
-        return self._flashinfer_linear(input)
+            return self._deepgemm_linear(input, out=out)
+        return self._flashinfer_linear(input, out=out)

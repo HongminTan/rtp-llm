@@ -295,6 +295,7 @@ class DeepEPWrapper:
             config: DeepepWrapperConfig containing all necessary configuration
         """
         self._config = config
+        self._uses_compute_stream = False
         self._mode, self._buffer = self._init_deepep_buffer(group)
 
     @classmethod
@@ -426,6 +427,11 @@ class DeepEPWrapper:
         return self._buffer
 
     @property
+    def uses_compute_stream(self) -> bool:
+        """Whether the low-latency buffer was configured to use the caller stream."""
+        return self._uses_compute_stream
+
+    @property
     def mode(self) -> DeepEPMode:
         """Get the DeepEP mode."""
         return self._mode
@@ -544,6 +550,27 @@ class DeepEPWrapper:
             )
 
         num_qps_per_rank = config.expert_num // config.ep_size
+
+        if "ACCL_LOW_LATENCY_USE_COMPUTE_STREAM" not in os.environ:
+            from rtp_llm.models_py.modules.factory.fused_moe.utils.config import (
+                shared_expert_mode,
+            )
+            from rtp_llm.models_py.utils.arch import is_sm90
+
+            if is_sm90() and shared_expert_mode() != "sequential":
+                # The SM90 shared-expert overlap moves dispatch and combine into
+                # a green-context partition through the current stream; AcclEP
+                # reads this when the buffer is created.
+                os.environ["ACCL_LOW_LATENCY_USE_COMPUTE_STREAM"] = "1"
+
+        # Snapshot the setting consumed by this buffer, independently of later
+        # environment changes before routers are constructed.
+        try:
+            self._uses_compute_stream = (
+                int(os.environ.get("ACCL_LOW_LATENCY_USE_COMPUTE_STREAM", "0")) == 1
+            )
+        except ValueError:
+            self._uses_compute_stream = False
 
         init_kwargs = {
             "group": group,

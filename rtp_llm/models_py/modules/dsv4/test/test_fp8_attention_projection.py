@@ -55,7 +55,6 @@ def test_end_to_end_via_einsum():
         attn = None
         if torch.cuda.get_device_capability()[0] == 9:
             from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
-                FLASHINFER_M_THRESHOLD,
                 get_flashinfer_sm90_fp8_gemm,
             )
             from rtp_llm.models_py.modules.dsv4.fp8.attention import AttentionFP8
@@ -66,7 +65,6 @@ def test_end_to_end_via_einsum():
                 _wo_a_stk_w=w_stk,
                 _wo_a_stk_s=s_stk,
                 _wo_a_swapab_gemm=get_flashinfer_sm90_fp8_gemm(),
-                _wo_a_swapab_max_rows=FLASHINFER_M_THRESHOLD,
             )
             assert (
                 attn._wo_a_swapab_gemm is not None

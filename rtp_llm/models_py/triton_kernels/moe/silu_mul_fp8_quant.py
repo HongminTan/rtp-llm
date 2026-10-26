@@ -603,9 +603,20 @@ def silu_mul_fp8_quant_f32_scale(
         output_scale.shape != scale_shape
         or output_scale.dtype != torch.float32
         or output_scale.device != gate_up.device
-        or not output_scale.is_contiguous()
+        # The masked kernel offsets experts by M row strides, which only
+        # row-major scales satisfy; MN-major scales are dense-only.
+        or not (
+            output_scale.is_contiguous()
+            or (
+                masked_m is None
+                and output_scale.stride(-2) == 1
+                and output_scale.stride(-1) >= M
+            )
+        )
     ):
-        raise ValueError("output_scale must be contiguous FP32 block scales")
+        raise ValueError(
+            "output_scale must be row-major FP32 scales, or MN-major without masked_m"
+        )
     if M == 0:
         return output_q, output_scale
 

@@ -929,8 +929,103 @@ class CudaFp8GEMMDispatchTest(CudaFp8LinearTestBase, unittest.TestCase):
         input_tensor = torch.randn(31, 128, dtype=torch.bfloat16, device=self.device)
         output = linear(input_tensor)
         linear._deepgemm_linear.forward.assert_not_called()
-        linear._flashinfer_linear.forward.assert_called_once_with(input_tensor)
+        linear._flashinfer_linear.forward.assert_called_once_with(
+            input_tensor, out=None
+        )
         self.assertTrue(torch.equal(output, expected))
+
+    def test_small_m_output_buffer_keeps_flashinfer_dispatch(self):
+        weight, weight_scales, _ = self._make_small_weight_bundle()
+        out = torch.empty(5, 128, dtype=torch.bfloat16, device=self.device)
+        flashinfer = mock.Mock(return_value=out)
+        with mock.patch(
+            "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_gemm_linear.CudaFp8GEMMLinear._create_flashinfer_backend",
+            return_value=flashinfer,
+        ):
+            linear = CudaFp8GEMMLinear(weight, weight_scales)
+        x = torch.randn_like(out)
+        self.assertIs(linear(x, out=out), out)
+        flashinfer.assert_called_once_with(x, out=out)
+
+    def test_quantized_small_m_requires_flashinfer_scale_layout(self):
+        from rtp_llm.models_py.kernels.cuda.flashinfer_gemm import (
+            is_flashinfer_activation_scale,
+        )
+        from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
+        )
+
+        weight = self.weight[:256, :128].contiguous()
+        weight_scales = self.weight_scales[:2, :1].contiguous()
+        flashinfer = mock.Mock()
+        with mock.patch(
+            "rtp_llm.models_py.modules.factory.linear.impl.cuda.fp8_gemm_linear.CudaFp8GEMMLinear._create_flashinfer_backend",
+            return_value=flashinfer,
+        ):
+            linear = CudaFp8GEMMLinear(weight, weight_scales)
+        linear._deepgemm_linear.forward_quantized = mock.Mock()
+
+        x = torch.randn(5, 256, device=self.device).to(torch.float8_e4m3fn)
+        aligned = create_per_token_group_quant_fp8_output_scale(
+            x.shape,
+            self.device,
+            128,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=False,
+        )
+        row_major = torch.empty(5, 2, device=self.device)
+        padded = torch.empty(2, 12, device=self.device).T[:5]
+        for scales, expected in ((aligned, True), (row_major, False), (padded, False)):
+            with self.subTest(stride=scales.stride()):
+                self.assertEqual(
+                    is_flashinfer_activation_scale(scales, 5, 256), expected
+                )
+                flashinfer.forward_quantized.reset_mock()
+                linear._deepgemm_linear.forward_quantized.reset_mock()
+                linear.forward_quantized(x, scales)
+                self.assertEqual(flashinfer.forward_quantized.called, expected)
+                self.assertEqual(
+                    linear._deepgemm_linear.forward_quantized.called, not expected
+                )
+
+    def test_flashinfer_quantized_bias_lands_in_output_buffer(self):
+        from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
+            create_per_token_group_quant_fp8_output_scale,
+        )
+
+        _, weight_fp8, weight_scales = self._make_small_precision_weight_bundle()
+        quant_config = init_quant_config("FP8_PER_BLOCK")
+        if not CudaFp8FlashinferLinear.can_handle(
+            quant_config, weight_fp8, weight_scales
+        ):
+            self.skipTest("FlashInfer SM90 FP8 GEMM is required")
+        bias = torch.randn(128, dtype=torch.bfloat16, device=self.device)
+        linear = CudaFp8FlashinferLinear(
+            weight=weight_fp8,
+            weight_scales=weight_scales,
+            bias=bias,
+            quant_config=quant_config,
+        )
+        x = torch.randn(5, 128, device=self.device).to(torch.float8_e4m3fn)
+        scales = create_per_token_group_quant_fp8_output_scale(
+            x.shape,
+            self.device,
+            128,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=False,
+        )
+        scales.copy_(torch.rand(5, 1, device=self.device) * 0.01)
+        ref = linear.forward_quantized(x, scales)
+        out = torch.empty(5, 128, dtype=torch.bfloat16, device=self.device)
+        got = linear.forward_quantized(x, scales, out=out)
+        self.assertIs(got, out)
+        self.assertTrue(torch.equal(out, ref))
+        bf16_input = torch.randn(5, 128, dtype=torch.bfloat16, device=self.device)
+        ref = linear(bf16_input)
+        self.assertIs(linear(bf16_input, out=out), out)
+        self.assertTrue(torch.equal(out, ref))
 
     def test_large_m_uses_deepgemm_path(self):
         weight, weight_scales, _ = self._make_small_weight_bundle()
@@ -952,7 +1047,7 @@ class CudaFp8GEMMDispatchTest(CudaFp8LinearTestBase, unittest.TestCase):
         linear._deepgemm_linear.forward = mock.Mock(return_value=expected)
         input_tensor = torch.randn(32, 128, dtype=torch.bfloat16, device=self.device)
         output = linear(input_tensor)
-        linear._deepgemm_linear.forward.assert_called_once_with(input_tensor)
+        linear._deepgemm_linear.forward.assert_called_once_with(input_tensor, out=None)
         linear._flashinfer_linear.forward.assert_not_called()
         self.assertTrue(torch.equal(output, expected))
 
@@ -989,7 +1084,9 @@ class CudaFp8GEMMDispatchTest(CudaFp8LinearTestBase, unittest.TestCase):
         flashinfer_output = flashinfer_linear(input_tensor)
         ref_output = (input_tensor.float() @ weight_bf16.float().t()).to(torch.bfloat16)
 
-        wrapper._flashinfer_linear.forward.assert_called_once_with(input_tensor)
+        wrapper._flashinfer_linear.forward.assert_called_once_with(
+            input_tensor, out=None
+        )
         wrapper._deepgemm_linear.forward.assert_not_called()
         self.assertLess(calc_diff(wrapper_output, ref_output), 0.0011)
         self.assertLess(calc_diff(wrapper_output, flashinfer_output), 1e-6)
@@ -1024,7 +1121,7 @@ class CudaFp8GEMMDispatchTest(CudaFp8LinearTestBase, unittest.TestCase):
         deepgemm_output = deepgemm_linear(input_tensor)
         ref_output = (input_tensor.float() @ weight_bf16.float().t()).to(torch.bfloat16)
 
-        wrapper._deepgemm_linear.forward.assert_called_once_with(input_tensor)
+        wrapper._deepgemm_linear.forward.assert_called_once_with(input_tensor, out=None)
         wrapper._flashinfer_linear.forward.assert_not_called()
         self.assertLess(calc_diff(wrapper_output, ref_output), 0.0011)
         self.assertLess(calc_diff(wrapper_output, deepgemm_output), 1e-6)

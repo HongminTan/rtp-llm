@@ -46,22 +46,59 @@ class _FakeFusedMoe:
     def __init__(self, events):
         self.events = events
 
-    def forward_gate_pack(self, *, hidden_states, gate_payload, activation):
+    def forward_gate_pack(
+        self,
+        *,
+        hidden_states,
+        gate_payload,
+        activation,
+        after_dispatch=None,
+        before_combine=None
+    ):
         self.events.append("fused_moe.forward_gate_pack")
+        if after_dispatch is not None:
+            after_dispatch()
+        if before_combine is not None:
+            before_combine()
         return torch.ones_like(hidden_states)
 
-    def __call__(self, *, hidden_states, topk_weights, topk_ids, activation):
+    def __call__(
+        self,
+        *,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        activation,
+        after_dispatch=None,
+        before_combine=None
+    ):
         self.events.append("fused_moe.forward")
+        if after_dispatch is not None:
+            after_dispatch()
+        if before_combine is not None:
+            before_combine()
         return torch.ones_like(hidden_states)
 
 
 class _FakeSharedExecutor:
+    def after_dispatch(self):
+        pass
+
+    def before_combine(self):
+        pass
+
     def __init__(self, events):
         self.events = events
         self.x = None
 
-    def start(self, shared_experts, x):
-        self.events.append("shared.start")
+    def begin(self, x):
+        self.events.append("shared.begin")
+
+    def abort(self):
+        self.events.append("shared.abort")
+
+    def run_shared(self, x):
+        self.events.append("shared.run_shared")
         self.x = x
 
     def finish(self):
@@ -124,7 +161,8 @@ class Fp8Fp4MoeLayerSchedulingTest(unittest.TestCase):
             events,
             [
                 "gate.can_prepare",
-                "shared.start",
+                "shared.begin",
+                "shared.run_shared",
                 "gate.prepare",
                 "fused_moe.forward_gate_pack",
                 "shared.finish",
@@ -149,13 +187,51 @@ class Fp8Fp4MoeLayerSchedulingTest(unittest.TestCase):
             events,
             [
                 "gate.can_prepare",
+                "shared.begin",
                 "gate.forward",
-                "shared.start",
+                "shared.run_shared",
                 "fused_moe.forward",
                 "shared.finish",
                 "combine",
             ],
         )
+
+    def test_stage_callbacks_are_forwarded_on_both_routing_paths(self):
+        for gate_pack_enabled in (False, True):
+            with self.subTest(gate_pack_enabled=gate_pack_enabled):
+                events = []
+                layer = self._layer(events, gate_pack_enabled)
+                layer._shared_executor.after_dispatch = lambda: events.append(
+                    "after_dispatch"
+                )
+                layer._shared_executor.before_combine = lambda: events.append(
+                    "before_combine"
+                )
+                with patch.object(
+                    layer_module,
+                    "combine_routed_and_shared",
+                    side_effect=self._combine(events),
+                ):
+                    layer(torch.ones((2, 4), dtype=torch.bfloat16), None)
+                self.assertEqual(
+                    events[-4:],
+                    ["after_dispatch", "before_combine", "shared.finish", "combine"],
+                )
+
+    def test_schedule_failures_abort_without_finishing(self):
+        for phase in ("begin", "run_shared", "routed", "finish"):
+            with self.subTest(phase=phase):
+                events = []
+                layer = self._layer(events, gate_pack_enabled=True)
+                target = (
+                    layer.fused_moe if phase == "routed" else layer._shared_executor
+                )
+                method = "forward_gate_pack" if phase == "routed" else phase
+                with patch.object(target, method, side_effect=RuntimeError(phase)):
+                    with self.assertRaisesRegex(RuntimeError, phase):
+                        layer(torch.ones((2, 4), dtype=torch.bfloat16), None)
+                self.assertEqual(events[-1], "shared.abort")
+                self.assertNotIn("shared.finish", events)
 
     def test_fused_shared_expert_keeps_gate_first(self):
         events = []

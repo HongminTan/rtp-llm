@@ -53,6 +53,7 @@ _KNOWN_HANG_TESTS = [
 ]
 
 _GPU_TESTS = [
+    "test_green_context",
     "test_cp_metadata_triton",
     "test_indexer_topk_backend",
     "test_fused_inv_rope_fp8_quant",
