@@ -2342,6 +2342,7 @@ class AttentionFP8(nn.Module):
         dual-pool epilogue consumes."""
         from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
             get_decode_freqs_cis,
+            get_decode_indexer_metadata,
         )
         from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
             CSA_KV,
@@ -2360,6 +2361,11 @@ class AttentionFP8(nn.Module):
         )
         # Indexer fills ``topk_buffer_compressed[:bsz]`` + self-scatters
         # nested compressor state into INDEXER_KV / INDEXER_STATE.
+        paged_metadata = None
+        if INDEXER_KV in attn_metadata.pool_block_tables:
+            paged_metadata = get_decode_indexer_metadata(
+                attn_metadata, self._pool_entries_per_block(INDEXER_KV)
+            )
         self.indexer.forward_decode_vectorized(
             x,
             qkv.qr,
@@ -2367,6 +2373,7 @@ class AttentionFP8(nn.Module):
             attn_metadata.topk_buffer_compressed[:bsz],
             position_ids=position_ids,
             compressor_meta=indexer_compressor_meta,
+            paged_metadata=paged_metadata,
             freqs_cis=get_decode_freqs_cis(attn_metadata, self.indexer.freqs_cis),
         )
         csa_compressor_meta = self._decode_compressor_meta_from_metadata(

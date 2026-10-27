@@ -25,6 +25,7 @@ Caller is responsible for FP8 quantizing Q via
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -117,15 +118,30 @@ def has_fp8_mqa_logits() -> bool:
     return True
 
 
-_sched_cache: Optional[torch.Tensor] = None
-_num_sms_cache: int = 0
+@dataclass
+class PagedIndexerMetadata:
+    block_table: torch.Tensor
+    context_lens: torch.Tensor
+    schedule: Optional[torch.Tensor]
 
 
-def _get_num_sms(device: torch.device) -> int:
-    global _num_sms_cache
-    if _num_sms_cache == 0:
-        _num_sms_cache = torch.cuda.get_device_properties(device).multi_processor_count
-    return _num_sms_cache
+def prepare_paged_indexer_metadata(
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+) -> PagedIndexerMetadata:
+    """Prepare one row per query, sharing physical KV pages across queries."""
+    batch_size, next_n = context_lens.shape
+    table = block_table[:batch_size].to(torch.int32).contiguous()
+    if next_n != 1:
+        table = table.repeat_interleave(next_n, dim=0)
+    lengths = context_lens.reshape(-1, 1).contiguous()
+    schedule = None
+    if supports_paged_mqa_logits(lengths.device, block_size):
+        schedule = _deep_gemm.get_paged_mqa_logits_metadata(
+            lengths, block_size, _deep_gemm.get_num_sms()
+        )
+    return PagedIndexerMetadata(table, lengths, schedule)
 
 
 def fp8_paged_indexer_score(
@@ -136,6 +152,8 @@ def fp8_paged_indexer_score(
     context_lens: torch.Tensor,  # [B, next_n] int32 — live K length per row
     block_size: int,  # tokens per cache block
     max_ctx_len: int,  # output T dim
+    *,
+    metadata: Optional[PagedIndexerMetadata] = None,
 ) -> torch.Tensor:
     """One-shot FP8 paged indexer logits via DeepGEMM.
 
@@ -162,25 +180,29 @@ def fp8_paged_indexer_score(
     num_blocks = total_slots // block_size
     kv_4d = kv_pool_uint8.view(num_blocks, block_size, 1, INDEXER_ENTRY_BYTES)
 
-    if not supports_paged_mqa_logits(q_fp8.device, block_size):
+    if metadata is None:
+        metadata = prepare_paged_indexer_metadata(block_table, context_lens, block_size)
+    q_rows = q_fp8.reshape(-1, 1, q_fp8.shape[-2], q_fp8.shape[-1])
+    if metadata.schedule is None:
         from rtp_llm.models_py.triton_kernels.legacy_fp8_indexer_score import (
             legacy_fp8_paged_mqa_logits,
         )
 
         return legacy_fp8_paged_mqa_logits(
-            q_fp8, kv_4d, w_fold, context_lens, block_table, max_ctx_len
+            q_rows,
+            kv_4d,
+            w_fold,
+            metadata.context_lens,
+            metadata.block_table,
+            max_ctx_len,
         )
-    num_sms = _get_num_sms(q_fp8.device)
-    schedule = _deep_gemm.get_paged_mqa_logits_metadata(
-        context_lens, block_size, num_sms
-    )
     return _deep_gemm.fp8_paged_mqa_logits(
-        q_fp8.contiguous(),
+        q_rows.contiguous(),
         kv_4d,
         w_fold.contiguous(),
-        context_lens,
-        block_table,
-        schedule,
+        metadata.context_lens,
+        metadata.block_table,
+        metadata.schedule,
         max_ctx_len,
     )
 

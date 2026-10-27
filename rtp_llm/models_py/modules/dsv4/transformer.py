@@ -533,6 +533,7 @@ class V4Transformer(nn.Module):
 
         if isinstance(attn_metadata, DSv4DecodeAttnMetadataFP8):
             attn_metadata.freqs_cis_by_table.clear()
+            attn_metadata.paged_indexer_metadata.clear()
         if self._mega_csa_runtime is not None:
             self._mega_csa_runtime.begin_decode(attn_metadata)
 

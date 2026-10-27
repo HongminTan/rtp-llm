@@ -244,6 +244,32 @@ class DSv4DecodeAttnMetadataFP8:
         default_factory=dict
     )
 
+    # Derived GPU tensors are shared within a forward, then rebuilt on replay.
+    paged_indexer_metadata: Dict[int, Any] = field(default_factory=dict)
+
+
+def get_decode_indexer_metadata(metadata: "DSv4DecodeAttnMetadataFP8", block_size: int):
+    """Prepare once per INDEXER_KV page size within a decode forward.
+
+    begin_decode clears eager results. Capture records preparation once and
+    replay reads the updated block table and lengths. The Indexer SM budget
+    must remain unchanged throughout the attention layers of this forward.
+    """
+    from rtp_llm.models_py.modules.dsv4.fp8._indexer_score import (
+        prepare_paged_indexer_metadata,
+    )
+    from rtp_llm.models_py.modules.dsv4.kv_cache_utils import INDEXER_KV
+
+    entry = metadata.paged_indexer_metadata.get(block_size)
+    if entry is None:
+        entry = prepare_paged_indexer_metadata(
+            metadata.pool_block_tables[INDEXER_KV],
+            metadata.compressed_lens_per_token[4][: metadata.batch_size],
+            block_size,
+        )
+        metadata.paged_indexer_metadata[block_size] = entry
+    return entry
+
 
 def get_decode_freqs_cis(
     metadata: "DSv4DecodeAttnMetadataFP8", freqs_cis: torch.Tensor

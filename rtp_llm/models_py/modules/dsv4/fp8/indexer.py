@@ -48,6 +48,7 @@ from rtp_llm.models_py.modules.dsv4.fp8._indexer_quant_triton import (
     INDEXER_HEAD_DIM,
 )
 from rtp_llm.models_py.modules.dsv4.fp8._indexer_score import (
+    PagedIndexerMetadata,
     fp8_mqa_indexer_score,
     fp8_paged_indexer_score,
     has_fp8_mqa_logits,
@@ -618,6 +619,7 @@ class IndexerFP8(PoolBackedModule):
         compressor_meta: Optional[CompressorMeta] = None,
         *,
         freqs_cis: Optional[torch.Tensor] = None,
+        paged_metadata: Optional[PagedIndexerMetadata] = None,
     ) -> torch.Tensor:
         """Run decode indexing with optional pre-gathered RoPE rows.
 
@@ -713,6 +715,7 @@ class IndexerFP8(PoolBackedModule):
                 ctx_lens_2d,
                 block_size=self._kv_eb,
                 max_ctx_len=T_max,
+                metadata=paged_metadata,
             )  # [B*q_len, T_max] fp32
             score = logits.view(bsz, q_len, T_max)
 

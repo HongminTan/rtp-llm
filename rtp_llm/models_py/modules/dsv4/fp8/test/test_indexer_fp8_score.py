@@ -52,10 +52,10 @@ except ImportError:
 
     pytest = _NoOpPytest()
 
+from rtp_llm.models_py.modules.dsv4.fp8 import _indexer_score as _indexer_score_mod
 from rtp_llm.models_py.modules.dsv4.fp8._indexer_q_quant_triton import (
     indexer_q_fp8_quant_fold,
 )
-from rtp_llm.models_py.modules.dsv4.fp8 import _indexer_score as _indexer_score_mod
 from rtp_llm.models_py.modules.dsv4.fp8._indexer_score import (
     fp8_paged_indexer_score,
     supports_paged_mqa_logits,
@@ -160,8 +160,9 @@ def _ref_indexer_score(Q_bf16, K_dequant_bf16, weights_fp32):
 
 # DeepGEMM ``get_paged_mqa_logits_metadata`` accepts ``block_kv == 64``
 # on SM90/SM100 and ``block_kv == 32`` on SM100 only.
+@pytest.mark.parametrize("next_n", [1, 2, 4])
 @pytest.mark.parametrize("block_size", [32, 64])
-def test_fp8_paged_indexer_score_via_deepgemm(block_size, monkeypatch):
+def test_fp8_paged_indexer_score_via_deepgemm(block_size, next_n, monkeypatch):
     """rtp-llm 132B pool → DeepGEMM ``fp8_paged_mqa_logits`` ≈ bf16 reference."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -184,20 +185,17 @@ def test_fp8_paged_indexer_score_via_deepgemm(block_size, monkeypatch):
     deepgemm = _CountingDeepGemm(_indexer_score_mod._deep_gemm)
     monkeypatch.setattr(_indexer_score_mod, "_deep_gemm", deepgemm)
     fallback = _CountingFallback(_legacy_fallback_mod.legacy_fp8_paged_mqa_logits)
-    monkeypatch.setattr(
-        _legacy_fallback_mod, "legacy_fp8_paged_mqa_logits", fallback
-    )
+    monkeypatch.setattr(_legacy_fallback_mod, "legacy_fp8_paged_mqa_logits", fallback)
 
     torch.manual_seed(0xDEAD)
     device = torch.device("cuda")
 
     B = 2  # batch
-    next_n = 1  # one Q step per request (decode-shape)
     H = 64  # head count (DeepGEMM contract: H consumed per row)
     D = INDEXER_HEAD_DIM
     # Each request gets a fresh K range; for simplicity all reqs use the
     # same context length and contiguous slot ids.
-    T_per_req = 32
+    T_per_req = 128
 
     # ── Build per-request K (bf16), quantize, pack ──
     # Total slots: B requests × T_per_req tokens, ALL contiguous starting
@@ -292,12 +290,112 @@ def test_fp8_paged_indexer_score_via_deepgemm(block_size, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("next_n", [1, 3, 4, 5])
+def test_paged_indexer_shared_metadata(next_n):
+    from types import SimpleNamespace
+
+    from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
+        build_decode_metadata_fp8,
+        get_decode_indexer_metadata,
+    )
+    from rtp_llm.models_py.modules.dsv4.kv_cache_utils import INDEXER_KV
+    from rtp_llm.models_py.modules.dsv4.transformer import V4Transformer
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    batch, heads, dim, block_size, capacity = 2, 64, 128, 64, 128
+    table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
+    meta = build_decode_metadata_fp8(
+        torch.tensor([247, 499], dtype=torch.int32, device=device),
+        next_n,
+        128,
+        512,
+        1024,
+        [4],
+        32,
+        device,
+    )
+    meta.pool_block_tables[INDEXER_KV] = table
+    lengths = meta.compressed_lens_per_token[4]
+    meta.compressed_lens_per_token[4] = torch.cat((lengths, torch.zeros_like(lengths)))
+    model = SimpleNamespace(_mega_csa_runtime=None)
+    keys = torch.randn(batch * capacity, dim, device=device).to(torch.float8_e4m3fn)
+    pool = torch.empty(4, block_size * 132, dtype=torch.uint8, device=device)
+    pool[:, : block_size * dim] = keys.view(torch.uint8).reshape(4, -1)
+    pool[:, block_size * dim :] = torch.ones(4, block_size, device=device).view(
+        torch.uint8
+    )
+    pool = pool.view(-1, 132)
+    query = torch.randn(batch, next_n, heads, dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn(batch * next_n, heads, device=device) / heads
+
+    def forward():
+        V4Transformer.begin_decode(model, meta)
+        prepared = get_decode_indexer_metadata(meta, block_size)
+        # Two layers consume the same preparation with their own query values.
+        outputs = []
+        for layer_weights in (weights, weights * 2):
+            shared = get_decode_indexer_metadata(meta, block_size)
+            assert shared is prepared
+            outputs.append(
+                fp8_paged_indexer_score(
+                    query,
+                    layer_weights,
+                    pool,
+                    table,
+                    meta.compressed_lens_per_token[4],
+                    block_size,
+                    capacity,
+                    metadata=shared,
+                )
+            )
+        return outputs
+
+    def check(outputs):
+        key_rows = (
+            keys.float()
+            .view(4, block_size, dim)[table.long()]
+            .reshape(batch, capacity, dim)
+        )
+        reference = torch.einsum("bnhd,btd->bnht", query.float(), key_rows).relu()
+        reference = (
+            (reference * weights.view(batch, next_n, heads, 1))
+            .sum(2)
+            .reshape(-1, capacity)
+        )
+        mask = torch.arange(capacity, device=device)[
+            None, :
+        ] < meta.compressed_lens_per_token[4][:batch].reshape(-1, 1)
+        for scale, output in zip((1, 2), outputs):
+            torch.testing.assert_close(
+                output[mask], (reference * scale)[mask], atol=2e-3, rtol=2e-3
+            )
+
+    check(forward())
+    # Capture once, then change both the mapping and the causal lengths.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = forward()
+    table.copy_(table.flip(0))
+    meta.compressed_lens_per_token[4].sub_(7)
+    graph.replay()
+    check(outputs)
+    check(forward())
+
+
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("SKIP: CUDA required")
     else:
-        # Runs on any CUDA device: the in-test counters assert the DeepGEMM
-        # path when the predicate is true and the fallback path otherwise.
-        for _block_size in (32, 64):
-            test_fp8_paged_indexer_score_via_deepgemm(_block_size, _NullMonkeypatch())
+        for block_size in (32, 64):
+            for next_n in (1, 2, 4):
+                test_fp8_paged_indexer_score_via_deepgemm(
+                    block_size, next_n, _NullMonkeypatch()
+                )
+        for next_n in (1, 3, 4, 5):
+            test_paged_indexer_shared_metadata(next_n)
     print("OK")
