@@ -1,7 +1,7 @@
 -r requirements_base.txt
 auto_gptq
 autoawq
-apache-tvm-ffi==0.1.9
+apache-tvm-ffi==0.1.12
 https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/fast_safetensors-0.7.3%2Btorch2.1.2.cu121-cp310-cp310-linux_x86_64.whl
 https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/fastsafetensors-0.3.4.dev20260904%2Bali.fuseshm.gf2e21da-cp310-cp310-linux_x86_64.whl
 https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/tensorrt_cu12_libs-10.3.0-py2.py3-none-manylinux_2_17_x86_64.whl
@@ -11,15 +11,18 @@ https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/flash_attn-2.8
 https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/flash_attn_3-3.0.0b1-cp39-abi3-linux_x86_64.whl
 https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/torch-2.8.0%2Bcu129-cp310-cp310-manylinux_2_28_x86_64.whl
 https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/torchvision-0.23.0%2Bcu129-cp310-cp310-manylinux_2_28_x86_64.whl
-https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/deep_ep-1.2.1.10%2Bd7d7b48-cp310-cp310-linux_x86_64.whl
+http://artlab.alibaba-inc.com/1/pypi/rtp_llm/deep-ep/deep_ep-1.2.1.10.1+d2fa38c.cu129-cp310-cp310-linux_x86_64.whl
 http://artlab.alibaba-inc.com/1/pypi/rtp_llm/deep-gemm/deep_gemm-2.5.0+d7d5eca.cu129-cp310-cp310-linux_x86_64.whl
-https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/flashinfer_260714/flashinfer_python-0.6.9-py3-none-any.whl
-https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/flashinfer_260714/flashinfer_cubin-0.6.9-py3-none-any.whl
-https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/flash_mla-1.0.0%2Bca58fed-cp310-cp310-linux_x86_64.whl
+https://artlab.alibaba-inc.com/1/pypi/rtp_llm/flashinfer-python/flashinfer_python-0.6.9+8c4f4dcf-py3-none-any.whl
+https://artlab.alibaba-inc.com/1/pypi/rtp_llm/flashinfer-cubin/flashinfer_cubin-0.6.9+8c4f4dcf-py3-none-any.whl
+http://artlab.alibaba-inc.com/1/pypi/rtp_llm/flash_mla/flash_mla-1.0.0+fcaae18.cu129-cp310-cp310-linux_x86_64.whl
 https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/fast_hadamard_transform-1.0.4.post1-cp310-cp310-linux_x86_64.whl
-https://rtp-opensource.oss-cn-hangzhou.aliyuncs.com/rtp_llm/cu129/rtp_kernel_260612/rtp_kernel-0.1.0%2B125c29e5-cp310-cp310-linux_x86_64.whl
+http://artlab.alibaba-inc.com/1/pypi/rtp_llm/rtp-kernel/rtp_kernel-0.1.0+47e3c4a4.cu129-cp310-cp310-linux_x86_64.whl
 mysql-connector-python
 tensorrt==10.3.0
 tensorrt-cu12-bindings==10.3.0
 tabulate==0.9.0
-tilelang==0.1.6
+tilelang==0.1.15
+cuda-tile==1.4.0
+nvidia-cutlass-dsl==4.4.2
+nvidia-cutlass-dsl-libs-base==4.4.2
