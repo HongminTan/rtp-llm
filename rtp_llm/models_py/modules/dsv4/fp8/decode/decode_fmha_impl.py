@@ -37,6 +37,7 @@ import torch
 from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
     DSv4DecodeAttnMetadataFP8,
     allocate_decode_metadata_fp8,
+    build_replay_start_pos_from_device_inputs,
     update_decode_metadata_in_place_fp8,
 )
 from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
@@ -82,6 +83,9 @@ class DSv4DecodeFmhaImplFP8:
     in place across replays so the captured graph reads fresh values
     from stable addresses.
     """
+
+    # Replay preparation uses device metadata; host mirrors may be stale.
+    prepare_cuda_graph_reads_host_metadata = False
 
     def __init__(
         self,
@@ -192,7 +196,9 @@ class DSv4DecodeFmhaImplFP8:
             )
         update_decode_metadata_in_place_fp8(
             self.metadata,
-            primary_attention_inputs(attn_inputs),
+            build_replay_start_pos_from_device_inputs(
+                primary_attention_inputs(attn_inputs), self.config.q_len
+            ),
             forbid_realloc=True,
             paged_block_tables=paged_block_tables,
             paged_pool_entries_per_block=self._paged_entries_per_block,

@@ -10,6 +10,7 @@ import torch
 from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
     allocate_decode_metadata_fp8,
     build_decode_metadata_fp8,
+    build_replay_start_pos_from_device_inputs,
     get_decode_freqs_cis,
     update_decode_metadata_in_place_fp8,
 )
@@ -840,6 +841,141 @@ class TestDecodeMetadataStartPos(unittest.TestCase):
         self.assertEqual(
             meta.swa_global_slots[:T].tolist(), expected_swa_global.tolist()
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required for fused decode meta")
+class TestReplayStartPosFromDeviceInputs(unittest.TestCase):
+    """CUDA-graph replay reads device metadata only (no host-mirror sync)."""
+
+    def test_replay_observes_device_updates_with_poisoned_host_mirrors(self):
+        for q_len in (1, 4):
+            with self.subTest(q_len=q_len):
+                attn = SimpleNamespace(
+                    is_prefill=q_len > 1,
+                    is_target_verify=q_len > 1,
+                    sequence_lengths=torch.full((3,), -999, dtype=torch.int32),
+                    prefix_lengths=torch.full((3,), -999, dtype=torch.int32),
+                    sequence_lengths_plus_1_device=_i32([5, 128, 1]),
+                    prefix_lengths_device=_i32([4, 127, 0]),
+                )
+                meta = _alloc(q_len=q_len)
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+
+                    def prepare():
+                        update_decode_metadata_in_place_fp8(
+                            meta,
+                            build_replay_start_pos_from_device_inputs(attn, q_len),
+                            forbid_realloc=True,
+                        )
+
+                    prepare()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        observed = meta.position_ids.clone()
+                    for values in ([128, 255, 0], [256, 511, 0]):
+                        source = torch.tensor(values, dtype=torch.int32, device="cuda")
+                        attn.sequence_lengths_plus_1_device.copy_(source + 1)
+                        attn.prefix_lengths_device.copy_(source)
+                        prepare()
+                        graph.replay()
+                        # Synchronize for assertions only.
+                        stream.synchronize()
+                        expected = source[:, None] + torch.arange(q_len, device="cuda")
+                        self.assertTrue(
+                            torch.equal(
+                                observed[: 3 * q_len].reshape(3, q_len), expected
+                            )
+                        )
+                torch.cuda.current_stream().wait_stream(stream)
+
+    @staticmethod
+    def _meta_tensors(meta):
+        out = {
+            "start_pos": meta.start_pos,
+            "position_ids": meta.position_ids,
+            "slot_mapping_swa": meta.slot_mapping_swa,
+            "topk_window_idxs": meta.topk_window_idxs,
+            "decode_seq_start_per_req": meta.decode_seq_start_per_req,
+        }
+        for r, t in meta.slot_mapping_compressed.items():
+            out[f"slot_compressed[{r}]"] = t
+        for r, t in meta.compressed_lens.items():
+            out[f"compressed_lens[{r}]"] = t
+        return out
+
+    def test_decode_uses_plus_1_device_minus_one(self):
+        # Graph rows beyond the live batch carry plus_1 == 1 (position 0),
+        # matching the zero the host mirror holds for padded rows.
+        attn = SimpleNamespace(
+            is_prefill=False,
+            is_target_verify=False,
+            sequence_lengths=_i32([999, 999, 999]),  # unused source
+            sequence_lengths_plus_1_device=_i32([5, 128, 1]),
+            prefix_lengths_device=_i32([]),
+        )
+        start_pos = build_replay_start_pos_from_device_inputs(attn, q_len=1)
+        self.assertTrue(start_pos.is_cuda)
+        self.assertEqual(start_pos.tolist(), [4, 127, 0])
+
+    def test_multi_token_paths_use_prefix_lengths_device(self):
+        for is_target_verify in (True, False):
+            attn = SimpleNamespace(
+                is_prefill=True,
+                is_target_verify=is_target_verify,
+                prefix_lengths=_i32([1, 1]),  # unused source
+                prefix_lengths_device=_i32([10, 20]),
+                sequence_lengths_plus_1_device=_i32([65598, 65598]),
+            )
+            start_pos = build_replay_start_pos_from_device_inputs(attn, q_len=4)
+            self.assertEqual(start_pos.tolist(), [10, 20])
+
+    def test_missing_device_metadata_is_an_error(self):
+        attn = SimpleNamespace(
+            is_prefill=False,
+            is_target_verify=False,
+            sequence_lengths=_i32([4]),
+            sequence_lengths_plus_1_device=_i32([]),
+        )
+        with self.assertRaises(RuntimeError):
+            build_replay_start_pos_from_device_inputs(attn, q_len=1)
+
+    def test_device_and_host_sources_build_identical_metadata(self):
+        cases = [
+            (
+                1,
+                SimpleNamespace(
+                    is_prefill=False,
+                    is_target_verify=False,
+                    sequence_lengths=_i32([4, 127, 0]),
+                    sequence_lengths_plus_1_device=_i32([5, 128, 1]),
+                ),
+            ),
+            (
+                4,
+                SimpleNamespace(
+                    is_prefill=True,
+                    is_target_verify=True,
+                    prefix_lengths=_i32([10, 255, 0]),
+                    prefix_lengths_device=_i32([10, 255, 0]),
+                ),
+            ),
+        ]
+        for q_len, attn in cases:
+            host_meta = _alloc(q_len=q_len)
+            device_meta = _alloc(q_len=q_len)
+            update_decode_metadata_in_place_fp8(host_meta, attn, forbid_realloc=True)
+            update_decode_metadata_in_place_fp8(
+                device_meta,
+                build_replay_start_pos_from_device_inputs(attn, q_len),
+                forbid_realloc=True,
+            )
+            host_tensors = self._meta_tensors(host_meta)
+            for name, tensor in self._meta_tensors(device_meta).items():
+                self.assertTrue(
+                    torch.equal(tensor, host_tensors[name]), f"q_len={q_len} {name}"
+                )
 
 
 if __name__ == "__main__":

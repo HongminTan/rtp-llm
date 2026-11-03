@@ -19,6 +19,27 @@ void refreshTaggedAttentionInputs(torch_ext::PyModelInputs& inputs) {
     }
 }
 
+// Tagged implementations require host metadata if any member needs it.
+bool attnImplReadsHostMetadata(const py::object& attn_pyobj) {
+    py::gil_scoped_acquire gil;
+    if (!attn_pyobj || attn_pyobj.is_none()) {
+        return false;  // nothing runs prepare_cuda_graph
+    }
+    const auto reads = [](const py::handle& impl) {
+        return !py::hasattr(impl, "prepare_cuda_graph_reads_host_metadata")
+               || impl.attr("prepare_cuda_graph_reads_host_metadata").cast<bool>();
+    };
+    if (py::isinstance<py::dict>(attn_pyobj)) {
+        for (auto item : attn_pyobj.cast<py::dict>()) {
+            if (reads(item.second)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return reads(attn_pyobj);
+}
+
 // Helper function to print tensor info and data
 void printTensorInfo(const std::string& name, const torch::Tensor& tensor, int max_print_size) {
     std::cout << "  " << name << ": defined=" << tensor.defined();

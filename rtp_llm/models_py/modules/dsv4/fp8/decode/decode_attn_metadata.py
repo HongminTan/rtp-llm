@@ -665,20 +665,58 @@ def _build_start_pos_from_attention_inputs(
     """Derive DSv4 decode first-token positions from framework attention inputs."""
     if isinstance(attention_inputs, torch.Tensor):
         start_pos = attention_inputs
+    elif _start_pos_from_prefix_lengths(attention_inputs, q_len):
+        start_pos = attention_inputs.prefix_lengths
     else:
-        is_target_verify = bool(getattr(attention_inputs, "is_target_verify", False))
-        is_prefill = bool(getattr(attention_inputs, "is_prefill", False))
-        # Target verify and MTP draft-prefill CUDA graph are both multi-token
-        # decode-shaped batches.  CudaGraphRunner copies prefix_lengths for
-        # prefill graph replay but leaves sequence_lengths at capture-time
-        # sentinel values, so prefix_lengths is the only valid first-token
-        # position source for those q_len > 1 paths.
-        if is_target_verify or (is_prefill and q_len > 1):
-            start_pos = attention_inputs.prefix_lengths
-        else:
-            start_pos = attention_inputs.sequence_lengths
+        start_pos = attention_inputs.sequence_lengths
+    return _clamp_start_pos(
+        start_pos.to(device=device, dtype=torch.int32), max_seq_len, q_len
+    )
 
-    start_pos = start_pos.to(device=device, dtype=torch.int32)
+
+def build_replay_start_pos_from_device_inputs(
+    attention_inputs: Any, q_len: int
+) -> torch.Tensor:
+    """Build replay start positions from device metadata.
+
+    Uses prefix lengths for target verify and multi-token prefill, otherwise
+    sequence_lengths_plus_1 - 1. The caller must order metadata updates before
+    this call. The metadata builder clamps positions to its capacity.
+    """
+    if _start_pos_from_prefix_lengths(attention_inputs, q_len):
+        name, start_pos = (
+            "prefix_lengths_device",
+            attention_inputs.prefix_lengths_device,
+        )
+    else:
+        name, start_pos = (
+            "sequence_lengths_plus_1_device",
+            attention_inputs.sequence_lengths_plus_1_device,
+        )
+    if start_pos is None or start_pos.numel() == 0 or not start_pos.is_cuda:
+        # Host mirrors may be stale when D2H refresh is disabled.
+        raise RuntimeError(
+            f"DSV4 CUDA-graph replay requires attention_inputs.{name} on CUDA"
+        )
+    if name == "sequence_lengths_plus_1_device":
+        start_pos = start_pos - 1
+    return start_pos
+
+
+def _start_pos_from_prefix_lengths(attention_inputs: Any, q_len: int) -> bool:
+    # Target verify and MTP draft-prefill CUDA graph are both multi-token
+    # decode-shaped batches.  CudaGraphRunner copies prefix_lengths for
+    # prefill graph replay but leaves sequence_lengths at capture-time
+    # sentinel values, so prefix_lengths is the only valid first-token
+    # position source for those q_len > 1 paths.
+    is_target_verify = bool(getattr(attention_inputs, "is_target_verify", False))
+    is_prefill = bool(getattr(attention_inputs, "is_prefill", False))
+    return is_target_verify or (is_prefill and q_len > 1)
+
+
+def _clamp_start_pos(
+    start_pos: torch.Tensor, max_seq_len: int, q_len: int
+) -> torch.Tensor:
     # Cuda-graph capture/warmup can hand us sentinel prefix lengths near
     # max_seq_len. For multi-token speculative batches, clamping only the first
     # token to max_seq_len - 1 still lets later tokens exceed the sized KV and
@@ -1039,11 +1077,8 @@ def update_decode_metadata_in_place_fp8(
 
     Args:
         meta: Pre-allocated metadata (from ``allocate_decode_metadata_fp8``).
-        attention_inputs: Framework attention inputs. Normal decode derives
-            the first-token position from ``sequence_lengths``; target verify
-            derives it from ``prefix_lengths`` because C++ clears
-            ``sequence_lengths`` for that path. A tensor is accepted for
-            focused metadata tests.
+        attention_inputs: Framework attention inputs, or a tensor of first-token
+            positions shaped [batch_size].
         forbid_realloc: If True, asserts every write reuses the existing
             tensor storage (sanity check for the captured-graph path).
     """

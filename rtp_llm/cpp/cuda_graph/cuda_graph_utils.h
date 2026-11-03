@@ -15,6 +15,9 @@ void printTensorInfo(const std::string& name, const torch::Tensor& tensor, int m
 void debugPrintPyModelInputs(const torch_ext::PyModelInputs& inputs);
 // Copy common attention metadata to every tag while retaining each tag's block tables.
 void refreshTaggedAttentionInputs(torch_ext::PyModelInputs& inputs);
+// Defaults to true. Implementations may declare
+// prepare_cuda_graph_reads_host_metadata = False to skip D2H refreshes.
+bool attnImplReadsHostMetadata(const py::object& attn_pyobj);
 
 }  // namespace rtp_llm
 
@@ -69,8 +72,15 @@ public:
             inputs.attention_inputs.sequence_lengths_plus_1_device;
     }
 
+    // Cache the implementation's host-metadata requirement for replay.
+    void setAttnImpl(py::object attn_pyobj) {
+        attn_reads_host_metadata_ = rtp_llm::attnImplReadsHostMetadata(attn_pyobj);
+        attn_pyobj_               = std::move(attn_pyobj);
+    }
+
 public:
     py::object               attn_pyobj_{py::none()};
+    bool                     attn_reads_host_metadata_{true};
     at::Tensor               decoder_layer_hidden_states_;
     at::Tensor               mtp_target_hidden_states_;
     torch_ext::PyModelInputs py_model_inputs_;

@@ -327,6 +327,106 @@ void optimizedCopyAsync(const torch::Tensor& src, torch::Tensor& dst, size_t siz
     }
 }
 
+namespace {
+
+// Updates host metadata mirrors. Device-to-host copies are skipped when no
+// CPU consumer needs them; otherwise wait() must precede host reads.
+class AttentionHostMetadataUpdater {
+public:
+    explicit AttentionHostMetadataUpdater(bool requires_device_to_host_copy):
+        requires_device_to_host_copy_(requires_device_to_host_copy) {}
+
+    // Copies a contiguous prefix. The caller handles tail padding.
+    void updateTensorPrefix(const torch::Tensor& src, torch::Tensor& dst, size_t bytes) {
+        if (isDeviceToHost(src, dst)) {
+            if (!requires_device_to_host_copy_) {
+                return;
+            }
+            pending_d2h_ = true;
+        }
+        optimizedCopyAsync(src, dst, bytes);
+    }
+
+    // Copies the live block table and clears uncovered rows and columns.
+    void updateBlockTable(const torch::Tensor& src, torch::Tensor& dst) {
+        if (!dst.defined() || dst.is_cuda() || (isDeviceToHost(src, dst) && !requires_device_to_host_copy_)) {
+            return;
+        }
+        if (!src.defined() || src.numel() <= 0) {
+            dst.zero_();
+            return;
+        }
+        const auto geometry = blockTableCopyGeometry(src, dst);
+        clearBlockTablePadding(dst, geometry.rows, geometry.cols);
+        if (geometry.cols == 0) {
+            return;
+        }
+        if (src.is_cuda()) {
+            RTP_LLM_PROFILE_SCOPE("stridedCopyHost(D2H)");
+            if (src.dim() < 2) {
+                dst.view({-1})
+                    .narrow(0, 0, geometry.cols)
+                    .copy_(src.view({-1}).narrow(0, 0, geometry.cols), /*non_blocking=*/true);
+            } else {
+                dst.narrow(0, 0, geometry.rows)
+                    .narrow(1, 0, geometry.cols)
+                    .copy_(src.narrow(0, 0, geometry.rows).narrow(1, 0, geometry.cols), /*non_blocking=*/true);
+            }
+            pending_d2h_ = true;
+            return;
+        }
+        RTP_LLM_PROFILE_SCOPE("stridedCopyHost");
+        if (src.dim() < 2) {
+            memcpy(dst.data_ptr(), src.data_ptr(), geometry.cols * src.element_size());
+            return;
+        }
+        const size_t nrows      = geometry.rows;
+        const size_t row_bytes  = geometry.cols * src.element_size();
+        const size_t src_stride = src.stride(0) * src.element_size();
+        const size_t dst_stride = dst.stride(0) * dst.element_size();
+        const char*  src_ptr    = reinterpret_cast<const char*>(src.data_ptr());
+        char*        dst_ptr    = reinterpret_cast<char*>(dst.data_ptr());
+        for (size_t r = 0; r < nrows; ++r) {
+            memcpy(dst_ptr + r * dst_stride, src_ptr + r * src_stride, row_bytes);
+        }
+    }
+
+    void wait(const char* profile_scope) {
+        if (!pending_d2h_) {
+            return;
+        }
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("%s", profile_scope);
+        cuda_graph::graphGetCurrentStream().synchronize();
+        pending_d2h_ = false;
+    }
+
+private:
+    static void clearBlockTablePadding(torch::Tensor& dst, int64_t rows, int64_t cols) {
+        // Clear padding so reused graph rows cannot retain stale block IDs.
+        if (dst.dim() < 2) {
+            if (cols < dst.numel()) {
+                dst.view({-1}).narrow(0, cols, dst.numel() - cols).zero_();
+            }
+        } else {
+            if (cols < dst.size(1)) {
+                dst.narrow(1, cols, dst.size(1) - cols).zero_();
+            }
+            if (rows < dst.size(0)) {
+                dst.narrow(0, rows, dst.size(0) - rows).zero_();
+            }
+        }
+    }
+
+    static bool isDeviceToHost(const torch::Tensor& src, const torch::Tensor& dst) {
+        return src.defined() && src.numel() > 0 && src.is_cuda() && dst.defined() && !dst.is_cuda();
+    }
+
+    const bool requires_device_to_host_copy_;
+    bool       pending_d2h_ = false;
+};
+
+}  // namespace
+
 void CudaGraphRunner::prepareInputs(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareInputs");
     prepareInputData(inputs, state);
@@ -536,71 +636,9 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                                dst.stride(0) * dst.element_size());
     };
 
-    // Host block-table mirror refresh. Main's host pipeline guaranteed that
-    // the pinned host mirrors reflect the current step before prepare_cuda_graph
-    // runs (the host fillParams/plan paths read them). The source table may be
-    // CUDA-resident even in the default host pipeline (e.g. the linear-attention
-    // regather or the MTP device-state fast path), so a CUDA source becomes an
-    // async strided D2H copy that the pre-callPrepareCudaGraph synchronize below
-    // waits for; host sources keep main's synchronous row-by-row memcpy.
-    bool pending_host_mirror_d2h = false;
-    auto stridedCopyHost         = [&pending_host_mirror_d2h](const torch::Tensor& src, torch::Tensor& dst) {
-        if (!dst.defined() || dst.is_cuda()) {
-            return;
-        }
-        if (!src.defined() || src.numel() <= 0) {
-            dst.zero_();
-            return;
-        }
-        const auto geometry = blockTableCopyGeometry(src, dst);
-        // The graph instance is reused across batch sizes. Clear exactly the
-        // part not overwritten by this replay so a request that left the batch
-        // cannot survive in the host-pinned page table consumed by the next
-        // FlashInfer/TRT-LLM plan. Device tables have the same contract above.
-        if (dst.dim() < 2) {
-            if (geometry.cols < dst.numel()) {
-                dst.view({-1}).narrow(0, geometry.cols, dst.numel() - geometry.cols).zero_();
-            }
-        } else {
-            if (geometry.cols < dst.size(1)) {
-                dst.narrow(1, geometry.cols, dst.size(1) - geometry.cols).zero_();
-            }
-            if (geometry.rows < dst.size(0)) {
-                dst.narrow(0, geometry.rows, dst.size(0) - geometry.rows).zero_();
-            }
-        }
-        if (geometry.cols == 0) {
-            return;
-        }
-        if (src.is_cuda()) {
-            RTP_LLM_PROFILE_SCOPE("stridedCopyHost(D2H)");
-            if (src.dim() < 2) {
-                dst.view({-1})
-                    .narrow(0, 0, geometry.cols)
-                    .copy_(src.view({-1}).narrow(0, 0, geometry.cols), /*non_blocking=*/true);
-            } else {
-                dst.narrow(0, 0, geometry.rows)
-                    .narrow(1, 0, geometry.cols)
-                    .copy_(src.narrow(0, 0, geometry.rows).narrow(1, 0, geometry.cols), /*non_blocking=*/true);
-            }
-            pending_host_mirror_d2h = true;
-            return;
-        }
-        RTP_LLM_PROFILE_SCOPE("stridedCopyHost");
-        if (src.dim() < 2) {
-            memcpy(dst.data_ptr(), src.data_ptr(), geometry.cols * src.element_size());
-            return;
-        }
-        const size_t nrows      = geometry.rows;
-        const size_t row_bytes  = geometry.cols * src.element_size();
-        const size_t src_stride = src.stride(0) * src.element_size();
-        const size_t dst_stride = dst.stride(0) * dst.element_size();
-        const char*  src_ptr    = reinterpret_cast<const char*>(src.data_ptr());
-        char*        dst_ptr    = reinterpret_cast<char*>(dst.data_ptr());
-        for (size_t r = 0; r < nrows; ++r) {
-            memcpy(dst_ptr + r * dst_stride, src_ptr + r * src_stride, row_bytes);
-        }
-    };
+    // Embedding prefill also reads host input lengths to compute padding.
+    AttentionHostMetadataUpdater host_metadata(graph_instances_[graph_idx].mem_hold_.attn_reads_host_metadata_
+                                               || isEmbeddingStylePrefillCudaGraph());
 
     // Clear stale device ranges in one launch before copying the live portions.
 #if USING_CUDA || USING_ROCM
@@ -845,47 +883,31 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(host_mirror_copy)");
 
-        // H2H copies (common to both modes)
-        //
-        // When the incoming metadata is CUDA-resident (the MTP decode path
-        // publishes sequence/input lengths on CUDA even in the default host
-        // pipeline) while the capture mirrors are host pinned, optimizedCopyAsync
-        // becomes an async D2H. callPrepareCudaGraph below consumes those host
-        // mirrors synchronously on the CPU (host fill_params / fa2 replan), so the
-        // copies must land first. Main's host pipeline used synchronous host
-        // memcpy here and never observed stale values.
-        auto copyToHostMirror = [&pending_host_mirror_d2h](const torch::Tensor& src, torch::Tensor& dst, size_t size) {
-            optimizedCopyAsync(src, dst, size);
-            if (src.defined() && src.numel() > 0 && src.is_cuda() && dst.defined() && !dst.is_cuda()) {
-                pending_host_mirror_d2h = true;
-            }
-        };
-
         if (!isGenerationPrefillCudaGraph()) {
-            copyToHostMirror(inputs.attention_inputs.cu_seqlens,
-                             py_model_inputs_.attention_inputs.cu_seqlens,
-                             (state.current_batch_size + 1) * sizeof(int));
+            host_metadata.updateTensorPrefix(inputs.attention_inputs.cu_seqlens,
+                                             py_model_inputs_.attention_inputs.cu_seqlens,
+                                             (state.current_batch_size + 1) * sizeof(int));
         }
 
-        copyToHostMirror(inputs.attention_inputs.input_lengths,
-                         py_model_inputs_.attention_inputs.input_lengths,
-                         state.current_batch_size * sizeof(int));
+        host_metadata.updateTensorPrefix(inputs.attention_inputs.input_lengths,
+                                         py_model_inputs_.attention_inputs.input_lengths,
+                                         state.current_batch_size * sizeof(int));
 
         if (!isGenerationPrefillCudaGraph()) {
-            copyToHostMirror(inputs.attention_inputs.prefix_lengths,
-                             py_model_inputs_.attention_inputs.prefix_lengths,
-                             state.current_batch_size * sizeof(int));
+            host_metadata.updateTensorPrefix(inputs.attention_inputs.prefix_lengths,
+                                             py_model_inputs_.attention_inputs.prefix_lengths,
+                                             state.current_batch_size * sizeof(int));
         }
 
         if (!has_tagged_cache) {
             // Common H2H strided copies for kv_cache block tables (both decode & prefill)
-            stridedCopyHost(inputs.attention_inputs.kv_cache_kernel_block_id,
-                            py_model_inputs_.attention_inputs.kv_cache_kernel_block_id);
+            host_metadata.updateBlockTable(inputs.attention_inputs.kv_cache_kernel_block_id,
+                                           py_model_inputs_.attention_inputs.kv_cache_kernel_block_id);
         }
         if (!is_prefill_cuda_graph_mode_) {
-            copyToHostMirror(inputs.attention_inputs.sequence_lengths,
-                             py_model_inputs_.attention_inputs.sequence_lengths,
-                             state.current_batch_size * sizeof(int));
+            host_metadata.updateTensorPrefix(inputs.attention_inputs.sequence_lengths,
+                                             py_model_inputs_.attention_inputs.sequence_lengths,
+                                             state.current_batch_size * sizeof(int));
             // When the live inputs carry no sequence_lengths at all (target verify
             // feeds the prefill attention path), nothing was copied above, so the
             // whole captured range - not just the padding tail - would otherwise
@@ -938,10 +960,8 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                     // data_ptr on the host is invalid; use the host-pinned capture mirror filled
                     // by the async D2H copy above and wait for that copy to land first.
                     const bool live_input_lengths_on_cuda = inputs.attention_inputs.input_lengths.is_cuda();
-                    if (live_input_lengths_on_cuda && pending_host_mirror_d2h) {
-                        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_input_lengths_d2h)");
-                        cuda_graph::graphGetCurrentStream().synchronize();
-                        pending_host_mirror_d2h = false;
+                    if (live_input_lengths_on_cuda) {
+                        host_metadata.wait("cuda_graph.prepareAttentionInputs(wait_input_lengths_d2h)");
                     }
                     const auto& input_lengths_host = live_input_lengths_on_cuda ?
                                                          py_model_inputs_.attention_inputs.input_lengths :
@@ -957,9 +977,9 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                         cumulative_padding += state.current_real_graph_seq_len - input_length;
                     }
                 } else {
-                    copyToHostMirror(inputs.attention_inputs.padding_offset,
-                                     py_model_inputs_.attention_inputs.padding_offset,
-                                     state.current_seq_len * sizeof(int));
+                    host_metadata.updateTensorPrefix(inputs.attention_inputs.padding_offset,
+                                                     py_model_inputs_.attention_inputs.padding_offset,
+                                                     state.current_seq_len * sizeof(int));
                 }
             }
         }
@@ -968,7 +988,8 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
         if (has_tagged_cache) {
             for (const auto& [tag, src_inputs] : inputs.attention_inputs_by_tag) {
                 auto& dst_inputs = py_model_inputs_.attention_inputs_by_tag.at(tag);
-                stridedCopyHost(src_inputs.kv_cache_kernel_block_id, dst_inputs.kv_cache_kernel_block_id);
+                host_metadata.updateBlockTable(src_inputs.kv_cache_kernel_block_id,
+                                               dst_inputs.kv_cache_kernel_block_id);
             }
         }
     }
@@ -1076,13 +1097,8 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     // a Python args tuple via PyTuple_New, which segfaults without the GIL.
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(prepare_cuda_graph)");
-        if (pending_host_mirror_d2h) {
-            // Wait for the async D2H metadata copies above so the CPU-side
-            // fill/plan paths inside prepare_cuda_graph read this step's
-            // values instead of the previous step's.
-            RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_host_mirror_d2h)");
-            cuda_graph::graphGetCurrentStream().synchronize();
-        }
+        // Complete pending D2H copies before attention planning reads host metadata.
+        host_metadata.wait("cuda_graph.prepareAttentionInputs(wait_host_mirror_d2h)");
         py::gil_scoped_acquire gil;
         callPrepareCudaGraph(attn_pyobj, py_model_inputs_);
     }
