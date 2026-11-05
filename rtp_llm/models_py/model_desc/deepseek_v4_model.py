@@ -639,6 +639,23 @@ class DeepSeekV4Model(GptModelBase):
 
     def _bind_runtime_buffers(self, device: torch.device) -> None:
         assert self.v4 is not None
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.grouped_fp4_sm90 import (
+            GroupedFp4Sm90Executor,
+        )
+
+        executors = [
+            m for m in self.v4.modules() if isinstance(m, GroupedFp4Sm90Executor)
+        ]
+        capacity = max((m.weight_workspace_numel() for m in executors), default=0)
+        # Serial layers share scratch; target and draft models own separate buffers.
+        self._moe_weight_workspace = None
+        if capacity:
+            self._moe_weight_workspace = torch.empty(
+                capacity, dtype=torch.float8_e4m3fn, device=device
+            )
+            for executor in executors:
+                if executor.weight_workspace_numel():
+                    executor.bind_weight_workspace(self._moe_weight_workspace)
         mtp_hidden = None
         mtp_last_hidden_capacity = None
         if Dsv4SharedRuntimeBufferStore.mtp_hidden_requested():

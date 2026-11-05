@@ -76,6 +76,7 @@ class GroupedFp4Sm90WeightTest(unittest.TestCase):
                     checkpoint_w13, checkpoint_s13 = w13, s13
                 executor = SimpleNamespace(
                     cfg=SimpleNamespace(
+                        dsv4_moe_sm90_storage="fp8",
                         dim=dim,
                         moe_inter_dim=inter,
                         n_routed_experts=6,

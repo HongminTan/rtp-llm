@@ -976,6 +976,7 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("ll_num_max_token", &MoeConfig::ll_num_max_token)
         .def_readwrite("moe_strategy", &MoeConfig::moe_strategy)
         .def_readwrite("fp4_moe_op", &MoeConfig::fp4_moe_op)
+        .def_readwrite("dsv4_moe_sm90_storage", &MoeConfig::dsv4_moe_sm90_storage)
         .def("to_string", &MoeConfig::to_string)
         .def(py::pickle(
             [](const MoeConfig& self) {
@@ -991,10 +992,11 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.use_all_gather,
                                       self.ll_num_max_token,
                                       self.moe_strategy,
-                                      self.fp4_moe_op);
+                                      self.fp4_moe_op,
+                                      self.dsv4_moe_sm90_storage);
             },
             [](py::tuple t) {
-                if (t.size() != 12 && t.size() != 13)
+                if (t.size() != 12 && t.size() != 13 && t.size() != 14)
                     throw std::runtime_error("Invalid state!");
                 MoeConfig c;
                 try {
@@ -1010,8 +1012,10 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                     c.use_all_gather             = t[9].cast<bool>();
                     c.ll_num_max_token           = t[10].cast<int>();
                     c.moe_strategy               = t[11].cast<std::string>();
-                    if (t.size() == 13)
+                    if (t.size() >= 13)
                         c.fp4_moe_op = t[12].cast<std::string>();
+                    if (t.size() >= 14)
+                        c.dsv4_moe_sm90_storage = t[13].cast<std::string>();
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("MoeConfig unpickle error: ") + e.what());
                 }

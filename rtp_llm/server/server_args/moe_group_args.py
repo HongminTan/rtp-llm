@@ -212,6 +212,16 @@ def init_moe_group_args(parser, moe_config, eplb_config, deep_ep_config):
         help="指定 FP4 MOE算子。可选值: auto (自动选择), trtllm (使用 TensorRT-LLM), cutedsl (使用 CuTe DSL)。",
     )
 
+    moe_group.add_argument(
+        "--dsv4_moe_sm90_storage",
+        env_name="DSV4_MOE_SM90_STORAGE",
+        bind_to=(moe_config, "dsv4_moe_sm90_storage"),
+        type=str,
+        choices=["fp8", "fp4"],
+        default="fp8",
+        help="DSv4 SM90 routed weight storage: fp8 at setup, or fp4 converted before each GEMM.",
+    )
+
     # Out-of-tree backends ship MoE strategies the public parser must not
     # advertise, so let them extend the accepted choices here instead.
     run_backend_registrations("moe_strategy_choices", repeatable=True, parser=parser)

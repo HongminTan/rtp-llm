@@ -302,6 +302,23 @@ class CacheConfigArgumentsTest(TestCase):
 class ServerArgsPyEnvConfigsTest(TestCase):
     """Test that environment variables and command line arguments are correctly set to py_env_configs structure."""
 
+    def test_dsv4_sm90_storage_config(self):
+        from rtp_llm.server.server_args import server_args
+
+        with patch.dict(os.environ, {}, clear=True):
+            config = server_args.setup_args([]).moe_config
+            self.assertEqual(config.dsv4_moe_sm90_storage, "fp8")
+        with patch.dict(os.environ, {"DSV4_MOE_SM90_STORAGE": "fp4"}, clear=True):
+            config = server_args.setup_args([]).moe_config
+            self.assertEqual(config.dsv4_moe_sm90_storage, "fp4")
+            self.assertEqual(
+                pickle.loads(pickle.dumps(config)).dsv4_moe_sm90_storage, "fp4"
+            )
+            override = server_args.setup_args(["--dsv4_moe_sm90_storage", "fp8"])
+            self.assertEqual(override.moe_config.dsv4_moe_sm90_storage, "fp8")
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
+            server_args.setup_args(["--dsv4_moe_sm90_storage", "typo"])
+
     def test_dsv4_mega_moe_public_choices(self):
         from rtp_llm.server.server_args import server_args
 
@@ -636,9 +653,7 @@ class ServerArgsSetTest(TestCase):
         self.assertEqual(legacy_fifo_config.max_inited_kv_cache_streams, 0)
         self.assertEqual(legacy_fifo_config.max_batch_tokens_without_cache, 0)
         seven_slot_fifo_config = fifo_config_type.__new__(fifo_config_type)
-        seven_slot_fifo_config.__setstate__(
-            (32, 8192, "ratio", "2", False, 16, 2048)
-        )
+        seven_slot_fifo_config.__setstate__((32, 8192, "ratio", "2", False, 16, 2048))
         self.assertEqual(seven_slot_fifo_config.max_batch_tokens_without_cache, 2048)
         self.assertEqual(seven_slot_fifo_config.prefill_chunk_size, 0)
 
@@ -1818,10 +1833,14 @@ class GenerateArgsFromEnvTest(TestCase):
         with patch.dict(os.environ, {"ENABLE_CRC": "0"}, clear=True):
             value = read_env_value("ENABLE_CRC", True, str2bool)
         self.assertIs(value, False)
-        self.assertEqual(format_argument_pair("--enable_crc", value), ["--enable_crc", "0"])
+        self.assertEqual(
+            format_argument_pair("--enable_crc", value), ["--enable_crc", "0"]
+        )
 
     def test_invalid_str2bool_environment_value_is_rejected(self):
-        from rtp_llm.server.server_args.generate_args_from_env_clean import read_env_value
+        from rtp_llm.server.server_args.generate_args_from_env_clean import (
+            read_env_value,
+        )
         from rtp_llm.server.server_args.util import str2bool
 
         with patch.dict(os.environ, {"ENABLE_CRC": "not-a-bool"}, clear=True):

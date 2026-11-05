@@ -1,4 +1,4 @@
-"""Hopper MoE with FP4 checkpoint weights converted to FP8 at load time."""
+"""Hopper MoE with FP8 resident or FP4 resident weights and FP8 compute."""
 
 from __future__ import annotations
 
@@ -134,16 +134,74 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
             )
 
         self._e_local = expected_local
-        self._w13, self._s13 = _dequant_fp4_to_fp8_blockwise(
-            w13, s13_raw, 2 * inter, D, self._DEQUANT_EXPERT_SLICE
-        )
-        del w13, s13_raw
-        self._w2, self._s2 = _dequant_fp4_to_fp8_blockwise(
-            w2, s2_raw, D, inter, self._DEQUANT_EXPERT_SLICE
-        )
-        del w2, s2_raw
+        self._storage = cfg.dsv4_moe_sm90_storage
+        self._weight_workspace = None
+        self._weight_workspace_numel = 0
+        self._s13_fp4 = self._s2_fp4 = None
+        if self._storage == "fp8":
+            self._w13, self._s13 = _dequant_fp4_to_fp8_blockwise(
+                w13, s13_raw, 2 * inter, D, self._DEQUANT_EXPERT_SLICE
+            )
+            del w13, s13_raw
+            self._w2, self._s2 = _dequant_fp4_to_fp8_blockwise(
+                w2, s2_raw, D, inter, self._DEQUANT_EXPERT_SLICE
+            )
+            del w2, s2_raw
+        elif self._storage == "fp4":
+            from rtp_llm.models_py.triton_kernels.moe.fp4_to_fp8 import (
+                compute_fp4_to_fp8_scales,
+            )
 
+            self._weight_workspace_numel = max(w13.numel(), w2.numel()) * 2
+            self._w13, self._s13_fp4 = w13, s13_raw
+            self._w2, self._s2_fp4 = w2, s2_raw
+            self._s13 = compute_fp4_to_fp8_scales(w13, s13_raw)
+            self._s2 = compute_fp4_to_fp8_scales(w2, s2_raw)
+        else:
+            raise ValueError(f"Invalid dsv4_moe_sm90_storage: {self._storage!r}")
         torch.cuda.empty_cache()
+
+    def weight_workspace_numel(self) -> int:
+        return self._weight_workspace_numel
+
+    def bind_weight_workspace(self, workspace: torch.Tensor) -> None:
+        if self._storage != "fp4":
+            raise ValueError("Only FP4 resident weights need a conversion workspace")
+        if (
+            workspace.device != self._w13.device
+            or workspace.dtype != torch.float8_e4m3fn
+            or not workspace.is_contiguous()
+            or workspace.numel() < self.weight_workspace_numel()
+        ):
+            raise ValueError("Invalid FP4-to-FP8 workspace")
+        self._weight_workspace = workspace
+        # Warm masked and unmasked variants before CUDA graph capture.
+        counts = torch.zeros(self._e_local, dtype=torch.int32, device=workspace.device)
+        for weight, s4, s8 in (
+            (self._w13, self._s13_fp4, self._s13),
+            (self._w2, self._s2_fp4, self._s2),
+        ):
+            self._weight_for_gemm(weight, s4, s8, counts)
+            self._weight_for_gemm(weight, s4, s8)
+
+    def _weight_for_gemm(self, weight, scale_fp4, scale_fp8, counts=None):
+        if self._storage == "fp8":
+            return weight, scale_fp8
+        elif self._storage == "fp4":
+            from rtp_llm.models_py.triton_kernels.moe.fp4_to_fp8 import (
+                convert_fp4_to_fp8,
+            )
+
+            if self._weight_workspace is None:
+                raise RuntimeError("FP4-to-FP8 workspace must be bound before forward")
+            e, n, packed_k = weight.shape
+            out = self._weight_workspace[: e * n * packed_k * 2].view(
+                e, n, packed_k * 2
+            )
+            convert_fp4_to_fp8(weight, scale_fp4, scale_fp8, out, counts)
+            return out, scale_fp8
+        else:
+            raise ValueError(f"Invalid dsv4_moe_sm90_storage: {self._storage!r}")
 
     def execute(
         self,
@@ -247,7 +305,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         )
         m_grouped_fp8_gemm_nt_contiguous(
             (scatter_out, scatter_out_scale),
-            (self._w13, self._s13),
+            self._weight_for_gemm(self._w13, self._s13_fp4, self._s13, aligned_counts),
             gate_up,
             m_indices,
             disable_ue8m0_cast=True,
@@ -264,7 +322,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         down_out = torch.empty(all_tokens, D, device=device, dtype=torch.bfloat16)
         m_grouped_fp8_gemm_nt_contiguous(
             (h_fp8, h_scale),
-            (self._w2, self._s2),
+            self._weight_for_gemm(self._w2, self._s2_fp4, self._s2, aligned_counts),
             down_out,
             m_indices,
             disable_ue8m0_cast=True,
@@ -296,7 +354,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         )
         m_grouped_fp8_gemm_nt_masked(
             (a_fp8, a_scale),
-            (self._w13, self._s13),
+            self._weight_for_gemm(self._w13, self._s13_fp4, self._s13, counts),
             gate_up,
             counts,
             expected_m,
@@ -311,7 +369,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         down = torch.empty((E, M, D), dtype=torch.bfloat16, device=a_fp8.device)
         m_grouped_fp8_gemm_nt_masked(
             (h_fp8, h_scale),
-            (self._w2, self._s2),
+            self._weight_for_gemm(self._w2, self._s2_fp4, self._s2, counts),
             down,
             counts,
             expected_m,
