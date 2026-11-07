@@ -1,5 +1,8 @@
 #pragma once
 
+#include <condition_variable>
+#include <mutex>
+
 #include "aios/network/accl-barex/include/accl/barex/highlevel/xconnection.h"
 #include "aios/network/accl-barex/include/accl/barex/highlevel/xclient_transport.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/MemoryUtil.h"
@@ -20,7 +23,7 @@ public:
     std::shared_ptr<RdmaConnection> getConnection(const std::shared_ptr<::accl::barex::XClientTransport>& client);
     void                            recycleConnection(const std::shared_ptr<RdmaConnection>& connection);
     void                            destroyConnection(const std::shared_ptr<RdmaConnection>& connection);
-    bool                            fillConnectionPool(const std::shared_ptr<::accl::barex::XClientTransport>& client, int count);
+    bool fillConnectionPool(const std::shared_ptr<::accl::barex::XClientTransport>& client, int count);
 
     void connectSuccess(const std::shared_ptr<::accl::barex::XConnection>& connection);
     void connectFailed(const std::shared_ptr<::accl::barex::XConnection>& connection);
@@ -31,7 +34,11 @@ private:
     std::shared_ptr<RdmaConnection>
     getRdmaConnectionFromConnectionPool(std::set<std::shared_ptr<::accl::barex::XConnection>>& connection_pool,
                                         bool                                                   all_connected);
-    std::shared_ptr<RdmaConnection> newRdmaConnection(const std::shared_ptr<::accl::barex::XClientTransport>& client);
+    // Caller holds mutex_.
+    std::shared_ptr<RdmaConnection> takeConnectionLocked(std::set<std::shared_ptr<::accl::barex::XConnection>>& pool,
+                                                         bool all_connected);
+    std::shared_ptr<RdmaConnection> newRdmaConnection(const std::shared_ptr<::accl::barex::XClientTransport>& client,
+                                                      bool reuse_available = false);
     void doRecycleConnections(const std::vector<std::shared_ptr<::accl::barex::XConnection>>& connections);
 
 private:
@@ -41,11 +48,13 @@ private:
     uint32_t                    qp_count_per_rdma_connection_;
     uint32_t                    connect_timeout_ms_;
 
+    // Serialize pool growth, without holding mutex_ across asynchronous Connect callbacks.
+    std::timed_mutex                                      connect_mutex_;
+    std::condition_variable                               connections_changed_;
     std::mutex                                            mutex_;
     std::set<std::shared_ptr<::accl::barex::XConnection>> newly_connections_;      // 新建连接已被预订
     std::set<std::shared_ptr<::accl::barex::XConnection>> available_connections_;  // 可复用
     std::set<std::shared_ptr<::accl::barex::XConnection>> busy_connections_;       // 正在用
-
 };
 
 }  // namespace rtp_llm

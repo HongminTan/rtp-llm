@@ -273,7 +273,8 @@ public:
               uint32_t,
               uint32_t,
               int,
-              int) override {
+              int,
+              std::shared_ptr<CacheLoadControl> = nullptr) override {
         callback(true, CacheStoreErrorCode::None);
     }
 
@@ -284,7 +285,9 @@ public:
                                              int64_t,
                                              LoadContext::CheckCancelFunc,
                                              int,
-                                             int) override {
+                                             int,
+                                             int64_t                           = 0,
+                                             std::shared_ptr<std::atomic_bool> = nullptr) override {
         return nullptr;
     }
 
@@ -384,10 +387,10 @@ GptModelInputs makeInputs(const std::vector<int32_t>&     input_lengths,
     inputs.prefix_lengths      = pinnedTensor(std::vector<int32_t>(batch_size, 0), {static_cast<int64_t>(batch_size)});
     inputs.cache_store_publish_start_tokens =
         pinnedTensor(std::vector<int32_t>(batch_size, 0), {static_cast<int64_t>(batch_size)});
-    inputs.kv_cache_block_id   = pinnedTensor(block_ids,
-                                            {static_cast<int64_t>(group_tags.size()),
-                                             static_cast<int64_t>(batch_size),
-                                             static_cast<int64_t>(block_table_width)});
+    inputs.kv_cache_block_id        = pinnedTensor(block_ids,
+                                                   {static_cast<int64_t>(group_tags.size()),
+                                                    static_cast<int64_t>(batch_size),
+                                                    static_cast<int64_t>(block_table_width)});
     inputs.kv_cache_kernel_block_id = inputs.kv_cache_block_id.clone().pin_memory();
     inputs.request_id               = pinnedLongTensor(request_ids, {static_cast<int64_t>(batch_size)});
     inputs.request_pd_separation    = pinnedBoolTensor(batch_size, true);
@@ -654,17 +657,17 @@ Scenario makeMtpScenario() {
 
 Scenario makeScenario(const std::string& name) {
     if (name == "cyclic_chunk_views") {
-        auto config      = makeCacheConfig({{"swa", 2, 24}, {"full", 2, 16}});
-        auto groups      = config.topology().groups();
-        groups[0].policy = defaultCacheGroupPolicy(CacheGroupType::SWA);
-        auto full_spec                      = groups[1].spec->clone();
+        auto config                          = makeCacheConfig({{"swa", 2, 24}, {"full", 2, 16}});
+        auto groups                          = config.topology().groups();
+        groups[0].policy                     = defaultCacheGroupPolicy(CacheGroupType::SWA);
+        auto full_spec                       = groups[1].spec->clone();
         full_spec->kernel_seq_size_per_block = 1;
-        groups[1].spec                      = std::move(full_spec);
+        groups[1].spec                       = std::move(full_spec);
         config.setTopology(std::move(groups), {LayerBase{kLayerId, {"swa", "full"}}});
         auto layout = makeLayout(config);
         // Both chunk rows use cyclic execution banks, but only the final
         // SWA row exposes its owned tail blocks to cache-store publication.
-        auto inputs = makeInputs(/*input_lengths=*/{4, 4},
+        auto inputs                             = makeInputs(/*input_lengths=*/{4, 4},
                                  /*request_ids=*/{301, 302},
                                  /*cache_keys=*/{3101, 3102, 3103, 3104, 3201, 3202, 0, 0},
                                  /*cache_keys_width=*/4,
@@ -675,9 +678,8 @@ Scenario makeScenario(const std::string& name) {
                                  /*global_stride_bytes=*/24);
         inputs.prefix_lengths                   = pinnedTensor({4, 0}, {2});
         inputs.cache_store_publish_start_tokens = pinnedTensor({4, 0}, {2});
-        inputs.kv_cache_kernel_block_id = pinnedTensor(
-            {3, 4, 3, 4, 0, 0, 0, 0, 5, 6, 5, 6, 0, 0, 0, 0,
-             2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0, 0, 0, 0},
+        inputs.kv_cache_kernel_block_id         = pinnedTensor(
+            {3, 4, 3, 4, 0, 0, 0, 0, 5, 6, 5, 6, 0, 0, 0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0, 0, 0, 0},
             {2, 2, 8});
         return {std::move(config), std::move(layout.layout), std::move(layout.base_addresses), std::move(inputs)};
     }

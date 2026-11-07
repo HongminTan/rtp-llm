@@ -103,7 +103,7 @@ private:
     void
     reportEarlyFinishTask(DecodeGenerateContext& decode_context, int64_t error_code, const std::string& error_message);
 
-    LoadCacheResult        loadCache(const LoadKVCacheContext& load_context);
+    LoadCacheResult        loadCache(const LoadKVCacheContext& load_context, int64_t connect_retries = 0);
     LoadCacheResult        loadCacheForAllRank(DecodeGenerateContext& decode_context);
     LoadCacheResult        loadCacheAsyncForTp(DecodeGenerateContext& decode_context, LoadKVCacheContext& load_context);
     BroadcastLoadRequestPB constructRemoteLoadRequest(const LoadKVCacheContext&       load_context,
@@ -117,7 +117,7 @@ private:
     static void            appendGroupBlockIds(const LoadKVCacheContext& context,
                                                const CacheTopology&      topology,
                                                BroadcastLoadRequestPB&   request);
-    static std::string makeTaggedRequestKey(int64_t request_id, size_t layer_id, const std::string& tag);
+    static std::string     makeTaggedRequestKey(int64_t request_id, size_t layer_id, const std::string& tag);
     static std::string
     makeMTPModuleCacheKey(size_t mtp_base_model_id, const std::string& token_id_str, size_t layer_id);
     static std::vector<MTPModuleLoadPlan> makeMTPModuleLoadPlan(const ProposeModelEngineInitParams* propose_params);

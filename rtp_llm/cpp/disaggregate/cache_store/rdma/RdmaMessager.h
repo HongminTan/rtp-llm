@@ -22,8 +22,8 @@ public:
               const std::shared_ptr<CacheStoreClientLoadMetricsCollector>& collector) override;
 
 private:
-    CacheLoadRequest* makeLoadRequest(const std::shared_ptr<RdmaConnection>& rdma_connection,
-                                      const std::shared_ptr<LoadRequest>&    request);
+    virtual CacheLoadRequest* makeLoadRequest(const std::shared_ptr<RdmaConnection>& rdma_connection,
+                                              const std::shared_ptr<LoadRequest>&    request);
 
     bool generateBlockInfo(::BlockBufferInfo*                  block_info,
                            const std::shared_ptr<BlockBuffer>& block_buffer,

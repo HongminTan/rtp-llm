@@ -465,7 +465,8 @@ public:
               uint32_t,
               uint32_t,
               int,
-              int) override {
+              int,
+              std::shared_ptr<CacheLoadControl> = nullptr) override {
         if (callback) {
             callback(false, CacheStoreErrorCode::InvalidParams);
         }
@@ -478,7 +479,9 @@ public:
                                              int64_t,
                                              LoadContext::CheckCancelFunc,
                                              int,
-                                             int) override {
+                                             int,
+                                             int64_t                           = 0,
+                                             std::shared_ptr<std::atomic_bool> = nullptr) override {
         return nullptr;
     }
 
@@ -615,9 +618,9 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, RecomputePreservesCompactCpReadyPr
             const auto  desc = makeDsv4Desc(tag, "state", 4, DataType::TYPE_FP32);
             const auto  spec = SpecBuilder::build(desc, context);
             CacheConfig config;
-            config.dtype     = context.dtype;
-            config.layer_num = 1;
-            config.seq_size_per_block               = context.seq_size_per_block;
+            config.dtype              = context.dtype;
+            config.layer_num          = 1;
+            config.seq_size_per_block = context.seq_size_per_block;
             config.fromGroupedSpecs({spec}, {{0}}, {CacheGroupType::SWA}, {tag}, {SpecBuilder::groupPolicy(desc)});
             config.setGroupBlockLayout({tag}, {8}, {spec->block_size_bytes()}, {0});
             ASSERT_EQ(config.group(tag).seqSizePerBlock(), device_ready_reuse_length);
@@ -914,7 +917,7 @@ TEST_F(HybridPoolCoordinatorCacheManagerTest, AvailableCapacityAggregatesCanonic
     const size_t total_available             = allocator->availableBlocksNum();
     const size_t tokens_before               = allocator->availableTokensNum();
     const auto   capacity_before             = allocator->tokenCapacity(config.seq_size_per_block);
-    auto expected_available_capacity = [&]() {
+    auto         expected_available_capacity = [&]() {
         return pools[1]->availableBlocksNum() * config.group("full").seqSizePerBlock();
     };
 

@@ -36,6 +36,7 @@ cc_test(
             "RdmaClientHostConnectionsTest.cpp",
             "RdmaConnectionTest.cpp",
             "RdmaMessagerTest.cpp",
+            "RdmaLoadDeadlineTest.cpp",
             "RdmaServerHostConnectionsTest.cpp",
         ],
         "//conditions:default": [],

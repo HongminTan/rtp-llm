@@ -78,7 +78,7 @@ public:
         }
     }
 
-    ScopedDeviceResetForTest(const ScopedDeviceResetForTest&) = delete;
+    ScopedDeviceResetForTest(const ScopedDeviceResetForTest&)            = delete;
     ScopedDeviceResetForTest& operator=(const ScopedDeviceResetForTest&) = delete;
 
 private:
@@ -156,7 +156,8 @@ public:
               uint32_t,
               uint32_t,
               int,
-              int) override {
+              int,
+              std::shared_ptr<CacheLoadControl> = nullptr) override {
         callback(true, CacheStoreErrorCode::None);
     }
 
@@ -167,7 +168,9 @@ public:
                                              int64_t,
                                              LoadContext::CheckCancelFunc,
                                              int,
-                                             int) override {
+                                             int,
+                                             int64_t                           = 0,
+                                             std::shared_ptr<std::atomic_bool> = nullptr) override {
         return nullptr;
     }
 

@@ -6,7 +6,6 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/RemoteStoreTask.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/CacheStoreMetricsCollector.h"
 
-
 #include <memory>
 
 namespace rtp_llm {
@@ -27,7 +26,8 @@ public:
                       uint32_t                                   rdma_port,
                       uint32_t                                   timeout_ms      = 1000,
                       int                                        partition_count = 1,
-                      int                                        partition_id    = 0) = 0;
+                      int                                        partition_id    = 0,
+                      std::shared_ptr<CacheLoadControl>          control         = nullptr) = 0;
 
     virtual std::shared_ptr<LoadContext>
     loadBuffers(const std::vector<std::shared_ptr<RequestBlockBuffer>>& request_block_buffers,
@@ -37,15 +37,17 @@ public:
                 int64_t                                                 timeout_ms,
                 LoadContext::CheckCancelFunc                            check_cancel_func,
                 int                                                     partition_count = 1,
-                int                                                     partition_id    = 0) = 0;
+                int                                                     partition_id    = 0,
+                int64_t                                                 connect_retries = 0,
+                std::shared_ptr<std::atomic_bool>                       request_stopped = nullptr) = 0;
 
     virtual std::shared_ptr<StoreContext>
     storeBuffers(const std::vector<std::shared_ptr<RequestBlockBuffer>>& request_block_buffers, int64_t timeout_ms) = 0;
 
     virtual std::shared_ptr<RemoteStoreTask>
-                 submitRemoteStoreTask(const std::shared_ptr<RemoteStoreRequest>& request,
+                 submitRemoteStoreTask(const std::shared_ptr<RemoteStoreRequest>&                    request,
                                        const std::shared_ptr<CacheStoreRemoteStoreMetricsCollector>& collector,
-                                       RemoteStoreTask::CheckCancelFunc           check_cancel_func) = 0;
+                                       RemoteStoreTask::CheckCancelFunc                              check_cancel_func) = 0;
     virtual void releaseRemoteStoreTask(const std::shared_ptr<RemoteStoreTask>& task)      = 0;
 
     virtual bool                         regUserBuffers(const std::vector<std::shared_ptr<BlockBuffer>>& buffers) = 0;

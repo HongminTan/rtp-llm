@@ -78,7 +78,8 @@ public:
               uint32_t,
               uint32_t,
               int,
-              int) override {
+              int,
+              std::shared_ptr<CacheLoadControl> = nullptr) override {
         if (callback) {
             callback(false, CacheStoreErrorCode::InvalidParams);
         }
@@ -91,7 +92,9 @@ public:
                                              int64_t,
                                              LoadContext::CheckCancelFunc,
                                              int,
-                                             int) override {
+                                             int,
+                                             int64_t                           = 0,
+                                             std::shared_ptr<std::atomic_bool> = nullptr) override {
         return nullptr;
     }
 

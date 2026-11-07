@@ -217,7 +217,8 @@ void NormalCacheStore::load(const std::shared_ptr<RequestBlockBuffer>& request_b
                             uint32_t                                   rdma_port,
                             uint32_t                                   timeout_ms,
                             int                                        partition_count,
-                            int                                        partition_id) {
+                            int                                        partition_id,
+                            std::shared_ptr<CacheLoadControl>          control) {
     if (request_block_buffer == nullptr || !request_block_buffer->isValid() || ip.empty()) {
         RTP_LLM_LOG_WARNING("normal cache store run load failed, invalid params");
         callback(false, CacheStoreErrorCode::InvalidParams);
@@ -247,17 +248,27 @@ void NormalCacheStore::load(const std::shared_ptr<RequestBlockBuffer>& request_b
                  timeout_ms,
                  collector,
                  partition_count,
-                 partition_id]() {
+                 partition_id,
+                 control]() {
         if (!tryPinThreadDevice(this->device_id_, "normal cache store load task")) {
             collector->markEnd(false);
             callback(false, CacheStoreErrorCode::LoadErrorUnknown);
             return;
         }
-        this->runLoadTask(
-            request_block_buffer, callback, ip, port, rdma_port, timeout_ms, collector, partition_count, partition_id);
+        this->runLoadTask(request_block_buffer,
+                          callback,
+                          ip,
+                          port,
+                          rdma_port,
+                          timeout_ms,
+                          collector,
+                          partition_count,
+                          partition_id,
+                          control);
     };
 
-    if (thread_pool_->pushTask(task) != autil::ThreadPoolBase::ERROR_NONE) {
+    if (thread_pool_->pushTask(task, /*isBlocked=*/!control, /*executeWhenFail=*/false)
+        != autil::ThreadPoolBase::ERROR_NONE) {
         RTP_LLM_LOG_WARNING("normal cache store push load task for request id [%s] to thread pool failed",
                             request_block_buffer->getRequestId().c_str());
         collector->markEnd(false);
@@ -274,10 +285,21 @@ void NormalCacheStore::runLoadTask(const std::shared_ptr<RequestBlockBuffer>&   
                                    uint32_t                                                     timeout_ms,
                                    const std::shared_ptr<CacheStoreClientLoadMetricsCollector>& collector,
                                    int                                                          partition_count,
-                                   int                                                          partition_id) {
+                                   int                                                          partition_id,
+                                   std::shared_ptr<CacheLoadControl>                            control) {
     collector->markTaskRun();
+    if (control) {
+        const auto remaining_ms = control->remainingMs();
+        if (control->isStopped() || remaining_ms <= 0) {
+            collector->markEnd(false);
+            callback(false, CacheStoreErrorCode::LoadBufferTimeout);
+            return;
+        }
+        timeout_ms = remaining_ms;
+    }
     auto load_request = std::make_shared<LoadRequest>(
         ip, port, rdma_port, request_block_buffer, callback, timeout_ms, partition_count, partition_id);
+    load_request->control = std::move(control);
     messager_->load(load_request, collector);
 }
 
@@ -289,14 +311,24 @@ NormalCacheStore::loadBuffers(const std::vector<std::shared_ptr<RequestBlockBuff
                               int64_t                                                 timeout_ms,
                               LoadContext::CheckCancelFunc                            check_cancel_func,
                               int                                                     partition_count,
-                              int                                                     partition_id) {
+                              int                                                     partition_id,
+                              int64_t                                                 connect_retries,
+                              std::shared_ptr<std::atomic_bool>                       request_stopped) {
     if (request_block_buffers.empty() || ip.empty()) {
         return nullptr;
     }
 
     auto load_context = std::make_shared<LoadContext>(shared_from_this(), memory_util_->isRdmaMode());
-    load_context->load(
-        request_block_buffers, ip, port, rdma_port, timeout_ms, check_cancel_func, partition_count, partition_id);
+    load_context->load(request_block_buffers,
+                       ip,
+                       port,
+                       rdma_port,
+                       timeout_ms,
+                       check_cancel_func,
+                       partition_count,
+                       partition_id,
+                       connect_retries,
+                       std::move(request_stopped));
     return load_context;
 }
 

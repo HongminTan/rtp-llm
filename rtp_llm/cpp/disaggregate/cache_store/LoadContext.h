@@ -28,7 +28,7 @@ public:
     void waitDone();
 
     bool                     success() const;
-    const ErrorInfo&         getErrorInfo() const;
+    ErrorInfo                getErrorInfo() const;
     std::string              getErrorInfoString() const;
     std::vector<std::string> failedBlockDebugInfos() const;
 
@@ -36,6 +36,11 @@ public:
     updateResult(bool success, CacheStoreErrorCode ec, const std::shared_ptr<RequestBlockBuffer>& request_block_buffer);
 
 protected:
+    void updateResultLocked(bool                                       success,
+                            CacheStoreErrorCode                        ec,
+                            const std::shared_ptr<RequestBlockBuffer>& request_block_buffer);
+    void finishErrorLocked(ErrorCode code);
+
     virtual bool doCall(const std::shared_ptr<RequestBlockBuffer>& request_block_buffer, int64_t timeout_ms) = 0;
 
 protected:
@@ -46,10 +51,12 @@ protected:
     std::vector<std::shared_ptr<RequestBlockBuffer>> failed_request_block_buffers_;
     ErrorInfo                                        error_info_;
 
-    int64_t         start_time_ms_     = 0;
-    int64_t         deadline_ms_       = 0;
-    bool            timed_out_         = false;
-    CheckCancelFunc check_cancel_func_ = nullptr;
+    int64_t                           start_time_ms_ = 0;
+    int64_t                           deadline_ms_   = 0;
+    bool                              timed_out_     = false;
+    bool                              finished_      = false;
+    std::shared_ptr<CacheLoadControl> load_control_;
+    CheckCancelFunc                   check_cancel_func_ = nullptr;
 
     mutable std::mutex      mutex_;
     std::condition_variable cond_;
@@ -69,12 +76,22 @@ public:
               int64_t                                                 timeout_ms,
               CheckCancelFunc                                         check_cancel_func,
               int                                                     partition_count,
-              int                                                     partition_id);
+              int                                                     partition_id,
+              int64_t                                                 connect_retries = 0,
+              std::shared_ptr<std::atomic_bool>                       request_stopped = nullptr);
 
 protected:
     bool doCall(const std::shared_ptr<RequestBlockBuffer>& request_block_buffer, int64_t timeout_ms) override;
 
 private:
+    void     onLoadDone(const std::shared_ptr<RequestBlockBuffer>& buffer,
+                        uint64_t                                   attempt,
+                        bool                                       success,
+                        CacheStoreErrorCode                        ec);
+    int64_t  retries_left_     = 0;
+    uint64_t attempt_id_       = 0;
+    bool     attempt_finished_ = false;
+
     std::string peer_ip_;
     uint32_t    port_;
     uint32_t    rdma_port_;

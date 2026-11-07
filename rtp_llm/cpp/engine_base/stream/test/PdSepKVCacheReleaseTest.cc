@@ -88,9 +88,10 @@ public:
               const std::string&,
               uint32_t,
               uint32_t,
-              uint32_t = 1000,
-              int      = 1,
-              int      = 0) override {
+              uint32_t                          = 1000,
+              int                               = 1,
+              int                               = 0,
+              std::shared_ptr<CacheLoadControl> = nullptr) override {
         bool ok = true;
         for (const auto& [key, block] : request_block_buffer->getBlocks()) {
             auto it = stored_blocks_.find(key);
@@ -119,12 +120,22 @@ public:
                 int64_t                                                 timeout_ms,
                 LoadContext::CheckCancelFunc                            check_cancel_func,
                 int                                                     partition_count,
-                int                                                     partition_id) override {
+                int                                                     partition_id,
+                int64_t                                                 connect_retries = 0,
+                std::shared_ptr<std::atomic_bool>                       request_stopped = nullptr) override {
         load_buffer_requests_.insert(
             load_buffer_requests_.end(), request_block_buffers.begin(), request_block_buffers.end());
         auto context = std::make_shared<LoadContext>(shared_from_this(), false);
-        context->load(
-            request_block_buffers, ip, port, rdma_port, timeout_ms, check_cancel_func, partition_count, partition_id);
+        context->load(request_block_buffers,
+                      ip,
+                      port,
+                      rdma_port,
+                      timeout_ms,
+                      check_cancel_func,
+                      partition_count,
+                      partition_id,
+                      connect_retries,
+                      std::move(request_stopped));
         return context;
     }
 
@@ -263,7 +274,7 @@ torch_ext::PyCacheStoreInputs makeDsv4WriteInputs(int64_t                       
     inputs.request_id            = torch::tensor({request_id}, torch::kInt64);
     inputs.request_pd_separation = torch::tensor({true}, torch::kBool);
     inputs.cache_keys            = torch::from_blob(const_cast<CacheKeyType*>(cache_keys.data()),
-                                         {1, (int64_t)cache_keys.size()},
+                                                    {1, (int64_t)cache_keys.size()},
                                          torch::TensorOptions(torch::kInt64))
                             .clone();
     return inputs;
@@ -1491,7 +1502,7 @@ TEST_F(PdSepKVCacheReleaseTest, testWriteCacheStoreWithPinnedHostMetadataAndEven
     // --- Call runtimeWriteCacheStore (event->synchronize() inside) ---
     auto cache_store = std::make_shared<MemoryBackedCacheStore>();
     auto block_ids   = torch::from_blob(const_cast<int*>(resource->blocks(0, "default").data()),
-                                      {1, (int64_t)resource->blocks(0, "default").size()},
+                                        {1, (int64_t)resource->blocks(0, "default").size()},
                                       torch::kInt32)
                          .clone();
 

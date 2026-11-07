@@ -31,7 +31,8 @@ public:
               uint32_t                                   rdma_port,
               uint32_t                                   timeout_ms      = 1000,
               int                                        partition_count = 1,
-              int                                        partition_id    = 0) override;
+              int                                        partition_id    = 0,
+              std::shared_ptr<CacheLoadControl>          control         = nullptr) override;
 
     std::shared_ptr<LoadContext>
     loadBuffers(const std::vector<std::shared_ptr<RequestBlockBuffer>>& request_block_buffers,
@@ -41,15 +42,18 @@ public:
                 int64_t                                                 timeout_ms,
                 LoadContext::CheckCancelFunc                            check_cancel_func,
                 int                                                     partition_count,
-                int                                                     partition_id) override;
+                int                                                     partition_id,
+                int64_t                                                 connect_retries = 0,
+                std::shared_ptr<std::atomic_bool>                       request_stopped = nullptr) override;
     std::shared_ptr<StoreContext>
     storeBuffers(const std::vector<std::shared_ptr<RequestBlockBuffer>>& request_block_buffers,
                  int64_t                                                 timeout_ms) override;
 
-    std::shared_ptr<RemoteStoreTask> submitRemoteStoreTask(const std::shared_ptr<RemoteStoreRequest>& request,
-                                                           const std::shared_ptr<CacheStoreRemoteStoreMetricsCollector>& collector,
-                                                           RemoteStoreTask::CheckCancelFunc check_cancel_func) override;
-    void                             releaseRemoteStoreTask(const std::shared_ptr<RemoteStoreTask>& task) override;
+    std::shared_ptr<RemoteStoreTask>
+         submitRemoteStoreTask(const std::shared_ptr<RemoteStoreRequest>&                    request,
+                               const std::shared_ptr<CacheStoreRemoteStoreMetricsCollector>& collector,
+                               RemoteStoreTask::CheckCancelFunc                              check_cancel_func) override;
+    void releaseRemoteStoreTask(const std::shared_ptr<RemoteStoreTask>& task) override;
 
     bool                         regUserBuffers(const std::vector<std::shared_ptr<BlockBuffer>>& buffers) override;
     std::shared_ptr<BlockBuffer> findUserBuffer(const std::string& buffer_key) override;
@@ -74,7 +78,8 @@ private:
                      uint32_t                                                     timeout_ms,
                      const std::shared_ptr<CacheStoreClientLoadMetricsCollector>& collelctor,
                      int                                                          partition_count,
-                     int                                                          partition_id);
+                     int                                                          partition_id,
+                     std::shared_ptr<CacheLoadControl>                            control);
 
     const std::shared_ptr<RequestBlockBufferStore>& getRequestBlockBufferStore() const;
 
@@ -90,7 +95,9 @@ private:
     std::shared_mutex                                                                remote_store_tasks_mutex_;
     std::unordered_map<std::string, std::list<std::shared_ptr<RemoteStoreTaskImpl>>> remote_store_tasks_;
     std::shared_mutex                                                                store_tasks_mutex_;
-    std::unordered_map<std::shared_ptr<RequestBlockBuffer>, std::pair<CacheStoreStoreDoneCallback, std::function<void()>>> store_tasks_;
+    std::unordered_map<std::shared_ptr<RequestBlockBuffer>,
+                       std::pair<CacheStoreStoreDoneCallback, std::function<void()>>>
+        store_tasks_;
 };
 
 }  // namespace rtp_llm

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <memory>
 #include <string>
 #include <functional>
 #include <stdint.h>
@@ -8,6 +11,26 @@
 #include <sstream>
 
 namespace rtp_llm {
+
+// Shared by one peer's attempts. Contains no request-stack references; queued
+// tasks and completion callbacks may outlive the thread waiting for the load.
+struct CacheLoadControl {
+    CacheLoadControl(int64_t timeout_ms, std::shared_ptr<std::atomic_bool> request_stopped):
+        deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)),
+        request_stopped(std::move(request_stopped)) {}
+
+    int64_t remainingMs() const {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
+            .count();
+    }
+    bool isStopped() const {
+        return stopped.load() || (request_stopped && request_stopped->load());
+    }
+
+    const std::chrono::steady_clock::time_point deadline;
+    const std::shared_ptr<std::atomic_bool>     request_stopped;
+    std::atomic_bool                            stopped{false};
+};
 
 enum class CacheStoreErrorCode {
     None = 0,

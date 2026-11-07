@@ -14,6 +14,7 @@ struct LoadRequest {
     std::shared_ptr<RequestBlockBuffer> request_block_buffer;
     CacheStoreLoadDoneCallback          callback;
     uint32_t                            timeout_ms;
+    std::shared_ptr<CacheLoadControl>   control;
     int                                 partition_count;
     int                                 partition_id;
     LoadRequest(const std::string&                         ip,

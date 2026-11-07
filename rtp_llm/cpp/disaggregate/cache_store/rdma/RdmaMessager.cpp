@@ -69,6 +69,11 @@ bool RdmaMessager::init(MessagerInitParams params) {
 
 void RdmaMessager::load(const std::shared_ptr<LoadRequest>&                          request,
                         const std::shared_ptr<CacheStoreClientLoadMetricsCollector>& collector) {
+    if (request->control && (request->control->isStopped() || request->control->remainingMs() <= 10)) {
+        collector->markEnd(false);
+        request->callback(false, CacheStoreErrorCode::LoadBufferTimeout);
+        return;
+    }
     auto channel = tcp_client_->getChannel(request->ip, request->port);
     if (channel == nullptr) {
         RTP_LLM_LOG_WARNING("messager client get channel failed, ip %s:%u", request->ip.c_str(), request->port);
@@ -86,12 +91,39 @@ void RdmaMessager::load(const std::shared_ptr<LoadRequest>&                     
         return;
     }
 
+    // makeLoadRequest reserves 10ms for the response; do not underflow its unsigned timeout.
+    if (request->control) {
+        const auto remaining_ms = request->control->remainingMs();
+        if (request->control->isStopped() || remaining_ms <= 10) {
+            rdma_client_->recycleConnection(rdma_connection);
+            collector->markEnd(false);
+            request->callback(false, CacheStoreErrorCode::LoadBufferTimeout);
+            return;
+        }
+        request->timeout_ms = remaining_ms;
+    }
     auto load_request = makeLoadRequest(rdma_connection, request);
     if (load_request == nullptr) {
         RTP_LLM_LOG_WARNING("messager client generate load request failed");
         collector->markEnd(false);
         request->callback(false, CacheStoreErrorCode::LoadSendRequestFailed);
         return;
+    }
+
+    // Request construction can consume the remaining budget or race cancellation.
+    // Check before handing ownership to the RPC closure, and charge construction
+    // time to both the client RPC timeout and the peer's buffer-wait timeout.
+    if (request->control) {
+        const auto remaining_ms = request->control->remainingMs();
+        if (request->control->isStopped() || remaining_ms <= 10) {
+            delete load_request;
+            rdma_client_->recycleConnection(rdma_connection);
+            collector->markEnd(false);
+            request->callback(false, CacheStoreErrorCode::LoadBufferTimeout);
+            return;
+        }
+        request->timeout_ms = remaining_ms;
+        load_request->set_timeout_ms(remaining_ms - 10);
     }
 
     arpc::ANetRPCController* controller = new arpc::ANetRPCController();
@@ -133,7 +165,7 @@ CacheLoadRequest* RdmaMessager::makeLoadRequest(const std::shared_ptr<RdmaConnec
 
     auto connections = rdma_connection->getAllConnections();
     for (auto& conn : connections) {
-        auto local = conn->GetLocalAddrAndPort();
+        auto local            = conn->GetLocalAddrAndPort();
         auto connection_proto = load_request->add_rdma_connections();
         connection_proto->set_ip(local.first);
         connection_proto->set_port(local.second);

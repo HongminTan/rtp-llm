@@ -1,5 +1,7 @@
 #include "rtp_llm/cpp/disaggregate/cache_store/LoadContext.h"
 
+#include <algorithm>
+
 #include "rtp_llm/cpp/disaggregate/cache_store/CacheStore.h"
 #include "rtp_llm/cpp/disaggregate/cache_store/ErrorCodeUtil.h"
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -53,6 +55,28 @@ void SyncContext::updateResult(bool                                       succes
                                CacheStoreErrorCode                        ec,
                                const std::shared_ptr<RequestBlockBuffer>& request_block_buffer) {
     std::lock_guard<std::mutex> lock(mutex_);
+    updateResultLocked(success, ec, request_block_buffer);
+}
+
+void SyncContext::finishErrorLocked(ErrorCode code) {
+    if (finished_) {
+        return;
+    }
+    error_info_ = ErrorInfo(code, ErrorCodeToString(code));
+    timed_out_  = code == ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT;
+    finished_   = true;
+    if (load_control_) {
+        load_control_->stopped.store(true);
+    }
+    cond_.notify_all();
+}
+
+void SyncContext::updateResultLocked(bool                                       success,
+                                     CacheStoreErrorCode                        ec,
+                                     const std::shared_ptr<RequestBlockBuffer>& request_block_buffer) {
+    if (finished_) {
+        return;
+    }
     if (!success) {
         auto error_code = transCacheStoreErrorCode(ec);
         error_info_     = ErrorInfo(error_code, ErrorCodeToString(error_code));
@@ -70,39 +94,36 @@ void SyncContext::updateResult(bool                                       succes
     }
 
     if (++done_layer_cnt_ == expect_layer_cnt_) {
+        finished_ = true;
+        if (load_control_) {
+            load_control_->stopped.store(true);
+        }
         cond_.notify_all();
     }
 }
 
 void SyncContext::waitDone() {
     std::unique_lock<std::mutex> lock(mutex_);
-    auto                         once_time_ms = 30;
-    while (true) {
-        if (done_layer_cnt_ == expect_layer_cnt_) {
+    while (!finished_ && done_layer_cnt_ != expect_layer_cnt_) {
+        // Only the waiting thread invokes check_cancel_func_, which may capture references to the RPC stack.
+        if (check_cancel_func_ && check_cancel_func_()) {
+            if (load_control_ && load_control_->request_stopped) {
+                load_control_->request_stopped->store(true);
+            }
+            finishErrorLocked(ErrorCode::CANCELLED);
             return;
         }
-
-        if (autil::TimeUtility::currentTimeInMilliSeconds() >= deadline_ms_) {
-            auto error_code = ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT;
-            error_info_     = ErrorInfo(error_code, ErrorCodeToString(error_code));
-            timed_out_      = true;
-            RTP_LLM_LOG_INFO("load context wait done on timeout");
+        if (load_control_ && load_control_->isStopped()) {
+            finishErrorLocked(ErrorCode::CANCELLED);
             return;
         }
-
-        if (check_cancel_func_ != nullptr && check_cancel_func_()) {
-            auto error_code = ErrorCode::CANCELLED;
-            error_info_     = ErrorInfo(error_code, ErrorCodeToString(error_code));
-            RTP_LLM_LOG_INFO("load context wait done on cancelled");
+        if (load_control_ ? load_control_->remainingMs() <= 0 :
+                            autil::TimeUtility::currentTimeInMilliSeconds() >= deadline_ms_) {
+            finishErrorLocked(ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT);
             return;
         }
-
-        // sync wait, safe to use this
-        if (cond_.wait_for(lock, std::chrono::milliseconds(once_time_ms), [this] {
-                return done_layer_cnt_ == expect_layer_cnt_;
-            })) {
-            return;
-        }
+        cond_.wait_for(
+            lock, std::chrono::milliseconds(30), [this] { return finished_ || done_layer_cnt_ == expect_layer_cnt_; });
     }
 }
 
@@ -116,7 +137,7 @@ std::string SyncContext::getErrorInfoString() const {
     return error_info_.ToString();
 }
 
-const ErrorInfo& SyncContext::getErrorInfo() const {
+ErrorInfo SyncContext::getErrorInfo() const {
     std::unique_lock<std::mutex> lock(mutex_);
     return error_info_;
 }
@@ -147,7 +168,13 @@ void LoadContext::load(const std::vector<std::shared_ptr<RequestBlockBuffer>>& r
                        int64_t                                                 timeout_ms,
                        CheckCancelFunc                                         check_cancel_func,
                        int                                                     partition_count,
-                       int                                                     partition_id) {
+                       int                                                     partition_id,
+                       int64_t                                                 connect_retries,
+                       std::shared_ptr<std::atomic_bool>                       request_stopped) {
+    retries_left_ = combine_load_ ? std::max<int64_t>(0, connect_retries) : 0;
+    if (combine_load_ && (connect_retries > 0 || request_stopped)) {
+        load_control_ = std::make_shared<CacheLoadControl>(timeout_ms, std::move(request_stopped));
+    }
     peer_ip_         = ip;
     port_            = port;
     rdma_port_       = rdma_port;
@@ -156,12 +183,74 @@ void LoadContext::load(const std::vector<std::shared_ptr<RequestBlockBuffer>>& r
     call(request_block_buffer, timeout_ms, check_cancel_func);
 }
 
-bool LoadContext::doCall(const std::shared_ptr<RequestBlockBuffer>& request_block_buffer, int64_t timeout_ms) {
-    auto cache_store = cache_store_.lock();
+void LoadContext::onLoadDone(const std::shared_ptr<RequestBlockBuffer>& buffer,
+                             uint64_t                                   attempt,
+                             bool                                       success,
+                             CacheStoreErrorCode                        ec) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (finished_ || attempt != attempt_id_ || attempt_finished_) {
+            return;
+        }
+        attempt_finished_ = true;
+        if (load_control_->isStopped()) {
+            finishErrorLocked(ErrorCode::CANCELLED);
+            return;
+        }
+        if (load_control_->remainingMs() <= 0) {
+            finishErrorLocked(ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT);
+            return;
+        }
+        if (success || retries_left_ == 0
+            || (ec != CacheStoreErrorCode::LoadConnectFailed && ec != CacheStoreErrorCode::LoadRdmaConnectFailed)) {
+            updateResultLocked(success, ec, buffer);
+            return;
+        }
+        --retries_left_;
+        RTP_LLM_LOG_INFO("request %s retry load to %s:%u after %s, retries left %ld",
+                         buffer->getRequestKey().c_str(),
+                         peer_ip_.c_str(),
+                         rdma_port_,
+                         CacheStoreErrorCodeToString(ec).c_str(),
+                         retries_left_);
+    }
+    // NormalCacheStore queues the attempt without blocking. Never wait for a
+    // connection or completion while running an IO/worker completion callback.
+    doCall(buffer, load_control_->remainingMs());
+}
 
-    auto load_layer_callback = [request_block_buffer, shared_this = shared_from_this()](bool                success,
-                                                                                        CacheStoreErrorCode ec) {
-        shared_this->updateResult(success, ec, request_block_buffer);
+bool LoadContext::doCall(const std::shared_ptr<RequestBlockBuffer>& request_block_buffer, int64_t timeout_ms) {
+    uint64_t attempt = 0;
+    if (load_control_) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (finished_) {
+            return true;
+        }
+        if (load_control_->isStopped()) {
+            finishErrorLocked(ErrorCode::CANCELLED);
+            return true;
+        }
+        timeout_ms = load_control_->remainingMs();
+        if (timeout_ms <= 0) {
+            finishErrorLocked(ErrorCode::CACHE_STORE_LOAD_BUFFER_TIMEOUT);
+            return true;
+        }
+        attempt           = ++attempt_id_;
+        attempt_finished_ = false;
+    }
+    auto cache_store = cache_store_.lock();
+    if (!cache_store) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        finishErrorLocked(ErrorCode::UNKNOWN_ERROR);
+        return true;
+    }
+    auto self                = std::static_pointer_cast<LoadContext>(shared_from_this());
+    auto load_layer_callback = [request_block_buffer, self, attempt](bool success, CacheStoreErrorCode ec) {
+        if (self->load_control_) {
+            self->onLoadDone(request_block_buffer, attempt, success, ec);
+        } else {
+            self->updateResult(success, ec, request_block_buffer);
+        }
     };
     cache_store->load(request_block_buffer,
                       load_layer_callback,
@@ -170,7 +259,8 @@ bool LoadContext::doCall(const std::shared_ptr<RequestBlockBuffer>& request_bloc
                       rdma_port_,
                       timeout_ms,
                       partition_count_,
-                      partition_id_);
+                      partition_id_,
+                      load_control_);
     return true;
 }
 
