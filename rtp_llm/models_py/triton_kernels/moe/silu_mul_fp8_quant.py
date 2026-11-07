@@ -65,8 +65,10 @@ def _silu_mul_fp8_quant_packed_kernel(
 ):
     N_2: tl.constexpr = N // 2
 
-    pid_pack = tl.program_id(0).to(tl.int64)  # which packed-int32 column (= 4 groups)
-    pid_m = tl.program_id(1).to(tl.int64)  # which BLOCK_M row tile
+    NUM_PACKS: tl.constexpr = (NUM_GROUPS + 3) // 4
+    pid = tl.program_id(0).to(tl.int64)
+    pid_pack = pid % NUM_PACKS
+    pid_m = pid // NUM_PACKS
     m_offset = pid_m * BLOCK_M
 
     if m_offset >= M:
@@ -156,8 +158,10 @@ def _silu_mul_fp8_quant_packed_split_kernel(
     BLOCK_M: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
 ):
-    pid_pack = tl.program_id(0).to(tl.int64)
-    pid_m = tl.program_id(1).to(tl.int64)
+    NUM_PACKS: tl.constexpr = (NUM_GROUPS + 3) // 4
+    pid = tl.program_id(0).to(tl.int64)
+    pid_pack = pid % NUM_PACKS
+    pid_m = pid // NUM_PACKS
     m_offset = pid_m * BLOCK_M
 
     if m_offset >= M:
@@ -274,7 +278,7 @@ def silu_mul_fp8_quant_packed(
         output_scale_packed = output_scale
 
     BLOCK_M = 8
-    grid = (num_packed_groups, (M + BLOCK_M - 1) // BLOCK_M)
+    grid = (num_packed_groups * triton.cdiv(M, BLOCK_M),)
 
     num_warps = max(4, group_size // 32)
     num_stages = 2
@@ -353,7 +357,7 @@ def silu_mul_fp8_quant_packed_from_parts(
         return output_q, output_scale_packed
 
     BLOCK_M = 8
-    grid = (num_packed_groups, (M + BLOCK_M - 1) // BLOCK_M)
+    grid = (num_packed_groups * triton.cdiv(M, BLOCK_M),)
     has_clamp = clamp_limit > 0
     _silu_mul_fp8_quant_packed_split_kernel[grid](
         gate,
@@ -400,8 +404,11 @@ def _silu_mul_fp8_quant_f32_scale_dense_kernel(
 ):
     N_2: tl.constexpr = N // 2
 
-    pid_g = tl.program_id(0).to(tl.int64)
-    pid_m = tl.program_id(1).to(tl.int64)
+    # A 1D grid avoids the 65535-block Y limit; adjacent blocks process groups.
+    NUM_GROUPS: tl.constexpr = N_2 // GROUP_SIZE
+    pid = tl.program_id(0).to(tl.int64)
+    pid_g = pid % NUM_GROUPS
+    pid_m = pid // NUM_GROUPS
     m_offset = pid_m * BLOCK_M
 
     offs_m = tl.arange(0, BLOCK_M).to(tl.int64)
@@ -652,7 +659,7 @@ def silu_mul_fp8_quant_f32_scale(
         return output_q, output_scale
 
     BLOCK_M = 8
-    grid = (num_groups_per_row, triton.cdiv(M, BLOCK_M))
+    grid = (num_groups_per_row * triton.cdiv(M, BLOCK_M),)
     num_warps = max(4, group_size // 32)
     _silu_mul_fp8_quant_f32_scale_dense_kernel[grid](
         gate_up,

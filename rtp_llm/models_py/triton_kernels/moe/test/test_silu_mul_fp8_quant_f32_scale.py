@@ -42,6 +42,42 @@ class SiluMulFp8QuantF32ScaleTest(unittest.TestCase):
         )
         self._assert_quantization(q, scales, *self._reference(inputs, 1.5))
 
+    def test_dense_large_m(self):
+        from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
+            silu_mul_fp8_quant_f32_scale,
+        )
+
+        # Exceed 65535 row tiles at BLOCK_M=8 and exercise a partial final tile.
+        m, inter = 65535 * 8 + 1, 256
+        torch.manual_seed(46)
+        tile = torch.randn((17, 2 * inter), device="cuda", dtype=torch.bfloat16) * 4
+        tile[0] = 0
+        inputs = tile.repeat((m + 16) // 17, 1)[:m]
+        ref_q, ref_scales = silu_mul_fp8_quant_f32_scale(tile, clamp_limit=7.0)
+        self._assert_quantization(ref_q, ref_scales, *self._reference(tile, 7.0))
+        q_storage = torch.full(
+            (m + 1, inter), 7.0, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        scale_storage = torch.full((m + 1, inter // 128), -123.0, device="cuda")
+        q, scales = silu_mul_fp8_quant_f32_scale(
+            inputs,
+            clamp_limit=7.0,
+            output_q=q_storage[:m],
+            output_scale=scale_storage[:m],
+        )
+        # Bound reference memory while checking every output row.
+        for start in range(0, m, 16384):
+            end = min(m, start + 16384)
+            ids = torch.arange(start, end, device="cuda") % tile.shape[0]
+            self.assertTrue(
+                torch.equal(
+                    q[start:end].view(torch.uint8), ref_q.view(torch.uint8)[ids]
+                )
+            )
+            self.assertTrue(torch.equal(scales[start:end], ref_scales[ids]))
+        self.assertTrue(torch.all(q_storage[-1].float() == 7.0).item())
+        self.assertTrue(torch.all(scale_storage[-1] == -123.0).item())
+
     def test_dense_mn_major_scale_matches_row_major(self):
         from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
             silu_mul_fp8_quant_f32_scale,
