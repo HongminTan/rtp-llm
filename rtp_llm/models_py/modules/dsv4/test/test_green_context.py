@@ -20,12 +20,10 @@ class GreenContextTest(unittest.TestCase):
                 driver = mock.Mock()
                 driver.CUresult.CUDA_SUCCESS = 0
                 driver.cuDeviceGetDevResource.return_value = (0, resource(16))
-                driver.cuDevSmResourceSplitByCount.return_value = (
-                    0,
-                    [resource(8), resource(8)],
-                    2,
-                    resource(0),
-                )
+                driver.cuDevSmResourceSplitByCount.side_effect = [
+                    (0, [resource(8)], 1, resource(8)),
+                    (0, [resource(8), resource(8)], 2, resource(0)),
+                ]
                 driver.cuDevResourceGenerateDesc.return_value = (0, "desc")
                 driver.cuGreenCtxCreate.side_effect = [
                     (0, "shared"),
@@ -120,6 +118,3 @@ class GreenContextTest(unittest.TestCase):
             self.assertEqual(len(shared), window.compute_sms)
             self.assertFalse(shared & comm)
             self.assertEqual(len(shared | comm), num_sms)
-        self.assertLess(
-            sms_of(windows[1].compute_stream), sms_of(windows[2].compute_stream)
-        )

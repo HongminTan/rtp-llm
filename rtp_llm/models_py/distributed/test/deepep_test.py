@@ -25,6 +25,7 @@ from rtp_llm.models_py.distributed.collective_torch import (
 from rtp_llm.models_py.distributed.deepep_wrapper import (
     DeepEPBuffer,
     DeepEPConfig,
+    DeepEPMode,
     DeepEPWrapper,
     DeepepWrapperConfig,
     init_deepep_wrapper,
@@ -77,8 +78,8 @@ def calc_ll_num_max_token_per_rank(max_generate_batch_size: int, tp_size: int) -
 
 
 class DeepEPStreamConfigTest(TestCase):
-    def test_router_uses_buffer_creation_stream_setting(self):
-        from rtp_llm.models_py.distributed import deepep_wrapper as wrapper_module
+    def test_router_launches_on_current_stream_follows_hook_mode(self):
+        """deep_ep 2.x: hook mode is what puts LL kernels on the caller stream."""
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers import (
             deepep_low_latency_router as router_module,
         )
@@ -92,20 +93,27 @@ class DeepEPStreamConfigTest(TestCase):
             tp_size=1,
             moe_k=8,
         )
-        for initial, expected in (("1", True), ("0", False), ("invalid", False)):
-            with self.subTest(initial=initial), patch.dict(
-                os.environ, {"ACCL_LOW_LATENCY_USE_COMPUTE_STREAM": initial}
-            ), patch.object(wrapper_module, "DeepEPBuffer", Mock()), patch.object(
-                wrapper_module, "_DeepEPRuntimeBuffer", None
-            ):
+        cases = (
+            (True, "auto", None, True),
+            (True, "overlap", None, True),
+            (True, "sequential", None, False),
+            (False, "auto", None, False),
+            (False, "overlap", None, False),
+            (True, "overlap", "1", True),
+            (True, "overlap", "0", False),
+            (True, "overlap", "invalid", False),
+        )
+        for sm90, mode, hook_env, expected in cases:
+            with self.subTest(sm90=sm90, mode=mode, hook_env=hook_env), patch.dict(
+                os.environ, {"MOE_SHARED_EXPERT_MODE": mode}
+            ), patch.object(router_module, "is_sm90", return_value=sm90):
+                os.environ.pop("DSV4_LL_RECV_HOOK", None)
+                if hook_env is not None:
+                    os.environ["DSV4_LL_RECV_HOOK"] = hook_env
                 wrapper = object.__new__(DeepEPWrapper)
                 wrapper._config = config
-                wrapper._mode = wrapper_module.DeepEPMode.LOW_LATENCY
-                wrapper._buffer = wrapper._init_low_latency_buffer(Mock())
-                self.assertIs(wrapper.uses_compute_stream, expected)
-                os.environ["ACCL_LOW_LATENCY_USE_COMPUTE_STREAM"] = (
-                    "0" if expected else "1"
-                )
+                wrapper._mode = DeepEPMode.LOW_LATENCY
+                wrapper._buffer = Mock()
                 with patch.object(
                     router_module.DeepEPWrapper, "get_instance", return_value=wrapper
                 ), patch.object(
@@ -117,6 +125,10 @@ class DeepEPStreamConfigTest(TestCase):
                         config, SimpleNamespace(is_quantized=False)
                     )
                 self.assertIs(router._launches_on_current_stream, expected)
+                self.assertEqual(
+                    os.environ.get("DSV4_LL_RECV_HOOK"),
+                    "1" if hook_env is None and expected else hook_env,
+                )
 
 
 class DeepEPTest(TestCase):

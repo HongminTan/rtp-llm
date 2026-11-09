@@ -343,9 +343,7 @@ class GroupedFp4Sm90Executor(Fp8Fp4ExecutorBase):
         if a_fp8.dtype != torch.float8_e4m3fn or a_scale.dtype != torch.float32:
             raise ValueError("DeepEP LL must return FP8 data and unpacked FP32 scales")
         if a_scale.shape != (E, M, D // FP8_BLOCK):
-            raise ValueError(
-                "DeepEP LL requires block-128 scales; AcclEP needs ACCL_FP8_CAST_LEVEL=1"
-            )
+            raise ValueError("DeepEP LL requires unpacked FP32 block-128 scales")
         counts = payload.expert_tokens_meta.expert_num_tokens
         expected_m = max(1, min(M, payload.expert_tokens_meta.expected_m))
         inter = cfg.moe_inter_dim

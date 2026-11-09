@@ -53,8 +53,11 @@ def main():
                 f"found {torch.cuda.device_count()}"
             )
         for index in range(options.cuda_devices):
-            if torch.cuda.get_device_capability(index)[0] != 10:
-                raise RuntimeError("DSV4 CUDA13 tests require Blackwell devices")
+            if torch.cuda.get_device_capability(index)[0] not in (9, 10):
+                raise RuntimeError(
+                    "DSV4 CUDA13 tests require SM90 or SM100 devices, got "
+                    f"{torch.cuda.get_device_capability(index)}"
+                )
 
     # Machine-installed plugins must not change test collection or dependencies.
     os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"

@@ -11,6 +11,7 @@ import torch.nn as nn
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.modules.dsv4 import _green_context as green_context
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.expert import Expert
+from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.gate import Gate
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.shared_expert import (
     _SHARED_EXPERT_STREAM_CACHE,
     _SHARED_EXPERT_WORKSPACE_CACHE,
@@ -29,7 +30,7 @@ from rtp_llm.models_py.triton_kernels.moe.silu_mul_fp8_quant import (
     silu_mul_fp8_quant_packed_from_parts,
 )
 from rtp_llm.test.utils.numeric_util import calc_diff
-from rtp_llm.utils.model_weight import concat_0
+from rtp_llm.utils.model_weight import W, concat_0
 
 _MODULE = "rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.shared_expert"
 
@@ -776,30 +777,53 @@ class TestSharedExpertExecutor(unittest.TestCase):
         return shared, sequential, overlap
 
     @staticmethod
-    def _run_layer_schedule(executor, shared, x, routed_weight):
-        """Issue the executor hooks in the MoE layer order around routed work."""
+    def _make_production_gate():
+        """Gate dimensions that exercise clustered cuBLAS kernels."""
+        return Gate(
+            layer_id=0,
+            dim=4096,
+            n_routed_experts=256,
+            n_activated_experts=6,
+            layer_weights={
+                W.moe_gate: (
+                    torch.randn(256, 4096, device="cuda", dtype=torch.bfloat16) * 0.01
+                ),
+                W.moe_gate_bias: torch.zeros(256, device="cuda"),
+            },
+        )
+
+    @staticmethod
+    def _run_layer_schedule(executor, gate, x):
+        """Run gate in the comm partition and preserve the layer's hook order."""
         executor.begin(x)
-        routed = x @ routed_weight
+        topk_weights, topk_ids = gate(x)
         executor.run_shared(x)
-        routed = routed @ routed_weight
         executor.after_dispatch()
-        routed = routed @ routed_weight
         executor.before_combine()
-        return executor.finish() + 0 * routed
+        return executor.finish(), topk_weights, topk_ids
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    @mock.patch.dict(
+        os.environ, {"MOE_GATE_FP32": "0", "MOE_GATE_FUSED": "1", "MOEDBG": "0"}
+    )
     def test_overlap_executor_matches_sequential(self):
-        shared, sequential, overlap = self._make_fused_executors()
-        weight = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+        shared, sequential, overlap = self._make_fused_executors(dim=4096)
+        gate = self._make_production_gate()
         for tokens, comm_sms in itertools.product(
             (1, 16, 33, 64), self._comm_sms_cases()
         ):
             with self.subTest(tokens=tokens, comm_sms=comm_sms):
                 overlap.prepare(shared, comm_sm_counts=mock.Mock(return_value=comm_sms))
-                x = torch.randn(tokens, 256, device="cuda", dtype=torch.bfloat16)
-                ref = self._run_layer_schedule(sequential, shared, x, weight)
-                got = self._run_layer_schedule(overlap, shared, x, weight)
-                self.assertTrue(torch.equal(got, ref))
+                if comm_sms is not None:
+                    self.assertIsNotNone(overlap._comm_sm_counts)
+                x = torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16)
+                # Both executors reuse the same workspace.
+                ref = tuple(
+                    t.clone() for t in self._run_layer_schedule(sequential, gate, x)
+                )
+                got = self._run_layer_schedule(overlap, gate, x)
+                for actual, expected in zip(got, ref):
+                    self.assertTrue(torch.equal(actual, expected))
 
     @staticmethod
     def _comm_sms_cases():
@@ -810,12 +834,15 @@ class TestSharedExpertExecutor(unittest.TestCase):
         return (None, (n - 16, n - 8), (n, n - 8), (n - 16, n), (n, n))
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    @mock.patch.dict(
+        os.environ, {"MOE_GATE_FP32": "0", "MOE_GATE_FUSED": "1", "MOEDBG": "0"}
+    )
     def test_overlap_executor_replays_captured_schedule(self):
         from rtp_llm.models_py.utils.arch import get_num_device_sms
 
         n = get_num_device_sms()
-        shared, sequential, overlap = self._make_fused_executors(dim=1024)
-        # Combine needs more SMs for larger batches, as in ACCL-EP.
+        shared, sequential, overlap = self._make_fused_executors(dim=4096)
+        # Exercise different dispatch/combine windows.
         overlap.prepare(
             shared,
             comm_sm_counts=mock.Mock(
@@ -825,14 +852,21 @@ class TestSharedExpertExecutor(unittest.TestCase):
                 )
             ),
         )
-        weight = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
+        self.assertIsNotNone(overlap._comm_sm_counts)
+        gate = self._make_production_gate()
         for tokens in (1, 33, 64):
             with self.subTest(tokens=tokens):
-                x = torch.randn(tokens, 1024, device="cuda", dtype=torch.bfloat16)
-                out = torch.empty(tokens, 1024, device="cuda", dtype=torch.bfloat16)
+                x = torch.randn(tokens, 4096, device="cuda", dtype=torch.bfloat16)
+                out = tuple(
+                    torch.empty_like(t)
+                    for t in self._run_layer_schedule(overlap, gate, x)
+                )
 
                 def forward():
-                    out.copy_(self._run_layer_schedule(overlap, shared, x, weight))
+                    for dst, src in zip(
+                        out, self._run_layer_schedule(overlap, gate, x)
+                    ):
+                        dst.copy_(src)
 
                 forward()
                 torch.cuda.synchronize()
@@ -843,8 +877,9 @@ class TestSharedExpertExecutor(unittest.TestCase):
                 x.copy_(torch.randn_like(x))
                 graph.replay()
                 torch.cuda.synchronize()
-                ref = self._run_layer_schedule(sequential, shared, x, weight)
-                self.assertTrue(torch.equal(out, ref))
+                ref = self._run_layer_schedule(sequential, gate, x)
+                for actual, expected in zip(out, ref):
+                    self.assertTrue(torch.equal(actual, expected))
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
     def test_sm100_whole_expert_overlap_and_capture_fallback(self):

@@ -24,7 +24,8 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
-from rtp_llm.models_py.utils.arch import get_num_device_sms, get_sm
+from rtp_llm.models_py.modules.factory.fused_moe.utils.config import shared_expert_mode
+from rtp_llm.models_py.utils.arch import get_num_device_sms, get_sm, is_sm90
 from rtp_llm.models_py.utils.math import ceil_div
 
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
@@ -79,13 +80,18 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             wrapper.mode == DeepEPMode.LOW_LATENCY
         ), "DeepEP mode should be LOW_LATENCY"
         self._buffer = wrapper.buffer
-        self._launches_on_current_stream = wrapper.uses_compute_stream
+        if is_sm90() and shared_expert_mode() in ("auto", "overlap"):
+            # SM90 auto selects overlap. Preserve an explicit opt-out.
+            os.environ.setdefault("DSV4_LL_RECV_HOOK", "1")
+        # Hook mode uses the caller stream instead of DeepEP's internal stream.
+        # Invoke RECV immediately to keep both phases in the green partition.
+        self._return_recv_hook = os.environ.get("DSV4_LL_RECV_HOOK", "0") == "1"
+        self._launches_on_current_stream = self._return_recv_hook
         self._num_topk = wrapper.num_topk
         self._num_max_dispatch_tokens_per_rank = wrapper.ll_num_max_token_per_rank
         self._use_fp8_dispatch = use_fp8_dispatch
         self._zero_copy = False
         self._async_finish = False
-        self._return_recv_hook = False
         self._handle: Optional[Tuple[Any, ...]] = None
 
     @property
@@ -95,14 +101,9 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
     def comm_sm_counts(self, num_tokens: int) -> Optional[Tuple[int, int]]:
         """Dispatch/combine SM budgets for this rank's pre-TP-slice token count.
 
-        Returns None unless the buffer was created to use the caller stream.
-        TP slicing uses this rank's actual local token count.
-        Counts estimate launch-grid demand, not measured resident SM occupancy.
-
-        Mirrors the grid of ACCL-EP 1.2.1.10 internode_ll.cu two-phase kernels,
-        including ACCL_DISPATCH_NUM_WARP_GROUPS / ACCL_COMBINE_NUM_WARP_GROUPS.
-        The shared-expert overlap sizes its green-context partitions with
-        these counts, so recheck them when the launch configuration changes.
+        Mirrors DeepEP's internode_ll.cu launch grids after local TP slicing.
+        These budgets size green partitions and must track kernel grid changes.
+        Returns None when communication does not use the caller stream.
         """
         if not self._launches_on_current_stream:
             return None
@@ -111,18 +112,11 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         slice_start = min(tokens_per_rank * self.config.tp_rank, num_tokens)
         num_tokens = min(num_tokens - slice_start, tokens_per_rank)
 
-        def expert_grid(env: str) -> int:
-            warp_groups = ceil_div(self._num_experts, num_sms)
-            try:
-                warp_groups = int(os.environ.get(env, warp_groups))
-            except ValueError:
-                pass
-            return ceil_div(self._num_experts, warp_groups)
-
-        dispatch_sms = expert_grid("ACCL_DISPATCH_NUM_WARP_GROUPS")
+        warp_groups = ceil_div(self._num_experts, num_sms)
+        dispatch_sms = ceil_div(self._num_experts, warp_groups)
         recv_per_sm = ceil_div(num_tokens, num_sms)
         combine_sms = max(
-            expert_grid("ACCL_COMBINE_NUM_WARP_GROUPS"),
+            dispatch_sms,
             ceil_div(num_tokens, recv_per_sm) if recv_per_sm else 1,
         )
         return dispatch_sms, combine_sms
@@ -177,9 +171,11 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         )
 
         # Dispatch tokens
-        expert_x, expert_num_tokens, self._handle, _, _ = (
+        expert_x, expert_num_tokens, self._handle, _, recv_hook = (
             self._buffer.low_latency_dispatch(**dispatch_args)
         )
+        if recv_hook is not None:
+            recv_hook()
         if self._use_fp8_dispatch:
             assert isinstance(expert_x, tuple), "expert_x should be a tuple"
             expert_x, expert_x_scale = expert_x[0], expert_x[1]
@@ -270,7 +266,9 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             combine_args (dict[str, Any]): Arguments for combining expert outputs.
         """
         # Normal finalize
-        combined_x, _, _ = self._buffer.low_latency_combine(**combine_args)
+        combined_x, _, recv_hook = self._buffer.low_latency_combine(**combine_args)
+        if recv_hook is not None:
+            recv_hook()
 
         return combined_x
 

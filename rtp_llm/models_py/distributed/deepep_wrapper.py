@@ -57,12 +57,10 @@ _configure_deepep_nccl_root()
 try:
     from deep_ep import Buffer as DeepEPBuffer
     from deep_ep import Config as DeepEPConfig
-    from deep_ep_cpp import Buffer as _DeepEPRuntimeBuffer
 except ImportError as _deep_ep_import_err:
     # Some CPU and non-NVIDIA builds intentionally omit deep_ep. Keep unrelated
     # startup paths importable and fail only when a DeepEP path is selected.
     _DEEP_EP_IMPORT_ERROR = _deep_ep_import_err
-    _DeepEPRuntimeBuffer = None
 
     class _DeepEPUnavailable:
         """Stub for deep_ep.Buffer / deep_ep.Config when the wheel is missing."""
@@ -167,8 +165,8 @@ class DeepepWrapperConfig:
         ffn_config = parallelism_config.ffn_disaggregate_config
         if ffn_config is not None and ffn_config.enable_ffn_disaggregate:
             raise RuntimeError(
-                "enable_ffn_disaggregate needs the ACCL-EP M2N DeepEP buffer and is "
-                "not supported by the official DeepEP provider"
+                "enable_ffn_disaggregate requires an M2N buffer, "
+                "which upstream DeepEP does not support"
             )
 
         return cls(
@@ -295,7 +293,6 @@ class DeepEPWrapper:
             config: DeepepWrapperConfig containing all necessary configuration
         """
         self._config = config
-        self._uses_compute_stream = False
         self._mode, self._buffer = self._init_deepep_buffer(group)
 
     @classmethod
@@ -427,11 +424,6 @@ class DeepEPWrapper:
         return self._buffer
 
     @property
-    def uses_compute_stream(self) -> bool:
-        """Whether the low-latency buffer was configured to use the caller stream."""
-        return self._uses_compute_stream
-
-    @property
     def mode(self) -> DeepEPMode:
         """Get the DeepEP mode."""
         return self._mode
@@ -502,13 +494,6 @@ class DeepEPWrapper:
 
         # Normal-kernel internode
         if config.use_deepep_internode:
-            accl_normal_mode = os.environ.get("ACCL_NORMAL_MODE")
-            if accl_normal_mode:
-                logging.warning(
-                    f"ACCL_NORMAL_MODE={accl_normal_mode} is no longer consulted: "
-                    "the DeepEP provider is the upstream package and "
-                    "num_qps_per_rank now always uses deep_ep_num_sm // 2."
-                )
             num_nvl_bytes = int(2e9)
             num_rdma_bytes = int(1e9)
             num_qps_per_rank = config.deep_ep_num_sm // 2
@@ -551,41 +536,14 @@ class DeepEPWrapper:
 
         num_qps_per_rank = config.expert_num // config.ep_size
 
-        if "ACCL_LOW_LATENCY_USE_COMPUTE_STREAM" not in os.environ:
-            from rtp_llm.models_py.modules.factory.fused_moe.utils.config import (
-                shared_expert_mode,
-            )
-            from rtp_llm.models_py.utils.arch import is_sm90
-
-            if is_sm90() and shared_expert_mode() != "sequential":
-                # The SM90 shared-expert overlap moves dispatch and combine into
-                # a green-context partition through the current stream; AcclEP
-                # reads this when the buffer is created.
-                os.environ["ACCL_LOW_LATENCY_USE_COMPUTE_STREAM"] = "1"
-
-        # Snapshot the setting consumed by this buffer, independently of later
-        # environment changes before routers are constructed.
-        try:
-            self._uses_compute_stream = (
-                int(os.environ.get("ACCL_LOW_LATENCY_USE_COMPUTE_STREAM", "0")) == 1
-            )
-        except ValueError:
-            self._uses_compute_stream = False
-
         init_kwargs = {
             "group": group,
             "num_nvl_bytes": 0,
             "num_rdma_bytes": num_rdma_bytes,
             "low_latency_mode": True,
             "num_qps_per_rank": num_qps_per_rank,
+            "allow_nvlink_for_low_latency_mode": not config.use_deepep_internode,
         }
-        if hasattr(_DeepEPRuntimeBuffer, "is_low_latency_optimize"):
-            # Match AcclEP C++'s low_latency_optimize > 0 predicate. Otherwise
-            # Python's allow_nvlink=True default promotes opt=0 to 1 by itself.
-            # Keep topology-dependent kernel selection in the C++ runtime.
-            init_kwargs["allow_nvlink_for_low_latency_mode"] = (
-                int(os.environ.get("ACCL_LOW_LATENCY_OPTIMIZE", "0")) > 0
-            )
         return DeepEPBuffer(**init_kwargs)  # type: ignore
 
     def _destroy_buffer(self) -> None:
