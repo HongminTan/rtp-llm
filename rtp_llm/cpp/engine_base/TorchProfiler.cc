@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#if USING_CUDA || USING_ROCM
+#include <torch/cuda.h>
+#endif
 
 namespace rtp_llm {
 namespace tap = torch::autograd::profiler;
@@ -70,6 +73,10 @@ std::pair<std::unique_ptr<tap::ProfilerResult>, std::string> TorchProfile::stopA
     if (stopped_) {
         return {nullptr, ""};
     }
+#if USING_CUDA || USING_ROCM
+    // Complete GPU activities before Kineto finalizes their timestamps.
+    torch::cuda::synchronize();
+#endif
     // disableProfiler() pops the active profiler state before finalizing the
     // trace. Mark this wrapper stopped first so an exception is never retried
     // from the destructor.
