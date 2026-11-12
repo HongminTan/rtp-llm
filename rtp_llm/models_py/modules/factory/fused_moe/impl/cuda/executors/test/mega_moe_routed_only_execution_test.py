@@ -5,16 +5,11 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from rtp_llm.config.model_config import ModelConfig
-from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
-    MoEConfigAdapter,
-)
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.local_loop import (
     LocalLoopExecutor,
 )
@@ -24,178 +19,24 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe im
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se import (
     MegaMoeSEExecutor,
 )
-from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
-    ChunkedFp8Fp4MoeLayer as MoE,
+from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.test.mega_moe_execution_test_util import (
+    _DIM,
+    _EXPERTS,
+    _MAX_TOKENS,
+    _WORLD_SIZE,
+    _assert_outputs_do_not_alias,
+    _check_eager_layer,
+    _check_graph_replays,
+    _init_process_group,
+    _make_global_weights,
+    _make_moe,
+    _sync_ranks_for_mega,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.chunked_layer import (
     resolve_moe_max_tokens_per_rank,
     synchronized_moe_chunk_plan,
 )
-from rtp_llm.ops import MoeConfig, ParallelismConfig
 from rtp_llm.utils.model_weight import W
-
-_WORLD_SIZE = 2
-_EXPERTS = 16
-_TOPK = 4
-_DIM = 4096
-_INTER_DIM = 2048
-_MAX_TOKENS = 32
-
-
-def _sync_ranks_for_mega(device: torch.device) -> None:
-    """Finish NCCL work before DeepGEMM occupies every SM for grid sync."""
-
-    dist.barrier()
-    torch.cuda.synchronize(device)
-
-
-def _assert_outputs_do_not_alias(expected: torch.Tensor, actual: torch.Tensor) -> None:
-    """Catch result-cache self-comparisons, including zero-length tensors."""
-
-    assert expected is not actual
-    assert not expected.is_set_to(actual)
-    if expected.numel() and actual.numel():
-        assert expected.data_ptr() != actual.data_ptr()
-
-
-def _ue8m0_ones(*shape: int, device: torch.device) -> torch.Tensor:
-    return torch.full(shape, 127, dtype=torch.uint8, device=device).view(
-        torch.float8_e8m0fnu
-    )
-
-
-def _make_global_weights(
-    device: torch.device,
-    *,
-    include_shared: bool = False,
-    n_shared_experts: int = 1,
-    hash_routing: bool = False,
-) -> dict:
-    def packed_fp4(out_dim: int, in_dim: int) -> torch.Tensor:
-        shape = (_EXPERTS, out_dim, in_dim // 2)
-        # Build each packed byte from finite E2M1 nibbles. Arbitrary int8
-        # bytes can encode reserved/non-finite FP4 patterns and make a
-        # numerical regression fail for reasons unrelated to the kernel.
-        low = torch.randint(0, 7, shape, dtype=torch.uint8, device=device)
-        high = torch.randint(0, 7, shape, dtype=torch.uint8, device=device)
-        low |= torch.randint(0, 2, shape, dtype=torch.uint8, device=device) << 3
-        high |= torch.randint(0, 2, shape, dtype=torch.uint8, device=device) << 3
-        return (low | (high << 4)).view(torch.int8)
-
-    def fp4_scale(out_dim: int, in_dim: int) -> torch.Tensor:
-        return _ue8m0_ones(
-            _EXPERTS,
-            out_dim,
-            in_dim // 32,
-            device=device,
-        )
-
-    weights = {
-        W.moe_gate: torch.randn(_EXPERTS, _DIM, dtype=torch.bfloat16, device=device),
-        W.moe_gate_bias: torch.zeros(_EXPERTS, dtype=torch.float32, device=device),
-        W.moe_w1: packed_fp4(_INTER_DIM, _DIM),
-        W.moe_s1: fp4_scale(_INTER_DIM, _DIM),
-        W.moe_w2: packed_fp4(_DIM, _INTER_DIM),
-        W.moe_s2: fp4_scale(_DIM, _INTER_DIM),
-        "routed_up": packed_fp4(_INTER_DIM, _DIM),
-        "routed_up_scale": fp4_scale(_INTER_DIM, _DIM),
-    }
-    if hash_routing:
-        weights[W.moe_gate_tid2eid] = torch.stack(
-            [torch.randperm(_EXPERTS, device=device)[:_TOPK] for _ in range(64)]
-        ).contiguous()
-    if include_shared:
-        shared_inter = _INTER_DIM * n_shared_experts
-        weights.update(
-            {
-                W.ffn_w13: (
-                    torch.randn(
-                        2 * shared_inter,
-                        _DIM,
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                    * 0.05
-                ).to(torch.float8_e4m3fn),
-                W.ffn_s13: _ue8m0_ones(
-                    2 * shared_inter // 128,
-                    _DIM // 128,
-                    device=device,
-                ),
-                W.ffn_w2: (
-                    torch.randn(
-                        _DIM,
-                        shared_inter,
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                    * 0.05
-                ).to(torch.float8_e4m3fn),
-                W.ffn_s2: _ue8m0_ones(
-                    _DIM // 128,
-                    shared_inter // 128,
-                    device=device,
-                ),
-            }
-        )
-    # Preserve the original split-tensor random draws before canonical packing.
-    weights[W.moe_w1] = torch.cat((weights[W.moe_w1], weights.pop("routed_up")), dim=1)
-    weights[W.moe_s1] = torch.cat(
-        (
-            weights[W.moe_s1].view(torch.uint8),
-            weights.pop("routed_up_scale").view(torch.uint8),
-        ),
-        dim=1,
-    ).view(torch.float8_e8m0fnu)
-    return weights
-
-
-def _make_moe(
-    layer_weights: dict,
-    *,
-    ep_size: int,
-    ep_rank: int,
-    strategy,
-    n_shared_experts: int = 0,
-    hash_routing: bool = False,
-    layer_id: int = 7,
-    max_tokens_per_rank: int = _MAX_TOKENS,
-    chunking_enabled: bool = True,
-) -> MoE:
-    model_config = ModelConfig()
-    model_config.hidden_size = _DIM
-    model_config.moe_inter_size = _INTER_DIM
-    model_config.expert_num = _EXPERTS
-    model_config.moe_k = _TOPK
-    model_config.n_shared_experts = n_shared_experts
-    model_config.routed_scaling_factor = 1.5
-    model_config.swiglu_limit = 10.0
-    model_config.moe_w1_layout = "gate_up"
-    parallelism = ParallelismConfig()
-    parallelism.ep_size = ep_size
-    parallelism.ep_rank = ep_rank
-    parallelism.world_size = ep_size
-    parallelism.world_rank = ep_rank
-    parallelism.dp_size = ep_size
-    parallelism.dp_rank = ep_rank
-    moe_config = MoeConfig()
-    moe_config.moe_strategy = strategy
-    config = MoEConfigAdapter(model_config, parallelism, moe_config).for_layer(
-        layer_id=layer_id,
-        moe_inter_dim=_INTER_DIM,
-        moe_w1_layout="gate_up",
-        max_tokens_per_rank=max_tokens_per_rank,
-        moe_quant_method="FP8_FP4",
-        warmup_include_capacity=chunking_enabled,
-    )
-    return MoE(
-        config=config,
-        score_func="sqrtsoftplus",
-        n_hash_layers=8 if hash_routing else 0,
-        vocab_size=64,
-        layer_weights=layer_weights,
-        chunking_enabled=chunking_enabled,
-    )
 
 
 def _worker(
@@ -209,17 +50,7 @@ def _worker(
     num_layers: int = 1,
     cp_request_lengths: tuple[int, ...] = (),
 ) -> None:
-    os.environ["MODEL_WARM_UP"] = "0"
-    torch.cuda.set_device(rank)
-    device = torch.device("cuda", rank)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"file://{rendezvous_path}",
-        rank=rank,
-        world_size=world_size,
-        device_id=device,
-        timeout=timedelta(seconds=120),
-    )
+    device = _init_process_group(rank, world_size, rendezvous_path)
     try:
         capacity = _MAX_TOKENS
         if cp_request_lengths:
@@ -351,31 +182,9 @@ def _worker(
         torch.manual_seed(20261100 + rank)
         graph_x = torch.randn(2, _DIM, dtype=torch.bfloat16, device=device)
         graph_ids = torch.arange(2, dtype=torch.long, device=device)
-        with torch.inference_mode():
-            reference(graph_x, graph_ids)
-            _sync_ranks_for_mega(device)
-            mega(graph_x, graph_ids)
-        torch.cuda.synchronize(device)
-        _sync_ranks_for_mega(device)
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(graph):
-            graph_actual = mega(graph_x, graph_ids)
-        torch.manual_seed(20261200 + rank)
-        graph_x.copy_(torch.randn_like(graph_x))
-        graph_ids.copy_(torch.arange(1, -1, -1, dtype=torch.long, device=device))
-        with torch.inference_mode():
-            graph_expected = reference(graph_x, graph_ids).clone()
-            graph_actual.fill_(float("nan"))
-        assert torch.isnan(graph_actual).all()
-        _sync_ranks_for_mega(device)
-        graph.replay()
-        torch.cuda.synchronize(device)
-        dist.barrier()
-        assert torch.isfinite(graph_actual).all()
-        _assert_outputs_do_not_alias(graph_expected, graph_actual)
-        graph_error = (graph_actual.float() - graph_expected.float()).abs()
-        graph_baseline = graph_expected.float().abs().mean().item() + 1e-6
-        assert graph_error.mean().item() / graph_baseline < 0.05
+        _check_graph_replays(
+            mega, reference, graph_x, graph_ids, device, seed=20261200 + rank
+        )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -389,17 +198,7 @@ def _se_worker(
     run_graph: bool,
     cp_request_lengths: tuple[int, ...] = (),
 ) -> None:
-    os.environ["MODEL_WARM_UP"] = "0"
-    torch.cuda.set_device(rank)
-    device = torch.device("cuda", rank)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"file://{rendezvous_path}",
-        rank=rank,
-        world_size=world_size,
-        device_id=device,
-        timeout=timedelta(seconds=120),
-    )
+    device = _init_process_group(rank, world_size, rendezvous_path)
     try:
         capacity = _MAX_TOKENS
         if cp_request_lengths:
@@ -483,56 +282,16 @@ def _se_worker(
         torch.manual_seed(20263100 + rank)
         x = torch.randn(tokens, _DIM, dtype=torch.bfloat16, device=device)
         input_ids = torch.arange(tokens, dtype=torch.long, device=device)
-        with torch.inference_mode():
-            expected = reference(x, input_ids).clone()
-        _sync_ranks_for_mega(device)
-        with torch.inference_mode():
-            actual = mega_se(x, input_ids)
-        torch.cuda.synchronize(device)
-        dist.barrier()
-
-        _assert_outputs_do_not_alias(expected, actual)
-        assert actual.shape == x.shape
-        assert torch.isfinite(actual).all()
-        if tokens:
-            error = (actual.float() - expected.float()).abs()
-            baseline = expected.float().abs().mean().item() + 1e-6
-            relative_error = error.mean().item() / baseline
-            assert relative_error < 0.05, (
-                f"rank={rank} MegaMoESE relative error {relative_error:.6f} "
-                "exceeds the standalone baseline"
-            )
+        _check_eager_layer(mega_se, reference, x, input_ids, label=f"SE/rank={rank}")
 
         if not run_graph:
             return
         torch.manual_seed(20263200 + rank)
         graph_x = torch.randn(2, _DIM, dtype=torch.bfloat16, device=device)
         graph_ids = torch.arange(2, dtype=torch.long, device=device)
-        with torch.inference_mode():
-            reference(graph_x, graph_ids)
-            _sync_ranks_for_mega(device)
-            mega_se(graph_x, graph_ids)
-        torch.cuda.synchronize(device)
-        _sync_ranks_for_mega(device)
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(graph):
-            graph_actual = mega_se(graph_x, graph_ids)
-        torch.manual_seed(20263300 + rank)
-        graph_x.copy_(torch.randn_like(graph_x))
-        graph_ids.copy_(torch.arange(1, -1, -1, dtype=torch.long, device=device))
-        with torch.inference_mode():
-            graph_expected = reference(graph_x, graph_ids).clone()
-            graph_actual.fill_(float("nan"))
-        assert torch.isnan(graph_actual).all()
-        _sync_ranks_for_mega(device)
-        graph.replay()
-        torch.cuda.synchronize(device)
-        dist.barrier()
-        assert torch.isfinite(graph_actual).all()
-        _assert_outputs_do_not_alias(graph_expected, graph_actual)
-        graph_error = (graph_actual.float() - graph_expected.float()).abs()
-        graph_baseline = graph_expected.float().abs().mean().item() + 1e-6
-        assert graph_error.mean().item() / graph_baseline < 0.05
+        _check_graph_replays(
+            mega_se, reference, graph_x, graph_ids, device, seed=20263300 + rank
+        )
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

@@ -1,5 +1,6 @@
 import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
@@ -39,9 +40,10 @@ def _config(
     strategy="auto",
     world_size=None,
     has_shared_expert_gate=False,
+    dim=512,
 ):
     model_config = ModelConfig()
-    model_config.hidden_size = 512
+    model_config.hidden_size = dim
     model_config.moe_inter_size = 256
     model_config.expert_num = 16
     model_config.moe_k = 4
@@ -77,7 +79,23 @@ def _registry():
     return registry
 
 
+@contextmanager
+def _backend(sm, *, routed=True, shared=True):
+    prefix = "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda."
+    native_shared = shared
+    with patch(prefix + "strategy.fp8_fp4.is_sm90", return_value=sm == 9), patch(
+        prefix + "executors.mega_moe._mega_moe_available", return_value=routed
+    ), patch(
+        prefix + "executors.mega_moe_se._mega_moe_se_available", return_value=shared
+    ), patch(
+        prefix + "executors.mega_moe_sm90.sm90_mega_available",
+        side_effect=lambda shared=False: routed and (native_shared if shared else True),
+    ):
+        yield
+
+
 class Fp8Fp4StrategySelectionTest(unittest.TestCase):
+
     def test_ll_capacity_follows_input_tp_view(self):
         for cp, expected in ((False, 64), (True, 128)):
             with self.subTest(cp=cp):
@@ -143,62 +161,6 @@ class Fp8Fp4StrategySelectionTest(unittest.TestCase):
             _registry().get_strategy(_config()), CudaLocalLoopStrategy
         )
 
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe._mega_moe_available",
-        return_value=True,
-    )
-    def test_auto_uses_mega_without_shared_experts(self, _):
-        self.assertIsInstance(
-            _registry().get_strategy(_config(ep_size=2)), CudaMegaMoeStrategy
-        )
-
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe._mega_moe_available",
-        return_value=True,
-    )
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se._mega_moe_se_available",
-        return_value=True,
-    )
-    def test_auto_prefers_mega_se_for_multiple_shared_experts(self, _, __):
-        self.assertIsInstance(
-            _registry().get_strategy(_config(ep_size=2, n_shared_experts=3)),
-            CudaMegaMoeSEStrategy,
-        )
-
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe._mega_moe_available",
-        return_value=True,
-    )
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se._mega_moe_se_available",
-        return_value=False,
-    )
-    def test_auto_falls_back_to_mega_when_se_is_unavailable(self, _, __):
-        self.assertIsInstance(
-            _registry().get_strategy(_config(ep_size=2, n_shared_experts=2)),
-            CudaMegaMoeStrategy,
-        )
-
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe._mega_moe_available",
-        return_value=True,
-    )
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se._mega_moe_se_available",
-        return_value=True,
-    )
-    def test_auto_keeps_gated_shared_expert_outside_mega_se(self, _, __):
-        config = _config(
-            ep_size=2,
-            n_shared_experts=2,
-            has_shared_expert_gate=True,
-        )
-        self.assertIsInstance(
-            _registry().get_strategy(config),
-            CudaMegaMoeStrategy,
-        )
-
     def test_grouped_capability_requires_both_deep_gemm_symbols(self):
         available = SimpleNamespace(
             m_grouped_fp8_fp4_gemm_nt_contiguous=object(),
@@ -244,60 +206,198 @@ class Fp8Fp4StrategySelectionTest(unittest.TestCase):
         ), mock.patch.object(torch.cuda, "get_device_capability", return_value=(12, 0)):
             self.assertFalse(_has_fp8_fp4_grouped_kernel())
 
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe._mega_moe_available",
-        return_value=False,
-    )
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se._mega_moe_se_available",
-        return_value=False,
-    )
-    def test_explicit_mega_se_rejects_unavailable_backend(self, _, __):
-        with self.assertRaisesRegex(ValueError, "MOE_STRATEGY='mega_moe_se'"):
-            _registry().get_strategy(
-                _config(ep_size=2, n_shared_experts=2, strategy="mega_moe_se")
+
+class MegaStrategySelectionTest(unittest.TestCase):
+    def test_auto_selection(self):
+        for sm in (9, 10):
+            for count, gated, native in (
+                (0, False, True),
+                (1, False, True),
+                (3, False, True),
+                (1, True, True),
+                (1, False, False),
+            ):
+                with self.subTest(
+                    sm=sm, count=count, gated=gated, native=native
+                ), _backend(sm, shared=native):
+                    config = _config(
+                        ep_size=2,
+                        n_shared_experts=count,
+                        has_shared_expert_gate=gated,
+                        dim=1024,
+                    )
+                    strategy = _registry().get_strategy(config)
+                    fused = (
+                        native and count > 0 and not gated and (sm == 10 or count == 1)
+                    )
+                    self.assertIsInstance(
+                        strategy,
+                        CudaMegaMoeSEStrategy if fused else CudaMegaMoeStrategy,
+                    )
+                    executor = strategy.get_executor_class()
+                    self.assertEqual(executor.includes_shared_expert, fused)
+                    self.assertEqual("sm90" in executor.__module__, sm == 9)
+
+    def test_explicit_selection_returns_backend_executor_class(self):
+        for sm in (9, 10):
+            for name in ("mega_moe", "mega_moe_se"):
+                for count, gated, native in (
+                    (0, False, True),
+                    (1, False, True),
+                    (3, False, True),
+                    (1, True, True),
+                    (1, False, False),
+                ):
+                    with self.subTest(
+                        sm=sm, name=name, count=count, gated=gated, native=native
+                    ), _backend(sm, shared=native):
+                        config = _config(
+                            ep_size=2,
+                            n_shared_experts=count,
+                            has_shared_expert_gate=gated,
+                            strategy=name,
+                            dim=1024,
+                        )
+                        rejected = name == "mega_moe_se" and (count == 0 or gated)
+                        if rejected:
+                            with self.assertRaises(ValueError):
+                                _registry().get_strategy(config)
+                        else:
+                            strategy = _registry().get_strategy(config)
+                            self.assertEqual(strategy.strategy_name, name)
+                            # This checks class selection only. SM90 SE with
+                            # wider shared experts changes its instance flag in
+                            # setup_weights; execution tests cover that fallback.
+                            executor_name = (
+                                "MegaMoeSm90" if sm == 9 else "MegaMoe"
+                            ) + (
+                                "SEExecutor"
+                                if name == "mega_moe_se" and native
+                                else "Executor"
+                            )
+                            self.assertEqual(
+                                strategy.get_executor_class().__name__, executor_name
+                            )
+
+    def test_unavailable_backend_rejected(self):
+        for sm in (9, 10):
+            with self.subTest(sm=sm), _backend(
+                sm, routed=False, shared=False
+            ), self.assertRaises(ValueError):
+                _registry().get_strategy(
+                    _config(
+                        ep_size=2, n_shared_experts=1, strategy="mega_moe_se", dim=1024
+                    )
+                )
+
+    def test_mismatched_world_rejected(self):
+        for sm in (9, 10):
+            for name in ("mega_moe", "mega_moe_se"):
+                with self.subTest(sm=sm, name=name), _backend(sm), self.assertRaises(
+                    ValueError
+                ):
+                    _registry().get_strategy(
+                        _config(
+                            ep_size=2,
+                            n_shared_experts=1,
+                            strategy=name,
+                            world_size=4,
+                            dim=1024,
+                        )
+                    )
+
+    def test_grouped_storage_does_not_restrict_mega_factory(self):
+        from rtp_llm.models_py.modules.factory.fused_moe.factory import FusedMoeFactory
+
+        for sm in (9, 10):
+            for storage in ("fp8", "fp4"):
+                for name in ("mega_moe", "mega_moe_se"):
+                    with self.subTest(sm=sm, storage=storage, name=name), _backend(sm):
+                        config = _config(
+                            ep_size=2, n_shared_experts=1, strategy=name, dim=1024
+                        )
+                        config.dsv4_moe_sm90_storage = storage
+                        strategy = _registry().get_strategy(config)
+                        with patch.object(FusedMoeFactory, "_registry", _registry()):
+                            factory = FusedMoeFactory()
+                        with patch.object(
+                            factory.registry, "get_strategy", return_value=strategy
+                        ), patch.object(strategy, "create_router"), patch.object(
+                            strategy, "create_executor"
+                        ), patch(
+                            "rtp_llm.models_py.modules.factory.fused_moe.factory.FusedMoe"
+                        ):
+                            factory.create_fused_moe(config, {})
+
+
+class Sm90CapabilityTest(unittest.TestCase):
+    def test_capability_probes_native_shared_api(self):
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_sm90 import (
+            sm90_mega_available,
+        )
+
+        def kernel(*, shared_l1_weights=None, shared_l2_weights=None):
+            pass
+
+        api = SimpleNamespace(
+            get_symm_buffer_for_mega_moe_sm90=lambda: None,
+            transform_weights_for_mega_moe_sm90=lambda: None,
+            sm90_fp8_fp4_mega_moe=kernel,
+        )
+        with patch.dict(sys.modules, {"deep_gemm": api}), patch.object(
+            torch.cuda, "is_available", return_value=True
+        ), patch(
+            "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_sm90.is_sm90",
+            return_value=True,
+        ), patch(
+            "torch.distributed.is_initialized", return_value=True
+        ), patch(
+            "torch.distributed.get_world_size", return_value=2
+        ):
+            self.assertTrue(sm90_mega_available())
+            self.assertTrue(sm90_mega_available(shared=True))
+            api.sm90_fp8_fp4_mega_moe = lambda: None
+            self.assertTrue(sm90_mega_available())
+            self.assertFalse(sm90_mega_available(shared=True))
+
+
+class BackendSpecificSelectionTest(unittest.TestCase):
+
+    def test_explicit_deepep_is_not_overridden_by_mega(self):
+        with _backend(9):
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy.fp8_fp4 import (
+                CudaGroupedFp4Sm90EpStrategy,
             )
 
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe._mega_moe_available",
-        return_value=True,
-    )
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se._mega_moe_se_available",
-        return_value=False,
-    )
-    def test_explicit_mega_se_uses_routed_and_standalone_shared(self, _, __):
-        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe import (
-            MegaMoeExecutor,
-        )
+            registry = _registry()
+            registry.register(CudaGroupedFp4Sm90EpStrategy())
+            config = _config(
+                ep_size=2, n_shared_experts=1, strategy="grouped_fp4_sm90_ep"
+            )
+            config.use_deepep_moe = True
+            config.use_deepep_low_latency = False
+            config.moe_config.use_deepep_moe = True
+            config.moe_config.use_deepep_low_latency = False
+            with patch(
+                "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.grouped_fp4_sm90._has_sm90_grouped_fp8_kernel",
+                return_value=True,
+            ), patch(
+                "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_normal_router.get_sm",
+                return_value=(9, 0),
+            ), patch(
+                "rtp_llm.models_py.distributed.deepep_wrapper.DeepEPWrapper.supported",
+                return_value=True,
+            ):
+                self.assertIsInstance(
+                    registry.get_strategy(config), CudaGroupedFp4Sm90EpStrategy
+                )
 
-        strategy = _registry().get_strategy(
-            _config(ep_size=2, n_shared_experts=2, strategy="mega_moe_se")
-        )
-        self.assertIsInstance(strategy, CudaMegaMoeSEStrategy)
-        executor = strategy.get_attributes().get_executor_class()
-        self.assertIs(executor, MegaMoeExecutor)
-        # This flag makes the layer retain FP8 shared weights and construct
-        # the existing shared-expert executor plus FP32 combine epilogue.
-        self.assertFalse(executor.includes_shared_expert)
-
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe._mega_moe_available",
-        return_value=True,
-    )
-    @patch(
-        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se._mega_moe_se_available",
-        return_value=True,
-    )
-    def test_mega_strategies_reject_ep_group_different_from_world(self, _, __):
-        config = _config(
-            ep_size=2, n_shared_experts=2, strategy="mega_moe_se", world_size=4
-        )
-        with self.assertRaisesRegex(ValueError, "MOE_STRATEGY='mega_moe_se'"):
-            _registry().get_strategy(config)
-        config.moe_strategy = "mega_moe"
-        with self.assertRaisesRegex(ValueError, "MOE_STRATEGY='mega_moe'"):
-            _registry().get_strategy(config)
+    def test_decode_route_slices_must_fit_hidden_size(self):
+        with _backend(9):
+            config = _config(ep_size=2, strategy="mega_moe")
+            config.dim = 512
+            with self.assertRaises(ValueError):
+                _registry().get_strategy(config)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from rtp_llm.models_py.modules.factory.fused_moe.defs.fused_moe import FusedMoe
-from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.test.mega_moe_routed_only_execution_test import (
+from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.test.mega_moe_execution_test_util import (
     _DIM,
     _EXPERTS,
     _MAX_TOKENS,

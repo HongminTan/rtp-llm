@@ -277,7 +277,10 @@ cuda13_sm100_py_test(
 
 cuda13_sm100_py_test(
     name = "mega_moe_routed_only_execution_test",
-    srcs = ["mega_moe_routed_only_execution_test.py"],
+    srcs = [
+        "mega_moe_routed_only_execution_test.py",
+        "mega_moe_execution_test_util.py",
+    ],
     # DeepGEMM uses $HOME/.deep_gemm; reuse the existing per-user JIT cache.
     env_inherit = ["HOME"],
     deps = [
@@ -292,7 +295,7 @@ cuda13_sm100_py_test(
     name = "mega_moe_end_to_end_perf_test",
     srcs = [
         "mega_moe_end_to_end_perf_test.py",
-        "mega_moe_routed_only_execution_test.py",
+        "mega_moe_execution_test_util.py",
     ],
     env_inherit = ["HOME"],
     deps = [
@@ -362,5 +365,24 @@ py_test(
     exec_properties = {
         "gpu": "H20_CU13",
         "gpu_count": "1",
+    },
+)
+
+py_test(
+    name = "mega_moe_sm90_execution_test",
+    srcs = [
+        "mega_moe_sm90_execution_test.py",
+        "mega_moe_execution_test_util.py",
+    ],
+    deps = [
+        "//rtp_llm:config",
+        "//rtp_llm:testlib",
+        "//rtp_llm/models_py:modules",
+    ],
+    env = {"GPU_COUNT": "2"},
+    tags = ["H20_CU13"],
+    exec_properties = {
+        "gpu": "H20_CU13",
+        "gpu_count": "2",
     },
 )

@@ -14,6 +14,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.strategy_base import MoeStrategy
+from rtp_llm.models_py.utils.arch import is_sm90
 
 
 class _CudaFp8Fp4Strategy(MoeStrategy):
@@ -61,7 +62,15 @@ class CudaMegaMoeSEStrategy(_CudaFp8Fp4Strategy):
     @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
         super().check_conditions(checker, config)
-        if config.moe_strategy == "auto":
+        if is_sm90() and config.moe_strategy == "auto":
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_sm90 import (
+                sm90_mega_available,
+            )
+
+            checker.check(
+                config.n_shared_experts == 1 and sm90_mega_available(shared=True)
+            )
+        elif config.moe_strategy == "auto":
             from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se import (
                 _mega_moe_se_available,
             )
@@ -72,6 +81,20 @@ class CudaMegaMoeSEStrategy(_CudaFp8Fp4Strategy):
 
     @classmethod
     def get_executor_class(cls) -> Type:
+        if is_sm90():
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_sm90 import (
+                MegaMoeSm90Executor,
+                sm90_mega_available,
+            )
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_sm90_se import (
+                MegaMoeSm90SEExecutor,
+            )
+
+            return (
+                MegaMoeSm90SEExecutor
+                if sm90_mega_available(shared=True)
+                else MegaMoeSm90Executor
+            )
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se import (
             MegaMoeSEExecutor,
             _mega_moe_se_available,
@@ -96,6 +119,12 @@ class CudaMegaMoeStrategy(_CudaFp8Fp4Strategy):
 
     @classmethod
     def get_executor_class(cls) -> Type:
+        if is_sm90():
+            from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_sm90 import (
+                MegaMoeSm90Executor,
+            )
+
+            return MegaMoeSm90Executor
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe import (
             MegaMoeExecutor,
         )

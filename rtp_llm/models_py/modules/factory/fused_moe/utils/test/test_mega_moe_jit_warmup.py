@@ -21,14 +21,19 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe im
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_se import (
     MegaMoeSEExecutor,
 )
+from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.mega_moe_sm90 import (
+    MegaMoeSm90Executor,
+)
 from rtp_llm.models_py.modules.factory.fused_moe.utils.mega_moe.input_packer import (
     FusedMegaMoEInputPacker,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.utils.mega_moe.jit_warmup import (
     clamp_token_counts,
     generate_mega_moe_jit_token_counts,
+    generate_mega_moe_sm90_jit_token_counts,
     mega_moe_config_signature,
     mega_moe_jit_warmup_enabled,
+    mega_moe_sm90_config_signature,
     parse_mega_moe_jit_warmup_tokens_override,
 )
 from rtp_llm.ops import MoeConfig, ParallelismConfig
@@ -300,6 +305,121 @@ class MegaMoeJitWarmupTest(unittest.TestCase):
                         executor._resolve_jit_warmup_token_counts(128), [1]
                     )
                 self.assertFalse(generator.call_args.kwargs["include_cap"])
+
+
+class MegaMoeSm90JitWarmupTest(unittest.TestCase):
+    def test_generated_counts_cover_row_layout_boundaries(self):
+        # Independent boundary fixtures: arrival counter, occupancy, decode
+        # policy, bound-derived lag and pull batching.
+        expected = {
+            2: [1, 4, 22, 86, 129, 257, 8192],
+            4: [1, 4, 11, 43, 129, 257, 8192, 10881],
+            8: [1, 4, 6, 22, 129, 257, 5377, 8192, 10881],
+        }
+        for ep_size, counts in expected.items():
+            with self.subTest(ep_size=ep_size):
+                self.assertEqual(
+                    generate_mega_moe_sm90_jit_token_counts(
+                        num_ranks=ep_size,
+                        num_experts=256,
+                        num_topk=6,
+                        max_tokens_per_rank=16384,
+                    ),
+                    counts,
+                )
+
+    def test_row_layout_tile_and_bound_lag(self):
+        # Row-layout MXFP4 retains the 64x256 tile above 256 tokens.
+        for tokens in (1, 4, 128, 129, 256, 257, 683, 8192, 16384):
+            with self.subTest(tokens=tokens):
+                signature = mega_moe_sm90_config_signature(
+                    num_experts_per_rank=32,
+                    num_topk=6,
+                    num_tokens=tokens,
+                )
+                self.assertEqual(signature[0], 64)
+                self.assertEqual(signature[1], 4 <= tokens <= 128)
+        # The bound is rounded up to 128 before computing the L2 lag.
+        for tokens, lag in ((5376, 14), (5377, 29), (10880, 29), (10881, 43)):
+            with self.subTest(tokens=tokens):
+                signature = mega_moe_sm90_config_signature(
+                    num_experts_per_rank=32,
+                    num_topk=6,
+                    num_tokens=tokens,
+                )
+                self.assertEqual(signature[6], lag)
+
+    def test_generated_counts_never_exceed_runtime_cap(self):
+        tokens = generate_mega_moe_sm90_jit_token_counts(
+            num_ranks=8,
+            num_experts=256,
+            num_topk=6,
+            max_tokens_per_rank=257,
+        )
+        self.assertTrue(tokens)
+        self.assertLessEqual(max(tokens), 257)
+
+    def test_unchunked_generated_counts_use_bucket_representative(self):
+        tokens = generate_mega_moe_sm90_jit_token_counts(
+            num_ranks=8,
+            num_experts=256,
+            num_topk=6,
+            max_tokens_per_rank=16384,
+        )
+        self.assertLess(tokens[-1], 16384)
+
+    def test_chunked_generated_counts_cover_runtime_cap(self):
+        tokens = generate_mega_moe_sm90_jit_token_counts(
+            num_ranks=8,
+            num_experts=256,
+            num_topk=6,
+            max_tokens_per_rank=16384,
+            include_cap=True,
+        )
+        self.assertEqual(tokens[-1], 16384)
+
+    def test_warmup_runs_eager_and_bound_variants_per_bucket(self):
+        executor = MegaMoeSm90Executor.__new__(MegaMoeSm90Executor)
+        torch.nn.Module.__init__(executor)
+        model_config = ModelConfig()
+        model_config.hidden_size = 128
+        model_config.moe_inter_size = 128
+        model_config.expert_num = 16
+        model_config.moe_k = 4
+        model_config.n_shared_experts = 0
+        model_config.swiglu_limit = 7.0
+        parallelism = ParallelismConfig()
+        parallelism.ep_size = 2
+        parallelism.ep_rank = 0
+        parallelism.world_size = 2
+        parallelism.world_rank = 0
+        parallelism.dp_size = 2
+        parallelism.dp_rank = 0
+        executor.cfg = MoEConfigAdapter(
+            model_config, parallelism, MoeConfig()
+        ).for_layer(
+            layer_id=1,
+            moe_inter_dim=128,
+            moe_w1_layout="gate_up",
+            max_tokens_per_rank=4,
+            moe_quant_method="FP8_FP4",
+        )
+        executor._output = torch.empty(4, 128)
+
+        with mock.patch.dict(
+            os.environ, {"MODEL_WARM_UP": "1"}, clear=True
+        ), mock.patch.object(executor, "_run") as run, mock.patch(
+            "torch.distributed.barrier"
+        ) as barrier, mock.patch(
+            "torch.cuda.synchronize"
+        ):
+            executor.warmup_jit([1, 4])
+
+        shapes = [call.args[0].size(0) for call in run.call_args_list]
+        bounds = [call.args[3] for call in run.call_args_list]
+        self.assertEqual(shapes, [1, 1, 4, 4])
+        self.assertEqual(bounds, [None, 1, None, 4])
+        self.assertEqual(barrier.call_count, 5)
 
 
 if __name__ == "__main__":

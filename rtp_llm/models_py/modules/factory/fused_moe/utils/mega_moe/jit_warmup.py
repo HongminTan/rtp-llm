@@ -169,6 +169,69 @@ def generate_mega_moe_jit_token_counts(
     return reps
 
 
+def mega_moe_sm90_config_signature(
+    *,
+    num_experts_per_rank: int,
+    num_topk: int,
+    num_tokens: int,
+) -> tuple:
+    """Conservative buckets for row-layout MXFP4, K128 and default scheduling.
+
+    BLOCK_M stays 64. Buffer geometry may map several buckets to one kernel.
+    """
+    routed_tokens = num_tokens * num_topk
+    aligned_bound = _ceil_div(max(num_tokens, 1), 128) * 128
+    units_per_expert = max(
+        _ceil_div(aligned_bound * num_topk, num_experts_per_rank * 1024), 1
+    )
+    # Match the scheduler's half-up rounding and [8, 64] lag clamp.
+    lag = min(max((45 * num_experts_per_rank * units_per_expert + 50) // 100, 8), 64)
+    return (
+        64,
+        4 <= num_tokens <= 128,
+        num_tokens <= 128,
+        num_tokens <= 256,
+        routed_tokens < num_experts_per_rank,
+        routed_tokens > 4 * num_experts_per_rank,
+        lag,
+        num_tokens >= 8192,
+    )
+
+
+def generate_mega_moe_sm90_jit_token_counts(
+    *,
+    num_ranks: int,
+    num_experts: int,
+    num_topk: int,
+    max_tokens_per_rank: int,
+    include_cap: bool = False,
+) -> list[int]:
+    """Select row-layout warmup counts, optionally using capacity in the last bucket."""
+    max_tokens = max(int(max_tokens_per_rank), 0)
+    if max_tokens == 0:
+        return []
+    num_experts_per_rank = max(int(num_experts) // max(int(num_ranks), 1), 1)
+
+    def signature(num_tokens: int) -> tuple:
+        return mega_moe_sm90_config_signature(
+            num_experts_per_rank=num_experts_per_rank,
+            num_topk=num_topk,
+            num_tokens=num_tokens,
+        )
+
+    reps: list[int] = []
+    last_signature: tuple | None = None
+    for num_tokens in range(1, max_tokens + 1):
+        current = signature(num_tokens)
+        if current != last_signature:
+            reps.append(num_tokens)
+            last_signature = current
+
+    if reps and include_cap and signature(reps[-1]) == signature(max_tokens):
+        reps[-1] = max_tokens
+    return reps
+
+
 def parse_mega_moe_jit_warmup_tokens_override() -> list[int] | None:
     raw_value = os.environ.get("MEGA_MOE_JIT_WARMUP_TOKENS")
     if not raw_value:

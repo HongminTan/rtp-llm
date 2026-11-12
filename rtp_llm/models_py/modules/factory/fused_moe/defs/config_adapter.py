@@ -116,10 +116,6 @@ class MoEConfigAdapter:
         self.ll_num_max_token = self.moe_config.ll_num_max_token
         self.masked_max_token_num = self.moe_config.masked_max_token_num
         self.dsv4_moe_sm90_storage = self.moe_config.dsv4_moe_sm90_storage
-        if self.dsv4_moe_sm90_storage not in ("fp8", "fp4"):
-            raise ValueError(
-                f"Invalid dsv4_moe_sm90_storage: {self.dsv4_moe_sm90_storage!r}"
-            )
         self.moe_strategy = self.moe_config.moe_strategy
         self.use_mori_ep = self.moe_config.use_mori_ep
         self.use_deepep_moe = self.moe_config.use_deepep_moe

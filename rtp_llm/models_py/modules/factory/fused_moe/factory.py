@@ -52,14 +52,6 @@ class FusedMoeFactory:
         """
         strategy = self.registry.get_strategy(config)
 
-        if config.dsv4_moe_sm90_storage == "fp4":
-            from .impl.cuda.executors.grouped_fp4_sm90 import GroupedFp4Sm90Executor
-
-            if strategy.get_executor_class() is not GroupedFp4Sm90Executor:
-                raise ValueError(
-                    "dsv4_moe_sm90_storage=fp4 requires the SM90 grouped FP4 executor"
-                )
-
         router = strategy.create_router(config)
         executor = strategy.create_executor(config, weights)
 
