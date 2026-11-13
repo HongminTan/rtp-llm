@@ -1,6 +1,6 @@
 """DSv4 Indexer FP8-paged score path via DeepGEMM.
 
-Wraps ``deep_gemm.fp8_paged_mqa_logits`` so it can drop into the indexer
+Wraps ``deep_gemm.fp8_fp4_paged_mqa_logits`` so it can drop into the indexer
 decode loop in place of the bf16 ``v4_indexer_score`` Triton kernel
 when the cache is FP8 packed (132B/slot).
 
@@ -34,40 +34,12 @@ from rtp_llm.models_py.modules.dsv4.fp8._indexer_quant_triton import (
     INDEXER_ENTRY_BYTES,
     INDEXER_HEAD_DIM,
 )
+from rtp_llm.models_py.utils.arch import is_sm90
 
 try:
     import deep_gemm as _deep_gemm
-
-    # DeepGEMM 2.8 renamed the group-128 MQA logits entry points to the
-    # fp8_fp4_* family and switched q to a (tensor, sf|None) tuple.
-    _HAS_DEEP_GEMM = hasattr(_deep_gemm, "fp8_paged_mqa_logits") and hasattr(
-        _deep_gemm, "get_paged_mqa_logits_metadata"
-    )
-    _HAS_DEEP_GEMM_MQA = hasattr(_deep_gemm, "fp8_mqa_logits")
-    # DeepGEMM 2.8.1 tightens the SM100 logits contracts: paged MQA requires
-    # varlen indices and non-paged MQA requires per-element MX q scale
-    # factors, so the group-128 legacy calls (q without SF) are rejected on
-    # SM100 there and must fall back to the Triton kernel. 2.8.0 still
-    # accepts them, and the legacy entry points exist in both versions.
-    import re as _re
-
-    _match = _re.match(r"(\d+)\.(\d+)\.(\d+)", getattr(_deep_gemm, "__version__", ""))
-    _DEEP_GEMM_SM100_LEGACY_OK = bool(_match) and tuple(
-        int(x) for x in _match.groups()
-    ) < (2, 8, 1)
 except ImportError:
     _deep_gemm = None
-    _HAS_DEEP_GEMM = False
-    _HAS_DEEP_GEMM_MQA = False
-    _DEEP_GEMM_SM100_LEGACY_OK = False
-
-
-def _sm100_needs_triton_fallback(device) -> bool:
-    """Whether this wheel rejects the group-128 legacy logits calls on SM100."""
-    return (
-        torch.cuda.get_device_capability(device)[0] == 10
-        and not _DEEP_GEMM_SM100_LEGACY_OK
-    )
 
 
 def deepgemm_supports_block_kv(device, block_kv: int) -> bool:
@@ -86,35 +58,32 @@ def deepgemm_supports_block_kv(device, block_kv: int) -> bool:
 
 
 def supports_paged_mqa_logits(device, block_kv: Optional[int] = None) -> bool:
-    """Whether :func:`fp8_paged_indexer_score` takes the DeepGEMM path.
-
-    Single source of truth shared by the production dispatch and the
-    capability gates in the tests: the DeepGEMM entry points must exist, the
-    wheel must accept the group-128 legacy call on this device, and (when
-    ``block_kv`` is given) the block size must satisfy the metadata contract.
-    """
-    if not _HAS_DEEP_GEMM or _sm100_needs_triton_fallback(device):
-        return False
-    return block_kv is None or deepgemm_supports_block_kv(device, block_kv)
+    """Whether this group-128 call selects native DeepGEMM, not overall availability."""
+    return (
+        (
+            _deep_gemm is not None
+            and callable(getattr(_deep_gemm, "fp8_fp4_paged_mqa_logits", None))
+        )
+        and is_sm90(device)
+        and (block_kv is None or block_kv == 64)
+    )
 
 
 def supports_mqa_logits(device) -> bool:
-    """Whether :func:`fp8_mqa_indexer_score` takes the DeepGEMM path."""
-    return _HAS_DEEP_GEMM_MQA and not _sm100_needs_triton_fallback(device)
+    """Whether this group-128 call selects native DeepGEMM, not overall availability."""
+    return (
+        _deep_gemm is not None
+        and callable(getattr(_deep_gemm, "fp8_fp4_mqa_logits", None))
+    ) and is_sm90(device)
 
 
 def has_fp8_paged_mqa_logits() -> bool:
-    """Kernel availability — not a device/path decision (always usable).
-
-    The group-128 paged kernel is always servable: DeepGEMM when the wheel
-    accepts the call, the Triton fallback otherwise. Ask
-    :func:`supports_paged_mqa_logits` which path actually runs.
-    """
+    """The group-128 scorer is available through DeepGEMM or Triton."""
     return True
 
 
 def has_fp8_mqa_logits() -> bool:
-    """Kernel availability — not a device/path decision; see above."""
+    """The group-128 scorer is available through DeepGEMM or Triton."""
     return True
 
 
@@ -159,9 +128,7 @@ def fp8_paged_indexer_score(
 
     Returns ``[B*next_n, max_ctx_len] fp32`` — feed straight to topk.
     Padded columns past per-row ``context_lens[b, n]`` are left as
-    whatever DeepGEMM writes (use ``clean_logits=True`` if the
-    downstream topk needs ``-inf`` there; default False to save the
-    extra mask).
+    whatever DeepGEMM writes; downstream TopK must use the context lengths.
     """
     assert q_fp8.dtype == torch.float8_e4m3fn, f"q_fp8 dtype={q_fp8.dtype}"
     assert q_fp8.dim() == 4 and q_fp8.shape[-1] == INDEXER_HEAD_DIM
@@ -196,19 +163,20 @@ def fp8_paged_indexer_score(
             metadata.block_table,
             max_ctx_len,
         )
-    return _deep_gemm.fp8_paged_mqa_logits(
-        q_rows.contiguous(),
+    return _deep_gemm.fp8_fp4_paged_mqa_logits(
+        (q_rows.contiguous(), None),
         kv_4d,
         w_fold.contiguous(),
         metadata.context_lens,
         metadata.block_table,
         metadata.schedule,
-        max_ctx_len,
+        max_context_len=max_ctx_len,
+        indices=None,
     )
 
 
 # ---------------------------------------------------------------------------
-# Prefill (non-paged) wrapper around ``deep_gemm.fp8_mqa_logits``.
+# Prefill (non-paged) wrapper around ``deep_gemm.fp8_fp4_mqa_logits``.
 #
 # Shape contract:
 #   q_fp8        [M, H, D]    float8_e4m3fn  (M = total query tokens)
@@ -219,9 +187,7 @@ def fp8_paged_indexer_score(
 #   cu_seqlen_ks [M]          int32          (K start, inclusive)
 #   cu_seqlen_ke [M]          int32          (K end,   exclusive)
 #
-# Returns ``[M, N] fp32`` logits — same semantics as ``v4_indexer_score``
-# but laid out flat over total query tokens (the indexer prefill caller
-# reshapes back to ``[B, S, T]``).
+# Native columns are request-relative; Triton retains global K columns.
 # ---------------------------------------------------------------------------
 
 
@@ -236,14 +202,13 @@ def fp8_mqa_indexer_score(
     clean_logits: bool = False,
     max_seqlen_k: int = 0,
 ) -> torch.Tensor:
-    """One-shot non-paged FP8 indexer logits via DeepGEMM.
+    """Return FP32 logits using the backend selected for the input format.
 
-    Returns ``[M, N] fp32`` (M = total Q tokens this chunk; N = total K
-    tokens in the gathered workspace). Caller reshapes back to ``[B, S, T]``.
+    Native DeepGEMM columns are request-relative; Triton columns are global.
 
-    ``clean_logits=False`` matches what we want — entries past
-    ``cu_seqlen_ke[m]`` are left untouched; the topk-with-causal-mask path
-    in :class:`Indexer.forward` re-applies its own ``q_pos`` causal cap.
+    Valid columns are [0, ke-ks) for DeepGEMM and [ks, ke) for Triton.
+    clean_logits fills invalid columns with negative infinity.
+    The native output row stride can include padding.
     """
     assert q_fp8.dtype == torch.float8_e4m3fn and q_fp8.dim() == 3
     assert q_fp8.shape[-1] == INDEXER_HEAD_DIM
@@ -272,13 +237,23 @@ def fp8_mqa_indexer_score(
             clean_logits=clean_logits,
             max_seqlen_k=max_seqlen_k,
         )
-
-    return _deep_gemm.fp8_mqa_logits(
-        q_fp8.contiguous(),
+    width = max_seqlen_k if max_seqlen_k > 0 else k_quant.shape[0]
+    if q_fp8.shape[0] == 0 or width == 0:
+        return torch.empty(
+            (q_fp8.shape[0], width), dtype=torch.float32, device=q_fp8.device
+        )
+    scores = _deep_gemm.fp8_fp4_mqa_logits(
+        (q_fp8.contiguous(), None),
         (k_quant.contiguous(), k_scale.contiguous()),
         w_fold.contiguous(),
         cu_seqlen_ks.contiguous(),
         cu_seqlen_ke.contiguous(),
-        clean_logits,
-        max_seqlen_k,
+        max_seqlen_k=width,
     )
+    if clean_logits:
+        columns = torch.arange(width, device=scores.device)
+        scores.masked_fill_(
+            columns[None, :] >= (cu_seqlen_ke - cu_seqlen_ks)[:, None],
+            -torch.inf,
+        )
+    return scores

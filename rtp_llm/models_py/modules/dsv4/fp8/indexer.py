@@ -1,22 +1,8 @@
-"""DeepSeek-V4 lightning Indexer — FP8 KV pool path.
+"""DSv4 Indexer over the FP8 K cache.
 
-Companion to ``indexer.py`` (BF16 path). Always uses DeepGEMM for the
-FP8 indexer score (paged for decode, non-paged for prefill); the bf16
-``v4_indexer_score`` fallback path lives in the BF16 class.
-
-Nested compressor is ``CompressorFP8(head_dim=128)`` which writes the
-132B grouped UE8M0 layout that DeepGEMM consumes directly.
-
-What this class does NOT do — by design:
-
-  * NO ``_bind_kv_cache_for_indexer`` materialization. DeepGEMM reads
-    the FP8 pool directly via ``fp8_paged_mqa_logits`` /
-    ``fp8_mqa_logits``. No bf16 dequant intermediate.
-  * NO env gate (``_fp8_deepgemm_score_enabled`` / equivalent). FP8
-    class always uses DeepGEMM. If DeepGEMM is unavailable at runtime,
-    the layer construction itself should fail loudly.
-  * NO bf16 / FP8 runtime branching. Pick the right indexer class at
-    attention construction time.
+SM90 uses native DeepGEMM FP8 MQA for prefill and paged decode. Prefill
+scores are consumed in bounded row chunks; backend-specific column bounds
+are passed to TopK without expanding a second logits tensor.
 """
 
 from __future__ import annotations
@@ -53,6 +39,7 @@ from rtp_llm.models_py.modules.dsv4.fp8._indexer_score import (
     fp8_paged_indexer_score,
     has_fp8_mqa_logits,
     has_fp8_paged_mqa_logits,
+    supports_mqa_logits,
 )
 from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import PoolBackedModule
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import (
@@ -186,18 +173,21 @@ def _run_prefill_topk(
     )
 
 
-def _fp8_prefill_score_chunk_rows() -> int:
-    """Rows per non-paged FP8 prefill score chunk.
-
-    ``fp8_mqa_indexer_score`` returns dense ``[M, T]`` logits. Long-context
-    CP prefill can have hundreds of thousands of local query rows and K rows,
-    so the one-shot output is not viable. Keep the default aligned with the
-    other DSV4 chunk knobs; lower it with the env var on tighter HBM budgets.
-    """
-    return dsv4_chunk_tokens_from_env(
-        "DSV4_FP8_INDEXER_SCORE_CHUNK_ROWS",
-        min_value=0,
+def _fp8_prefill_score_chunk_rows(width: int) -> int:
+    """Bound each score tensor by padded FP32 bytes as well as query rows."""
+    budget = 256 * 1024 * 1024
+    if width <= 0:
+        raise ValueError("Score width must be positive")
+    # Native MQA pads rows to BLOCK_Q (at most four for 32/64 heads) and
+    # columns to 256 FP32 values. Budget the physical allocation.
+    stride = (width + 255) // 256 * 256
+    rows = min(4096, budget // (stride * 4)) // 4 * 4
+    if rows == 0:
+        raise ValueError("Score budget cannot hold one native MQA row tile")
+    requested = dsv4_chunk_tokens_from_env(
+        "DSV4_FP8_INDEXER_SCORE_CHUNK_ROWS", min_value=0
     )
+    return min(rows, requested) if requested > 0 else rows
 
 
 def _get_topk_workspace(device: torch.device) -> torch.Tensor:
@@ -321,9 +311,8 @@ class IndexerFP8(PoolBackedModule):
             f"(matches CompressorFP8 132B layout); got {index_head_dim}"
         )
         assert has_fp8_paged_mqa_logits(), (
-            "FP8 indexer kernel stack unavailable — IndexerFP8 needs either "
-            "deep_gemm.fp8_paged_mqa_logits or the group-128 Triton fallback. "
-            "Use IndexerBF16 if neither is importable."
+            "FP8 indexer kernel stack unavailable — IndexerFP8 requires "
+            "native DeepGEMM or the group-128 Triton scorer."
         )
         assert layer_weights is not None, (
             "IndexerFP8 requires layer_weights — meta-tensor / stand-alone "
@@ -1191,11 +1180,9 @@ class IndexerFP8(PoolBackedModule):
                 )
             del q, weights, q_for_quant, w_for_quant
 
-            assert (
-                has_fp8_mqa_logits()
-            ), (
-                "FP8 prefill kernel stack unavailable — IndexerFP8 needs either "
-                "deep_gemm.fp8_mqa_logits or the group-128 Triton fallback"
+            assert has_fp8_mqa_logits(), (
+                "FP8 prefill kernel stack unavailable — IndexerFP8 requires "
+                "native DeepGEMM or the group-128 Triton scorer"
             )
             assert self._kv_pool_view.dim() == 3, (
                 "IndexerFP8 expects 3D ``_kv_pool_view`` "
@@ -1203,7 +1190,7 @@ class IndexerFP8(PoolBackedModule):
                 f"{self._kv_pool_view.dim()}"
             )
 
-            if T == 0:
+            if T == 0 or M == 0:
                 # Cold-start prefill before any compressed tokens — no K
                 # to score against; emit empty topk buffer behavior.
                 return torch.full(empty_shape, -1, dtype=torch.int32, device=x.device)
@@ -1232,19 +1219,30 @@ class IndexerFP8(PoolBackedModule):
                 ):
                     self._wait_prefill_k_cache_gather(indexer_k_pending)
                 indexer_k_pending = None
-            # ``deep_gemm.fp8_mqa_logits`` expects k_scale as 1D fp32 contig:
+            # ``deep_gemm.fp8_fp4_mqa_logits`` expects k_scale as 1D fp32 contig:
             # view uint8 [T, 4] → fp32 [T, 1] → squeeze [T].
             k_scale_flat = k_scale_buf.view(torch.float32).squeeze(-1)
 
             q_score = q_fp8.view(M, self.n_heads, INDEXER_HEAD_DIM)
             w_score = w_fold.view(M, self.n_heads)
-            score_chunk_rows = _fp8_prefill_score_chunk_rows()
+            score_chunk_rows = _fp8_prefill_score_chunk_rows(T)
+            relative_scores = supports_mqa_logits(q_score.device)
+            topk_starts = (
+                torch.zeros_like(attention_inputs.ks)
+                if relative_scores
+                else attention_inputs.ks
+            )
+            topk_ends = (
+                attention_inputs.ke - attention_inputs.ks
+                if relative_scores
+                else attention_inputs.ke
+            )
             chunked_score = score_chunk_rows > 0 and M > score_chunk_rows
             if not chunked_score:
                 score_chunk_rows = M
             out_buf = torch.empty((M, K), dtype=torch.int32, device=x.device)
 
-            # Vendored CUDA per-row TopK over [ks[r], ke[r]). Causal mask is
+            # TopK bounds follow the selected scorer column coordinates. Causal mask is
             # implicit via ke = (q_pos+1)//ratio clamped to T; padding past
             # per-row valid count is ``-1`` from the kernel. For long prefill,
             # score in row chunks because DeepGEMM returns dense [rows, T].
@@ -1259,13 +1257,14 @@ class IndexerFP8(PoolBackedModule):
                         attention_inputs.ks[row_start:row_end],
                         attention_inputs.ke[row_start:row_end],
                         clean_logits=False,
+                        max_seqlen_k=T if relative_scores else 0,
                     )  # [chunk_rows, T] fp32
 
                 with record_function_range("dsv4.fp8.indexer.prefill.topk"):
                     _run_prefill_topk(
                         logits,
-                        attention_inputs.ks[row_start:row_end],
-                        attention_inputs.ke[row_start:row_end],
+                        topk_starts[row_start:row_end],
+                        topk_ends[row_start:row_end],
                         out_buf[row_start:row_end],
                         K,
                         self.compress_ratio,
@@ -1409,11 +1408,9 @@ class IndexerFP8(PoolBackedModule):
                 )
             del q, weights, q_for_quant, w_for_quant
 
-            assert (
-                has_fp8_mqa_logits()
-            ), (
-                "FP8 prefill kernel stack unavailable — IndexerFP8 needs either "
-                "deep_gemm.fp8_mqa_logits or the group-128 Triton fallback"
+            assert has_fp8_mqa_logits(), (
+                "FP8 prefill kernel stack unavailable — IndexerFP8 requires "
+                "native DeepGEMM or the group-128 Triton scorer"
             )
             assert self._kv_pool_view.dim() == 3, (
                 "IndexerFP8 expects 3D ``_kv_pool_view`` "
@@ -1421,7 +1418,7 @@ class IndexerFP8(PoolBackedModule):
                 f"{self._kv_pool_view.dim()}"
             )
 
-            if T == 0:
+            if T == 0 or M == 0:
                 return torch.full(empty_shape, -1, dtype=torch.int32, device=x.device)
 
             if before_gather_k is not None:
@@ -1453,7 +1450,18 @@ class IndexerFP8(PoolBackedModule):
 
             q_score = q_fp8.view(M, self.n_heads, INDEXER_HEAD_DIM)
             w_score = w_fold.view(M, self.n_heads)
-            score_chunk_rows = _fp8_prefill_score_chunk_rows()
+            score_chunk_rows = _fp8_prefill_score_chunk_rows(T)
+            relative_scores = supports_mqa_logits(q_score.device)
+            topk_starts = (
+                torch.zeros_like(attention_inputs.ks)
+                if relative_scores
+                else attention_inputs.ks
+            )
+            topk_ends = (
+                attention_inputs.ke - attention_inputs.ks
+                if relative_scores
+                else attention_inputs.ke
+            )
             chunked_score = score_chunk_rows > 0 and M > score_chunk_rows
             if not chunked_score:
                 score_chunk_rows = M
@@ -1470,13 +1478,14 @@ class IndexerFP8(PoolBackedModule):
                         attention_inputs.ks[row_start:row_end],
                         attention_inputs.ke[row_start:row_end],
                         clean_logits=False,
+                        max_seqlen_k=T if relative_scores else 0,
                     )
 
                 with record_function_range("dsv4.fp8.indexer.prefill.topk"):
                     _run_prefill_topk(
                         logits,
-                        attention_inputs.ks[row_start:row_end],
-                        attention_inputs.ke[row_start:row_end],
+                        topk_starts[row_start:row_end],
+                        topk_ends[row_start:row_end],
                         out_buf[row_start:row_end],
                         K,
                         self.compress_ratio,

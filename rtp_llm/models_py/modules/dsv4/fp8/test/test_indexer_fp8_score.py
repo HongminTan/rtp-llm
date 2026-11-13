@@ -1,7 +1,7 @@
 """DeepGEMM contract for the 132B indexer FP8 pool.
 
 Path coverage: the case executes on any CUDA device. ``supports_paged_mqa_logits``
-selects the kernel — DeepGEMM ``fp8_paged_mqa_logits`` on SM90/SM100 with a
+selects the kernel — DeepGEMM ``fp8_fp4_paged_mqa_logits`` on SM90/SM100 with a
 wheel that accepts the group-128 legacy call, the Triton fallback otherwise
 (e.g. pre-SM90 L20). The call counters below pin the selected path
 (DeepGEMM == 1 when the predicate is true, fallback == 1 when it is false), so
@@ -9,11 +9,11 @@ the numeric comparison is honest about which kernel produced the logits.
 
 Verifies end-to-end that the 132B/slot UE8M0 layout we just locked in
 (``test_indexer_fp8_writer.py``) is consumed correctly by DeepGEMM's
-``fp8_paged_mqa_logits``. This pins the data path:
+``fp8_fp4_paged_mqa_logits``. This pins the data path:
 
   1. K bf16 → UE8M0 quant → 132B pool packing  (matches rtp-llm fused writer)
   2. Q bf16 → per-(token,head) fp8 quant + scale-fold into weights
-  3. DeepGEMM ``fp8_paged_mqa_logits`` reads the 132B pool directly
+  3. DeepGEMM ``fp8_fp4_paged_mqa_logits`` reads the 132B pool directly
   4. Compare returned logits to the pure-PyTorch reference math:
         score[b,n,k_pos] = sum_h relu(sum_d Q[b,n,h,d] * K_dequant[b,k_pos,d]) * w[b,n,h]
 
@@ -79,9 +79,9 @@ class _CountingDeepGemm:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
-    def fp8_paged_mqa_logits(self, *args, **kwargs):
+    def fp8_fp4_paged_mqa_logits(self, *args, **kwargs):
         self.paged += 1
-        return self._inner.fp8_paged_mqa_logits(*args, **kwargs)
+        return self._inner.fp8_fp4_paged_mqa_logits(*args, **kwargs)
 
 
 class _CountingFallback:
@@ -163,7 +163,7 @@ def _ref_indexer_score(Q_bf16, K_dequant_bf16, weights_fp32):
 @pytest.mark.parametrize("next_n", [1, 2, 4])
 @pytest.mark.parametrize("block_size", [32, 64])
 def test_fp8_paged_indexer_score_via_deepgemm(block_size, next_n, monkeypatch):
-    """rtp-llm 132B pool → DeepGEMM ``fp8_paged_mqa_logits`` ≈ bf16 reference."""
+    """rtp-llm 132B pool → DeepGEMM ``fp8_fp4_paged_mqa_logits`` ≈ bf16 reference."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     # Run on every device: when the predicate is False the wrapper must serve
@@ -279,7 +279,7 @@ def test_fp8_paged_indexer_score_via_deepgemm(block_size, next_n, monkeypatch):
     expected_deepgemm = 1 if expects_deepgemm else 0
     expected_fallback = 0 if expects_deepgemm else 1
     assert deepgemm.paged == expected_deepgemm, (
-        f"expected {expected_deepgemm} deep_gemm.fp8_paged_mqa_logits call(s) "
+        f"expected {expected_deepgemm} deep_gemm.fp8_fp4_paged_mqa_logits call(s) "
         f"(predicate says DeepGEMM={expects_deepgemm}), got {deepgemm.paged} — "
         "the capability predicate and the dispatch drifted"
     )

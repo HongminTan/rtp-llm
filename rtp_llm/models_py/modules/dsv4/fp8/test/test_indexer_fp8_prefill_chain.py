@@ -1,44 +1,10 @@
-"""UT: IndexerFP8 prefill kernel chain — gather + score + top-K.
-
-Path coverage: the chain executes on any CUDA device with the vendored gather/
-topk ops. Stage 2 is served by DeepGEMM ``fp8_mqa_logits`` when the shared
-``supports_mqa_logits`` predicate accepts this device/wheel and by the Triton
-fallback otherwise (e.g. SM100 with DeepGEMM >= 2.8.1); a counter in
-``_run_chain`` pins which path ran, so this glue target can never pass by
-skipping every case.
-
-Glue test for the three-kernel chain ``IndexerFP8.forward`` invokes once
-the per-call meta is built:
-
-  1. ``rtp_llm_ops.cp_gather_indexer_k_quant_cache``
-       — gather paged FP8 K + scale via (block_table, cu_kv_seqlens)
-  2. ``deep_gemm.fp8_mqa_logits`` (via :func:`fp8_mqa_indexer_score`)
-       — per-row [ks[r], ke[r]) MQA score, fp32 logits
-  3. ``rtp_llm_ops.dsv4_top_k_per_row_prefill``
-       — per-row TopK over ``[ks[r], ke[r])`` with ``-1`` padding
-
-The kernel-level UTs already lock each kernel's correctness in isolation
-(``test_dsv4_top_k_per_row_prefill.py``, ``test_fp8_mqa_prefill_indexer
-score.py``). This file targets the **glue layer** — the same role
-``IndexerOpGetTopkRaggedV2Test`` plays in the
-``refactor/dsv4_attention_prefill_split_back`` branch (vendored to here
-since we don't take a dependency on ``IndexerOp``):
-
-  * shape / dtype contracts at each boundary
-  * the ``k_scale`` ``view(fp32).squeeze(-1)`` glue that
-    ``deep_gemm.fp8_mqa_logits`` requires
-  * causal ``ke = (q_pos+1)//ratio clamp T`` round-trip — every row's
-    valid topk lands in ``[0, ke[r])`` and padding is ``-1``
-
-Run:
-  CUDA_VISIBLE_DEVICES=7 /opt/conda310/bin/python3 -m unittest \\
-    rtp_llm.models_py.modules.dsv4.test.test_indexer_fp8_prefill_chain
-"""
+"""Validate native DeepGEMM FP8 indexer scoring and TopK. """
 
 from __future__ import annotations
 
 import contextlib
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -70,9 +36,9 @@ class _CountingDeepGemm:
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
-    def fp8_mqa_logits(self, *args, **kwargs):
+    def fp8_fp4_mqa_logits(self, *args, **kwargs):
         self.mqa += 1
-        return self._inner.fp8_mqa_logits(*args, **kwargs)
+        return self._inner.fp8_fp4_mqa_logits(*args, **kwargs)
 
 
 @contextlib.contextmanager
@@ -102,7 +68,7 @@ def _assert_mqa_path(counted, fallback) -> None:
     expected_deepgemm = 1 if expects_deepgemm else 0
     expected_fallback = 0 if expects_deepgemm else 1
     assert counted.mqa == expected_deepgemm, (
-        f"expected {expected_deepgemm} deep_gemm.fp8_mqa_logits call(s) "
+        f"expected {expected_deepgemm} deep_gemm.fp8_fp4_mqa_logits call(s) "
         f"(predicate says DeepGEMM={expects_deepgemm}), got {counted.mqa} — "
         "the capability predicate and the dispatch drifted"
     )
@@ -114,16 +80,7 @@ def _assert_mqa_path(counted, fallback) -> None:
 
 
 def _have_chain_kernels() -> bool:
-    """All pieces of the chain must be present: indexer_k_quant_and_cache
-    (writer), cp_gather_indexer_k_quant_cache (reader), the fp8_mqa_logits
-    path (DeepGEMM or the Triton fallback — see ``supports_mqa_logits``),
-    dsv4_top_k_per_row_prefill.
-
-    The score stage is deliberately *not* gated on the DeepGEMM predicate:
-    the wrapper degrades to Triton, so requiring DeepGEMM here would skip the
-    whole target on SM100 lanes with a group-128-rejecting wheel — and an
-    all-skipped target is a pytest-runner failure, not a pass.
-    """
+    """Require the native score kernel and cache/TopK operators."""
     return (
         torch.cuda.is_available()
         and hasattr(rtp_llm_ops, "cp_gather_indexer_k_quant_cache")
@@ -133,14 +90,36 @@ def _have_chain_kernels() -> bool:
 
 
 class IndexerFP8PrefillChainTest(unittest.TestCase):
-    """End-to-end test of cp_gather + fp8_mqa_logits + dsv4_top_k_per_row_prefill."""
+    """End-to-end test of cp_gather + fp8_fp4_mqa_logits + dsv4_top_k_per_row_prefill."""
+
+    def test_backend_selection(self):
+        from types import SimpleNamespace
+
+        native = SimpleNamespace(
+            fp8_fp4_mqa_logits=lambda: None,
+            fp8_fp4_paged_mqa_logits=lambda: None,
+        )
+        for sm90 in (False, True):
+            with self.subTest(sm90=sm90), patch.object(
+                _indexer_score_mod, "is_sm90", return_value=sm90
+            ), patch.object(_indexer_score_mod, "_deep_gemm", native):
+                self.assertTrue(_indexer_score_mod.has_fp8_mqa_logits())
+                self.assertTrue(_indexer_score_mod.has_fp8_paged_mqa_logits())
+                self.assertEqual(supports_mqa_logits(self.device), sm90)
+                self.assertEqual(
+                    _indexer_score_mod.supports_paged_mqa_logits(self.device, 64),
+                    sm90,
+                )
+                self.assertFalse(
+                    _indexer_score_mod.supports_paged_mqa_logits(self.device, 32)
+                )
 
     def setUp(self) -> None:
         if not _have_chain_kernels():
             self.skipTest("CUDA + deep_gemm + vendored gather/topk kernels required")
         self.device = torch.device("cuda")
         torch.manual_seed(42)
-        # Pick 32 heads so deep_gemm fp8_mqa_logits' seq_len_alignment
+        # Pick 32 heads so deep_gemm fp8_fp4_mqa_logits' seq_len_alignment
         # constraint (block_q = 128/n_heads = 4) is satisfied. IndexerFP8
         # production uses 64 heads (block_q=2), but 32 is the standard
         # cross-test config used in test_indexer_op_v2.py.
@@ -208,7 +187,7 @@ class IndexerFP8PrefillChainTest(unittest.TestCase):
             kv_pool, k_quant, k_scale_buf, block_table, cu_kv_seqlens
         )
         k_scale = k_scale_buf.view(torch.float32).squeeze(-1)
-        self.assertEqual(k_scale.dim(), 1, "fp8_mqa_logits requires 1D k_scale")
+        self.assertEqual(k_scale.dim(), 1, "fp8_fp4_mqa_logits requires 1D k_scale")
         self.assertEqual(k_scale.dtype, torch.float32)
 
         # 2. Q quant + weight scale-fold (4D-shape contract).
@@ -220,7 +199,7 @@ class IndexerFP8PrefillChainTest(unittest.TestCase):
         self.assertEqual(q_fp8.shape, (1, N, H, D))
         self.assertEqual(w_fold.dtype, torch.float32)
 
-        # 3. Score via DeepGEMM (or the Triton fallback off-contract).
+        # 3. Score via native DeepGEMM.
         with _count_mqa_dispatch() as (counted, fallback):
             logits = fp8_mqa_indexer_score(
                 q_fp8.view(N, H, D),
@@ -234,6 +213,10 @@ class IndexerFP8PrefillChainTest(unittest.TestCase):
         _assert_mqa_path(counted, fallback)
         self.assertEqual(logits.shape, (N, num_kv_tokens))
         self.assertEqual(logits.dtype, torch.float32)
+
+        if supports_mqa_logits(q_fp8.device):
+            ke = ke - ks
+            ks = torch.zeros_like(ks)
 
         # 4. Per-row TopK with [ks, ke) window + -1 padding.
         out_buf = torch.empty((N, index_topk), dtype=torch.int32, device=self.device)
@@ -252,6 +235,25 @@ class IndexerFP8PrefillChainTest(unittest.TestCase):
     # ------------------------------------------------------------------
     # Test cases
     # ------------------------------------------------------------------
+    def test_score_chunks_bound_padded_allocation(self) -> None:
+        from rtp_llm.models_py.modules.dsv4.fp8.indexer import (
+            _fp8_prefill_score_chunk_rows,
+        )
+
+        for cap in ("0", "8192", "1024", "3"):
+            with patch.dict("os.environ", {"DSV4_FP8_INDEXER_SCORE_CHUNK_ROWS": cap}):
+                for width in (1, 200, 16384, 52686, 262144, 1048576):
+                    rows = _fp8_prefill_score_chunk_rows(width)
+                    padded_rows = (rows + 3) // 4 * 4
+                    padded_width = (width + 255) // 256 * 256
+                    self.assertLessEqual(
+                        padded_rows * padded_width * 4, 256 * 1024 * 1024
+                    )
+                    self.assertLessEqual(rows, 4096)
+                    self.assertGreater(rows, 0)
+        with self.assertRaises(ValueError):
+            _fp8_prefill_score_chunk_rows(1 << 26)
+
     def test_chain_returns_in_range_indices_with_minus_one_padding(self) -> None:
         """Causal Q-rows: row i sees [0, i+1). TopK should land in
         ``[0, i+1)`` with ``-1`` padding past per-row valid count."""
@@ -314,7 +316,7 @@ class IndexerFP8PrefillChainTest(unittest.TestCase):
 
     def test_chain_k_scale_squeeze_glue(self) -> None:
         """Regression on ``k_scale.view(fp32).squeeze(-1)`` glue. If the
-        squeeze regresses, ``deep_gemm.fp8_mqa_logits`` asserts on
+        squeeze regresses, ``deep_gemm.fp8_fp4_mqa_logits`` asserts on
         ``k_scale.dim() == 1`` and crashes inside ``fp8_mqa_indexer_score``."""
         N = 8
         num_kv_tokens = 8

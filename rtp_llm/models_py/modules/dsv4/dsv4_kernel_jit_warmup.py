@@ -1726,9 +1726,9 @@ def _generate_mhc_prenorm_warmup_specs(
 
 def _fp8_mqa_logits_available() -> bool:
     try:
-        import deep_gemm
+        from .fp8._indexer_score import supports_mqa_logits
 
-        return hasattr(deep_gemm, "fp8_mqa_logits")
+        return supports_mqa_logits(torch.device("cuda"))
     except Exception:
         return False
 
@@ -2805,8 +2805,6 @@ def _launch_dummy_fp8_mqa_logits(
     key: tuple[int, int],
     device: torch.device,
 ) -> None:
-    import deep_gemm
-
     num_heads, head_dim = key
     block_q = max(1, 128 // int(num_heads))
     seq_len = max(1, block_q)
@@ -2821,13 +2819,34 @@ def _launch_dummy_fp8_mqa_logits(
     ks = torch.zeros((seq_len,), dtype=torch.int32, device=device)
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device=device)
 
-    logits = deep_gemm.fp8_mqa_logits(
+    from .fp8._indexer_score import fp8_mqa_indexer_score
+
+    logits = fp8_mqa_indexer_score(
         q,
-        (k, k_scale),
         weights,
+        k,
+        k_scale,
         ks,
         ke,
-        False,
-        0,
+        max_seqlen_k=seq_len_kv,
     )
+    # Warm the paged FP8 contract with the same query flattening used at runtime.
+    from .fp8._indexer_score import fp8_paged_indexer_score, supports_paged_mqa_logits
+
+    if supports_paged_mqa_logits(device, 64):
+        pages = torch.zeros((seq_len_kv, 132), dtype=torch.uint8, device=device)
+        table = torch.arange(4, dtype=torch.int32, device=device).view(1, 4)
+        for query_len in (1, 2, 3, 5):
+            paged_q = torch.zeros(
+                (1, query_len, num_heads, head_dim), dtype=q.dtype, device=device
+            )
+            folded = torch.zeros(
+                (query_len, num_heads), dtype=torch.float32, device=device
+            )
+            lengths = torch.full(
+                (1, query_len), seq_len_kv, dtype=torch.int32, device=device
+            )
+            fp8_paged_indexer_score(
+                paged_q, folded, pages, table, lengths, 64, seq_len_kv
+            )
     del q, k, k_scale, weights, ks, ke, logits
