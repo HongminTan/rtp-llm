@@ -1,26 +1,24 @@
-/// \file topk_impl.cuh
+/// \file topk_v3.cuh
 /// \brief DeepSeek V4 (DSA indexer) top-k implementation classes.
 ///
 /// This header holds ONLY the device-side implementation classes + helpers; the
-/// `__global__` kernels and the host dispatcher live in csrc/deepseek_v4/topk_v2.cuh.
+/// `__global__` kernels and the host dispatcher live in topk_v3.cu.
 ///
 /// Design notes:
 ///  - top-k (`topk`) is a *runtime* value (<= kMaxTopK = 2048), never a
 ///    compile-time constant.
-///  - the output is the page-table transform of the selected raw indices
-///    (`TopKProblem::emit` then `transform_output`).
-///  - each block reads its own `seq_len` (per-batch ragged lengths) -- the host
-///    launches one universal kernel and dispatches per block.
+///  - topk_v3 returns raw column indices in each row's valid prefix.
+///  - the host selects a kernel by batch size, K and maximum sequence length.
+///    Device code uses the individual row lengths.
 ///  - the standalone launcher instantiates 2/4/8-CTA cluster variants.
 ///
-/// Algorithm: fp16 coarse histogram -> threshold bin -> fp32-boundary collect ->
-/// exact radix tie-break.
+/// The FP16 histogram locates the Kth score. Oversized mixed bins are narrowed
+/// by FP32 radix digits before candidate collection and exact selection.
 
 #pragma once
 
 #include "topk_v3_compat.cuh"
 
-#include <cfloat>
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <limits>
@@ -47,14 +45,7 @@ constexpr T ct_max(T a, Ts... rest) {
     return a > m ? a : m;
 }
 
-/// Static shared-memory buffer sized + aligned to hold any one of the given
-/// impl `Smem` types. A kernel that dispatches across several paths (e.g. the
-/// fused small-batch kernel runs either Streaming or Cluster; the main kernel
-/// runs any of Register2/Register4/Streaming) declares one
-/// `__shared__ MaxSmem<...> smem` and hands `&smem` to whichever forward() it
-/// calls -- instead of hand-picking "the largest" type and relying on it
-/// staying the largest. `&smem` converts to the `void*` the forwards expect;
-/// the buffer is aligned to the strictest member, so the cast is well-aligned.
+/// Shared storage sized and aligned for any of the supplied kernel implementations.
 template<typename... Smems>
 struct MaxSmem {
     static constexpr size_t kSize  = ct_max(sizeof(Smems)...);
@@ -68,6 +59,8 @@ struct MaxSmem {
 
 SGL_DEVICE uint32_t extract_exact_bin(float x) {
     uint32_t bits = __float_as_uint(x);
+    if ((bits & 0x7fffffffu) == 0)
+        bits = 0;  // Both FP32 zeros have the same rank.
     if ((bits & 0x7fffffffu) > 0x7f800000u)
         return 0xffffffffu;
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
@@ -79,12 +72,16 @@ SGL_DEVICE bool is_nan(float x) {
 
 template<uint32_t kBits>
 SGL_DEVICE uint32_t extract_coarse_bin(float x) {
-    static_assert(0 < kBits && kBits < 15);
-    const auto     hx   = cast<fp16_t>(x);
-    const uint16_t bits = *reinterpret_cast<const uint16_t*>(&hx);
-    if ((bits & 0x7fffu) > 0x7c00u)
-        return (1u << kBits) - 1u;
-    const uint16_t key = (bits & 0x8000) ? ~bits : bits | 0x8000;
+    static_assert(kBits >= 8 && kBits < 15);  // Leave bins outside the finite FP16 key band.
+    constexpr uint32_t end       = 1u << kBits;
+    const uint32_t     raw       = __float_as_uint(x);
+    const uint32_t     magnitude = raw & 0x7fffffffu;
+    // Reserve exact ranks outside the finite bins: -Inf, +Inf, then NaN.
+    // Finite FP32 inputs keep their coarse bin even when conversion overflows.
+    if (magnitude >= 0x7f800000u)
+        return magnitude > 0x7f800000u ? end - 1 : ((raw >> 31) ? 0 : end - 2);
+    const uint16_t bits = magnitude == 0 ? 0u : __half_as_ushort(cast<fp16_t>(x));
+    const uint16_t key  = (bits & 0x8000) ? ~bits : bits | 0x8000;
     return key >> (16 - kBits);
 }
 
@@ -93,57 +90,51 @@ SGL_DEVICE uint32_t extract_coarse_bin(float x) {
 // non-decreasing in its argument, the collect pass can classify an element with two
 // fp32 comparisons against these boundaries instead of recomputing the fp16 bin --
 // removing the F2F conversion and bit-twiddle from the (compute-bound) second pass.
-// Returns -inf for bin 0 (everything qualifies) and +inf for bins past the top.
+// The last two bins hold +Inf and NaNs. Callers classify NaNs explicitly.
 template<uint32_t kBits>
 SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
-    constexpr uint32_t kShift = 16 - kBits;
-    const uint32_t     key    = bin << kShift;  // ordered16 key at the low edge of `bin`
-    // ordered16 -> fp16 value (inverse of the transform in extract_coarse_bin);
-    // finite keys only.
-    const auto to_finite_val = [](uint32_t okey) -> float {
-        const uint16_t ob = static_cast<uint16_t>(okey);
-        const uint16_t hb = (ob & 0x8000) ? static_cast<uint16_t>(ob ^ 0x8000) : static_cast<uint16_t>(~ob);
-        return cast<float>(*reinterpret_cast<const fp16_t*>(&hb));
+    const uint32_t  key = bin << (16 - kBits);
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    if (key < 0x0400u)
+        return bin == 0 ? -inf : std::numeric_limits<float>::lowest();
+    if (key > 0xfc00u)
+        return bin < (1u << kBits) - 1 ? inf : std::numeric_limits<float>::quiet_NaN();
+
+    const auto half_bits = [](uint32_t ordered) -> uint16_t {
+        return (ordered & 0x8000u) ? static_cast<uint16_t>(ordered ^ 0x8000u) : static_cast<uint16_t>(~ordered);
     };
-    // Fast path, hoisted above the per-key special cases so both keys are
-    // range-checked at once: `key` and `key - 1` both land in the finite band
-    // [0x0401, 0xFBFF] -- every boundary a finite-score threshold produces.
-    // fp16 rounds to nearest, so the fp32 boundary is the midpoint between the
-    // fp16 values at `key` and `key - 1`. (Verified bit-exact against the slow
-    // path for every bin of kBits 10 and 12, and measured faster than either
-    // per-key dispatch or an ordered-bit decrement trick -- the two conversions
-    // are independent and issue in parallel.)
-    if (key - 0x0401u <= 0xFBFFu - 0x0401u && bin < (1u << kBits)) {
-        return 0.5f * (to_finite_val(key) + to_finite_val(key - 1));
-    }
-    // Slow path: an edge of `bin` touches the +/-inf keys or NaN key space.
-    // The ordered-key line is: [0, 0x03FF) negative-NaN space, 0x03FF = -inf,
-    // [0x0400, 0xFC00) finite, 0xFC00 = +inf, (0xFC00, 0xFFFF] positive-NaN
-    // space. Treat the +/-inf keys as +/-65536 (one ideal step past fp16 max,
-    // so the midpoint lands exactly on +/-65520 -- the fp32->fp16
-    // round-to-nearest overflow threshold) and saturate NaN-space keys, keeping
-    // the returned boundaries finite-or-inf and monotone. Otherwise a threshold
-    // bin at/next to the inf bin gets NaN boundaries, the collect pass matches
-    // nothing, and rows whose scores contain >= topk (+/-)inf or >65504 values
-    // come back short -- the padded slots then illegal-address downstream.
-    if (bin == 0)
-        return -FLT_MAX;
-    if (bin >= (1u << kBits))
-        return FLT_MAX;
-    const auto to_val = [&](uint32_t okey) -> float {
-        constexpr float k_Inf = std::numeric_limits<float>::infinity();
-        if (okey < 0x03FFu)
-            return -k_Inf;
-        if (okey == 0x03FFu)
-            return -65536.0f;
-        if (okey == 0xFC00u)
-            return 65536.0f;
-        if (okey > 0xFC00u)
-            return FLT_MAX;
-        return to_finite_val(okey);
-    };
-    return 0.5f * (to_val(key) + to_val(key - 1));
+    const uint16_t upper = half_bits(key);
+    // Use the virtual next FP16 magnitude at the finite-range endpoints.
+    const float left     = key == 0x0400u ? -65536.0f : __half2float(__ushort_as_half(half_bits(key - 1)));
+    const float right    = key == 0xfc00u ? 65536.0f : __half2float(__ushort_as_half(upper));
+    const float midpoint = 0.5f * (left + right);
+    // Round-to-nearest-even assigns the midpoint to the neighbor with an even
+    // significand. This also puts +65520 in the overflow bin and -65520 below
+    // the first finite negative bin. At the signed-zero transition upper is +0.
+    return (upper & 1u) ? nextafterf(midpoint, inf) : midpoint;
 }
+
+// Exact keys of all threshold-bin candidates, including those beyond the tie buffer.
+// The coarse key is monotone in the exact key, so this interval excludes every other bin.
+struct BoundaryKeyRange {
+    uint32_t lo;
+    uint32_t hi;
+
+    SGL_DEVICE void include(float value) {
+        const uint32_t key = extract_exact_bin(value);
+        lo                 = min(lo, key);
+        hi                 = max(hi, key);
+    }
+
+    SGL_DEVICE void merge_warp_into(BoundaryKeyRange* row) const {
+        const uint32_t warp_lo = __reduce_min_sync(0xffffffffu, lo);
+        const uint32_t warp_hi = __reduce_max_sync(0xffffffffu, hi);
+        if (threadIdx.x % kWarpSize == 0 && warp_lo <= warp_hi) {
+            atomicMin(&row->lo, warp_lo);
+            atomicMax(&row->hi, warp_hi);
+        }
+    }
+};
 
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 #pragma unroll
@@ -170,7 +161,7 @@ struct alignas(8) TieValue {
 };
 
 // ---------------------------------------------------------------------------
-// Per-batch problem description + page-table transform sink
+// Per-row input and output
 // ---------------------------------------------------------------------------
 
 SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_bits) {
@@ -178,22 +169,16 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
     return (page_table[i >> page_bits] << page_bits) | (i & mask);
 }
 
-/// One batch element's worth of work. `emit(pos, raw_idx)` writes the selected raw
-/// index to output slot `pos`; `transform_output` then applies the page-table
-/// transform in a separate pass (and records the raw index in `raw_out` if set).
+/// topk_v3 emits raw column indices from the first seq_len scores in this row.
 struct TopKProblem {
     const float* __restrict__ in;
-    int32_t* __restrict__ out;      // page_indices [topk]
+    int32_t* __restrict__ out;      // [topk]
     int32_t* __restrict__ raw_out;  // optional raw (pre-transform) indices [topk]; nullptr if unused
     const int32_t* __restrict__ page_table;
     uint32_t topk;
     uint32_t seq_len;
     uint32_t page_bits;
 
-    // Write the raw selected index; the page-table transform is applied afterwards
-    // by transform_output() in a separate, pipelined pass. Keeping the per-element
-    // page_table gather off the atomic-serialized scatter loop is measurably faster
-    // for both short and long context.
     SGL_DEVICE void emit(uint32_t pos, uint32_t raw_idx) const {
         out[pos] = static_cast<int32_t>(raw_idx);
     }
@@ -270,131 +255,6 @@ struct TopKConfig {
             *total = prefix + val;
         __syncthreads();
         return prefix;
-    }
-
-    /// Exact fallback when the coarse threshold bin contains more candidates
-    /// than the fixed shared-memory tie buffer can hold. Re-scan only that
-    /// coarse value interval and skip any FP32 key bytes shared by both interval
-    /// endpoints. Values above the interval have already been emitted.
-    SGL_DEVICE static void exact_boundary_scan_topk(
-        const TopKProblem& problem, TieHandleSmem* smem, float v_lo, float v_hi, uint32_t output_base) {
-        const uint32_t tx = threadIdx.x;
-        if (tx == 0) {
-            const uint32_t lo_key      = extract_exact_bin(v_lo);
-            const uint32_t hi_key      = extract_exact_bin(nextafterf(v_hi, -FLT_MAX));
-            uint32_t       prefix      = 0;
-            uint32_t       first_round = 0;
-#pragma unroll
-            for (uint32_t round = 0; round < 4; ++round) {
-                const uint32_t shift   = 24u - round * 8u;
-                const uint32_t lo_byte = (lo_key >> shift) & 0xffu;
-                const uint32_t hi_byte = (hi_key >> shift) & 0xffu;
-                if (lo_byte != hi_byte)
-                    break;
-                prefix |= lo_byte << shift;
-                first_round = round + 1;
-            }
-            smem->match.bin         = prefix;
-            smem->match.above_count = problem.topk - output_base;
-            smem->match.equal_count = first_round;
-        }
-        __syncthreads();
-
-#pragma unroll 1
-        for (uint32_t round = smem->match.equal_count; round < 4; ++round) {
-            if (tx < kRadixSize)
-                smem->histogram[0][tx] = 0;
-            __syncthreads();
-
-            const uint32_t prefix = smem->match.bin;
-            const uint32_t mask   = round == 0 ? 0u : (~0u << (32u - round * 8u));
-            const uint32_t shift  = 24u - round * 8u;
-            for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-                const float    value = problem.in[idx];
-                const uint32_t key   = extract_exact_bin(value);
-                if (value >= v_lo && value < v_hi && (key & mask) == prefix) {
-                    atomicAdd(&smem->histogram[0][(key >> shift) & 0xffu], 1u);
-                }
-            }
-            __syncthreads();
-
-#pragma unroll 1
-            for (uint32_t step = 0; step < 8; ++step) {
-                if (tx < kRadixSize) {
-                    const uint32_t distance = 1u << step;
-                    const uint32_t src      = step & 1u;
-                    const uint32_t dst      = src ^ 1u;
-                    uint32_t       value    = smem->histogram[src][tx];
-                    if (tx + distance < kRadixSize) {
-                        value += smem->histogram[src][tx + distance];
-                    }
-                    smem->histogram[dst][tx] = value;
-                }
-                __syncthreads();
-            }
-
-            const uint32_t remaining = smem->match.above_count;
-            if (tx < kRadixSize) {
-                const uint32_t count_ge = smem->histogram[0][tx];
-                const uint32_t count_gt = tx + 1u < kRadixSize ? smem->histogram[0][tx + 1u] : 0u;
-                if (count_ge >= remaining && count_gt < remaining) {
-                    smem->match.equal_count = tx;
-                }
-            }
-            __syncthreads();
-            if (tx == 0) {
-                const uint32_t threshold = smem->match.equal_count;
-                const uint32_t count_gt  = threshold + 1u < kRadixSize ? smem->histogram[0][threshold + 1u] : 0u;
-                smem->match.bin |= threshold << shift;
-                smem->match.above_count -= count_gt;
-            }
-            __syncthreads();
-        }
-
-        const uint32_t pivot = smem->match.bin;
-        // Deterministic emission: count per thread, take a thread-order block
-        // prefix, then emit. The atomicAdd version ordered above-pivot elements
-        // by SM arrival, which made run-to-run output order vary.
-        uint32_t my_above = 0;
-        for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float value = problem.in[idx];
-            if (value >= v_lo && value < v_hi && extract_exact_bin(value) > pivot) {
-                ++my_above;
-            }
-        }
-        __syncthreads();
-        const uint32_t base_above = block_exclusive_prefix(my_above, smem->warp_sum, &smem->total_scratch[0]);
-        uint32_t       run_above  = 0;
-        for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float value = problem.in[idx];
-            if (value >= v_lo && value < v_hi && extract_exact_bin(value) > pivot) {
-                problem.emit(output_base + base_above + run_above++, idx);
-            }
-        }
-        __syncthreads();
-        // Threshold-bin ties fill the remaining slots in the same deterministic
-        // thread order instead of SM arrival order, so tie membership is
-        // reproducible run to run.
-        uint32_t my_eq = 0;
-        for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float value = problem.in[idx];
-            if (value >= v_lo && value < v_hi && extract_exact_bin(value) == pivot) {
-                ++my_eq;
-            }
-        }
-        __syncthreads();
-        const uint32_t base_eq = block_exclusive_prefix(my_eq, smem->warp_sum, &smem->total_scratch[1]);
-        uint32_t       run_eq  = 0;
-        for (uint32_t idx = tx; idx < problem.seq_len; idx += kBlockSize) {
-            const float value = problem.in[idx];
-            if (value >= v_lo && value < v_hi && extract_exact_bin(value) == pivot) {
-                const uint32_t pos = output_base + smem->total_scratch[0] + base_eq + run_eq++;
-                if (pos < problem.topk) {
-                    problem.emit(pos, idx);
-                }
-            }
-        }
-        __syncthreads();
     }
 
     /// Resolve the threshold bin's ties exactly. `base` is the number of strictly
@@ -643,12 +503,13 @@ struct TopKRadixBase: TopKConfig {
         using kHistVec = AlignedVector<uint32_t, kHistSize / kBlockSize>;
         alignas(128) uint32_t count_eq;
         alignas(128) uint32_t count_gt;
-        uint32_t threshold_bin;
-        uint32_t warp_sum[kNumWarps];
-        // The coarse histogram is dead once find_threshold() has published
-        // threshold_bin, and the tie machinery only comes alive after that: the
-        // collect pass fills tie.values, then handle_tie works over them with
-        // tie.handle as scratch. Overlaying the two phases keeps the
+        uint32_t         threshold_bin;
+        uint32_t         bin_count;
+        uint32_t         above_bin_count;
+        BoundaryKeyRange boundary_range;
+        uint32_t         warp_sum[kNumWarps];
+        // All histogram passes finish before collection fills tie.values.
+        // handle_tie then uses tie.handle as scratch. Overlaying these phases keeps the
         // kMaxNumTie-candidate buffer from growing the block's shared-memory
         // footprint. tie.handle and tie.values are live TOGETHER, so they sit
         // side by side inside the overlay, not in a union with each other.
@@ -703,6 +564,31 @@ protected:
         }
     }
 
+    // The histogram has already proved that this bin overflows the tie buffer.
+    // Each CTA scans its own chunk, including candidates that will not be staged.
+    template<bool kAlignedInput>
+    SGL_DEVICE static void
+    measure_boundary_range(const float* in, uint32_t length, uint32_t bin, BoundaryKeyRange* row_range) {
+        BoundaryKeyRange range{0xffffffffu, 0u};
+        for_each_input<kAlignedInput>(in, length, [&](float value, uint32_t) {
+            if (extract_coarse_bin<kHistBits>(value) == bin)
+                range.include(value);
+        });
+        range.merge_warp_into(row_range);
+    }
+
+    SGL_DEVICE static void finish_selection(const TopKProblem& problem, Smem* smem) {
+        const auto base = smem->count_gt;
+        // An exact fit or a single winning rank may already have filled every slot.
+        if (base >= problem.topk)
+            return;
+        const auto remaining = problem.topk - base;
+        const auto count     = smem->count_eq;
+        // Refinement stops above capacity only when every boundary key is identical.
+        handle_tie(
+            smem->tie.values, problem, base, count > kMaxNumTie ? remaining : count, remaining, &smem->tie.handle);
+    }
+
     SGL_DEVICE static void find_threshold(const uint32_t topk, const uint32_t seq_len, Smem* smem) {
         const auto         tx     = threadIdx.x;
         constexpr uint32_t kItems = kHistSize / kBlockSize;
@@ -734,18 +620,105 @@ protected:
             prefix_sum += orig[i];
             const auto above = seq_len - prefix_sum;
             if (above < topk && above + orig[i] >= topk) {
-                smem->threshold_bin = tx * kItems + i;
+                const uint32_t bin    = tx * kItems + i;
+                smem->threshold_bin   = bin;
+                smem->bin_count       = orig[i];
+                smem->above_bin_count = above;
             }
         }
         __syncthreads();
     }
+
+    template<uint32_t kClusterSize>
+    SGL_DEVICE static void reduce_histogram(Smem* smem) {
+        if constexpr (kClusterSize > 1) {
+            // Each rank reduces a partition of bins and publishes the totals to every peer.
+            static_assert(kHistSize == kBlockSize);
+            const auto cluster = cg::this_cluster();
+            cluster.sync();
+            const auto bin   = blockIdx.y * (kHistSize / kClusterSize) + threadIdx.x / kClusterSize;
+            const auto peer  = cluster.map_shared_rank(&smem->histogram[bin], threadIdx.x % kClusterSize);
+            const auto count = *peer;
+            *peer            = warp::reduce_sum<kClusterSize>(count);
+            cluster.sync();
+        }
+    }
+
+    struct Bounds {
+        float lo;
+        float hi;
+    };
+
+    template<uint32_t kClusterSize, bool kAlignedInput>
+    __device__ __noinline__ static Bounds
+    refine_boundary(const float* in, uint32_t length, uint32_t need, Smem* smem, BoundaryKeyRange* row_range) {
+        const auto bin   = smem->threshold_bin;
+        auto       count = smem->bin_count;
+        measure_boundary_range<kAlignedInput>(in, length, bin, row_range);
+        if constexpr (kClusterSize > 1) {
+            cg::this_cluster().sync();
+        } else {
+            __syncthreads();
+        }
+        auto range = *row_range;
+
+        // Each pass consumes up to kHistBits of the remaining exact key. All CTAs
+        // participate, even if the Kth value is buried in one rank's input chunk.
+        while (range.lo < range.hi && need < count && count > kMaxNumTie) {
+            const uint32_t          shift  = max(0, 32 - __clz(range.hi ^ range.lo) - int(kHistBits));
+            const uint32_t          suffix = (1u << shift) - 1;
+            const uint32_t          prefix = range.lo & ~(((kHistSize - 1) << shift) | suffix);
+            typename Smem::kHistVec zeros;
+            zeros.fill(0);
+            smem->hist_vecs[threadIdx.x] = zeros;
+            __syncthreads();
+            for_each_input<kAlignedInput>(in, length, [&](float value, uint32_t) {
+                const auto key = extract_exact_bin(value);
+                if (key >= range.lo && key <= range.hi)
+                    atomicAdd(&smem->histogram[(key >> shift) & (kHistSize - 1)], 1);
+            });
+            __syncthreads();
+            reduce_histogram<kClusterSize>(smem);
+            find_threshold(need, count, smem);
+            const uint32_t start = prefix | (smem->threshold_bin << shift);
+            range.lo             = max(range.lo, start);
+            range.hi             = min(range.hi, start | suffix);
+            need -= smem->above_bin_count;
+            count = smem->bin_count;
+        }
+
+        // Use the *next exact key* for the exclusive upper bound. Its inverse
+        // also maps the key between the smallest negative subnormal and +0 to zero.
+        const auto from_key = [](uint32_t key) {
+            return __uint_as_float(key & 0x80000000u ? key ^ 0x80000000u : ~key);
+        };
+        const float lo = from_key(range.lo);
+        return {lo, need == count ? lo : from_key(range.hi + 1)};
+    }
+
+    template<uint32_t kClusterSize, bool kAlignedInput>
+    SGL_DEVICE static Bounds
+    selection_bounds(const float* in, uint32_t length, uint32_t topk, Smem* smem, BoundaryKeyRange* row_range) {
+        const auto bin         = smem->threshold_bin;
+        const auto count       = smem->bin_count;
+        const auto need        = topk - smem->above_bin_count;
+        const bool single_rank = bin == 0 || bin >= kHistSize - 2;
+        if (need == count || count <= kMaxNumTie || single_rank) {
+            const float lo = coarse_bin_lower_bound<kHistBits>(bin);
+            // If no higher score exists, any K members of a single rank can be
+            // emitted directly. Otherwise reserve the prefix for all higher ranks.
+            const bool direct = need == count || (single_rank && need == topk);
+            return {lo, direct ? lo : coarse_bin_lower_bound<kHistBits>(bin + 1)};
+        }
+        return refine_boundary<kClusterSize, kAlignedInput>(in, length, need, smem, row_range);
+    }
 };
 
 // ---------------------------------------------------------------------------
-// Register path: scores stay resident in registers across both passes (read
-// once). Templated on kLocalVecs so the caller picks the smallest covering
-// kernel -- a larger kLocalVecs raises kMaxSeqLen but its fixed-unrolled loop
-// wastes work on shorter sequences.
+// Register path: scores stay resident across histogram and collection;
+// oversized mixed bins can require extra refinement reads. Templated on kLocalVecs so the caller picks the smallest
+// covering kernel -- a larger kLocalVecs raises kMaxSeqLen but its fixed-unrolled loop wastes work on shorter
+// sequences.
 // ---------------------------------------------------------------------------
 
 template<uint32_t kLocalVecs_>
@@ -765,8 +738,9 @@ struct TopKRegister: TopKRadixBase<12> {
             smem->hist_vecs[tx] = hist_vec;
         }
         if (tx == 0) {
-            smem->count_eq = 0;
-            smem->count_gt = 0;
+            smem->boundary_range = {0xffffffffu, 0u};
+            smem->count_eq       = 0;
+            smem->count_gt       = 0;
         }
 
         __syncthreads();
@@ -812,12 +786,11 @@ struct TopKRegister: TopKRadixBase<12> {
         // Phase 2: Find the threshold bin
         find_threshold(problem.topk, problem.seq_len, smem);
 
-        // Phase 3: collect by two fp32 boundaries (raw indices; transform applied later)
-        const auto topk          = problem.topk;
-        const auto threshold_bin = smem->threshold_bin;
-        const auto v_hi          = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-        const auto v_lo          = coarse_bin_lower_bound<kHistBits>(threshold_bin);
-        const auto is_above      = [&](float val) { return is_nan(val) || val >= v_hi; };
+        const auto topk = problem.topk;
+        const auto bounds =
+            selection_bounds<1, kAlignedInput>(problem.in, problem.seq_len, topk, smem, &smem->boundary_range);
+        const float v_lo = bounds.lo;
+        const float v_hi = bounds.hi;
         // Deterministic positions: count per thread, take a thread-order block
         // prefix, then emit/append in the same iteration order. The atomicAdd
         // version ordered both the above-threshold emissions and the tie-buffer
@@ -834,7 +807,7 @@ struct TopKRegister: TopKRadixBase<12> {
 #pragma unroll
             for (uint32_t j = 0; j < kVecSize; ++j) {
                 const auto val = local_vecs[i][j];
-                if (is_above(val))
+                if (is_nan(val) || val >= v_hi)
                     ++my_gt;
                 else if (val >= v_lo)
                     ++my_eq;
@@ -842,7 +815,7 @@ struct TopKRegister: TopKRadixBase<12> {
         }
         if (tx >= kBlockSize - tail) {
             const auto val = problem.in[tail_start + tx - (kBlockSize - tail)];
-            if (is_above(val))
+            if (is_nan(val) || val >= v_hi)
                 ++my_gt;
             else if (val >= v_lo)
                 ++my_eq;
@@ -853,7 +826,7 @@ struct TopKRegister: TopKRadixBase<12> {
         uint32_t   run_gt  = 0;
         uint32_t   run_eq  = 0;
         const auto collect = [&](float val, uint32_t idx) {
-            if (is_above(val)) {
+            if (is_nan(val) || val >= v_hi) {
                 const auto pos = base_gt + run_gt++;
                 if (pos < topk) [[likely]]
                     problem.emit(pos, idx);
@@ -880,25 +853,13 @@ struct TopKRegister: TopKRadixBase<12> {
 
         // Phase 4: Handle ties.
         __syncthreads();
-        const auto above_count = smem->count_gt;
-        const auto equal_count = smem->count_eq;
-        if (__builtin_expect(equal_count > kMaxNumTie, 0)) {
-            // A negative FP16 midpoint can make the FP32 collect count reach topk.
-            // In that case the output is already complete; do not underflow the
-            // exact scan's topk - output_base calculation.
-            if (above_count < topk) {
-                exact_boundary_scan_topk(problem, &smem->tie.handle, v_lo, v_hi, above_count);
-            }
-            return;
-        }
-        const auto remain_topk = above_count < topk ? topk - above_count : 0;
-        const auto tie_count   = min(equal_count, kMaxNumTie);
-        handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+        finish_selection(problem, smem);
     }
 };
 
 // ---------------------------------------------------------------------------
-// Streaming path: seq_len > 8192 -- two vectorized passes over global memory
+// Single-CTA streaming path: reread scores for histogram, counting and output.
+// Oversized mixed bins require additional refinement scans.
 // ---------------------------------------------------------------------------
 
 struct TopKStreaming: TopKRegister<2> {
@@ -916,8 +877,9 @@ public:
             smem->hist_vecs[tx] = hist_vec;
         }
         if (tx == 0) {
-            smem->count_eq = 0;
-            smem->count_gt = 0;
+            smem->boundary_range = {0xffffffffu, 0u};
+            smem->count_eq       = 0;
+            smem->count_gt       = 0;
         }
         __syncthreads();
         PDLWaitPrimary<kUsePDL>();
@@ -932,15 +894,11 @@ public:
         // Phase 2: Find the threshold bin
         find_threshold(problem.topk, problem.seq_len, smem);
 
-        // Phase 3: Collect candidates and sort. Classify by two fp32 boundaries derived
-        // from the threshold bin instead of recomputing the fp16 bin per element: an
-        // element is "above" iff val >= v_hi (bin > threshold) and a "tie" iff
-        // v_lo <= val < v_hi (bin == threshold). This drops the F2F + bit-twiddle from
-        // the second full pass over the input.
-        const auto  threshold_bin = smem->threshold_bin;
-        const float v_hi          = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-        const float v_lo          = coarse_bin_lower_bound<kHistBits>(threshold_bin);
-        const auto  topk          = problem.topk;
+        const auto topk = problem.topk;
+        const auto bounds =
+            selection_bounds<1, kAlignedInput>(problem.in, problem.seq_len, topk, smem, &smem->boundary_range);
+        const float v_lo = bounds.lo;
+        const float v_hi = bounds.hi;
         // Deterministic positions: one extra counting sweep, a thread-order
         // block prefix, then emit/append in the same iteration order. The
         // atomicAdd version ordered emissions and tie-buffer fill by SM arrival
@@ -972,24 +930,8 @@ public:
             }
         });
 
-        // Phase 4: Handle ties. Drive the output layout from the *collect* counts so it
-        // is self-consistent with the fp32 classification above (rather than the fp16
-        // histogram counts), even if rounding moves a boundary element between the
-        // "above" and "tie" sets. An exact negative FP16 midpoint can make
-        // above_count reach topk; the overflow branch treats that as an
-        // already-complete output.
         __syncthreads();
-        const auto above_count = smem->count_gt;
-        const auto equal_count = smem->count_eq;
-        if (__builtin_expect(equal_count > kMaxNumTie, 0)) {
-            if (above_count < topk) {
-                exact_boundary_scan_topk(problem, &smem->tie.handle, v_lo, v_hi, above_count);
-            }
-            return;
-        }
-        const auto remain_topk = above_count < topk ? topk - above_count : 0;
-        const auto tie_count   = min(equal_count, kMaxNumTie);
-        handle_tie(smem->tie.values, problem, above_count, tie_count, remain_topk, &smem->tie.handle);
+        finish_selection(problem, smem);
     }
 };
 
@@ -1015,8 +957,7 @@ public:
     };
 
     // Process one batch element per cluster. There is no trailing barrier, so
-    // the kernel performs cluster.sync() after each forward(). Writes raw indices
-    // to out; the kernel's transform pass applies the page-table transform.
+    // the kernel performs cluster.sync() after each forward(). Writes raw indices to out.
     template<bool kUsePDL, bool kAlignedInput>
     SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
         forward_impl<kUsePDL, kAlignedInput>(problem, _smem);
@@ -1043,8 +984,9 @@ private:
         hist_vec.fill(0);
         smem->hist_vecs[tx] = hist_vec;
         if (tx == 0) {
-            smem->count_eq = 0;
-            smem->count_gt = 0;
+            smem->boundary_range = {0xffffffffu, 0u};
+            smem->count_eq       = 0;
+            smem->count_gt       = 0;
         }
         __syncthreads();
 
@@ -1055,35 +997,15 @@ private:
         });
         __syncthreads();
 
-        // Phase 1.5: reduce the histogram across the cluster.
-        {
-            // Each rank owns kPartition bins, gathers one value from every peer,
-            // then scatters the sum back through distributed shared memory.
-            cluster.sync();
-            static_assert(kHistSize == kBlockSize);
-            constexpr uint32_t kPartition = kHistSize / kClusterSize;
-            const auto         start      = this_rank * kPartition;
-            const auto         which      = start + tx / kClusterSize;
-            const auto         peer_rank  = tx % kClusterSize;
-            const auto         addr       = cluster.map_shared_rank(&smem->histogram[which], peer_rank);
-            const auto         value      = *addr;
-            *addr                         = warp::reduce_sum<kClusterSize>(value);
-            cluster.sync();
-        }
-
-        // Phase 2: Find the threshold bin (uses global seq_len)
+        reduce_histogram<kClusterSize>(smem);
         find_threshold(problem.topk, problem.seq_len, smem);
 
-        // Phase 3: Collect candidates over this rank's chunk; convert local indices
-        // back to global by adding chunk_start. Classify by two fp32 boundaries derived
-        // from the (global) threshold bin instead of recomputing the fp16 bin per
-        // element -- see TopKStreaming for the rationale. threshold_bin is identical
-        // across ranks, so v_hi/v_lo are too.
-        const auto  topk          = problem.topk;
-        const auto  threshold_bin = smem->threshold_bin;
-        const float v_hi          = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
-        const float v_lo          = coarse_bin_lower_bound<kHistBits>(threshold_bin);
-        const auto  cur_out       = is_primary ? problem.out : smem->tmp_out;
+        const auto topk   = problem.topk;
+        const auto smem_0 = cluster.map_shared_rank(smem, 0);
+        const auto bounds = selection_bounds<kClusterSize, kAlignedInput>(
+            problem.in, local_seq_len, topk, smem, &smem_0->boundary_range);
+        const float v_lo = bounds.lo;
+        const float v_hi = bounds.hi;
         // Deterministic per-rank positions: counting sweep, thread-order block
         // prefix, then emit/append in the same iteration order. Replaces the
         // atomicAdd arrival order so outputs are reproducible run to run.
@@ -1100,39 +1022,54 @@ private:
         const auto base_eq = block_exclusive_prefix(my_eq, smem->warp_sum, &smem->count_eq);
         uint32_t   run_gt  = 0;
         uint32_t   run_eq  = 0;
-        for_each_input<kAlignedInput>(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
-            const auto idx = chunk_start + local_idx;
-            if (is_nan(val) || val >= v_hi) {
-                const auto pos = base_gt + run_gt++;
-                if (pos < topk) [[likely]] {
-                    // rank 0's slots [0, a0) are final; other ranks stage raw indices and
-                    // page-translate them after the cross-rank prefix sum is known.
-                    cur_out[pos] = idx;
+        // Keep the scatter destinations separate. Merging the cluster-mapped
+        // output and CTA-local tmp_out pointers drops non-primary stores with
+        // CUDA 13.1+ on Hopper (sgl-project/sglang#34167).
+        if (is_primary) {
+            for_each_input<kAlignedInput>(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
+                const auto idx = chunk_start + local_idx;
+                if (is_nan(val) || val >= v_hi) {
+                    const auto pos = base_gt + run_gt++;
+                    if (pos < topk) [[likely]] {
+                        problem.out[pos] = idx;
+                    }
+                } else if (val >= v_lo) {
+                    const auto pos = base_eq + run_eq++;
+                    if (pos < kMaxNumTie) [[likely]] {
+                        smem->tie.values[pos] = {val, idx};
+                    }
                 }
-            } else if (val >= v_lo) {
-                const auto pos = base_eq + run_eq++;
-                if (pos < kMaxNumTie) [[likely]] {
-                    smem->tie.values[pos] = {val, idx};
+            });
+        } else {
+            for_each_input<kAlignedInput>(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
+                const auto idx = chunk_start + local_idx;
+                if (is_nan(val) || val >= v_hi) {
+                    const auto pos = base_gt + run_gt++;
+                    if (pos < topk) [[likely]] {
+                        smem->tmp_out[pos] = idx;
+                    }
+                } else if (val >= v_lo) {
+                    const auto pos = base_eq + run_eq++;
+                    if (pos < kMaxNumTie) [[likely]] {
+                        smem->tie.values[pos] = {val, idx};
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // Phase 3.5: deterministic cross-rank staging for non-primary blocks.
         // Fixed per-rank count slots plus rank-order prefix sums replace the
         // previous atomicAdd offsets, whose arrival order varied run to run.
-        uint32_t   start_write       = 0;
-        uint32_t   num_write         = 0;
-        uint32_t   local_above_count = 0;
-        uint32_t   local_equal_count = 0;
-        const auto smem_0            = cluster.map_shared_rank(smem, 0);
+        uint32_t start_write       = 0;
+        uint32_t num_write         = 0;
+        uint32_t local_above_count = 0;
+        uint32_t local_equal_count = 0;
         if (!is_primary) {
             __syncthreads();
             local_above_count = smem->count_gt;
             local_equal_count = smem->count_eq;
-            // Report the exact count while keeping the fixed-size DSMEM copy. The
-            // previous min(count_eq, kMaxNumTie) hid a local overflow when all
-            // candidates lived in one non-primary rank, so rank 0 selected from the
-            // truncated buffer instead of rescanning the full row exactly.
+            // Keep the count separate from the bounded copy: rank 0 uses the
+            // global count to recognize a uniform bin larger than the buffer.
             if (tx == 0) {
                 smem_0->peer_counts[this_rank][0] = local_above_count;
                 smem_0->peer_counts[this_rank][1] = local_equal_count;
@@ -1183,17 +1120,7 @@ private:
                 }
             }
             __syncthreads();
-            // Phase 4: Handle ties.
-            const auto above_count = smem->count_gt;
-            const auto equal_count = smem->count_eq;
-            if (__builtin_expect(equal_count > kMaxNumTie, 0)) {
-                if (above_count < topk) {
-                    exact_boundary_scan_topk(problem, &smem->tie.handle, v_lo, v_hi, above_count);
-                }
-            } else {
-                const auto remain_topk = above_count < topk ? topk - above_count : 0;
-                handle_tie(smem->tie.values, problem, above_count, equal_count, remain_topk, &smem->tie.handle);
-            }
+            finish_selection(problem, smem);
         }
     }
 };

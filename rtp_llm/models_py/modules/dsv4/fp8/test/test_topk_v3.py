@@ -153,9 +153,14 @@ def _assert_clamped_value_equiv(
             expected = (
                 logits[row, :valid_len].topk(keep, sorted=False).values.sort().values
             )
-            assert torch.equal(
-                actual, expected
-            ), f"{tag}: row {row} selected values outside the clamped prefix"
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=0,
+                atol=0,
+                equal_nan=True,
+                msg=f"{tag}: row {row} top-{keep} value multiset mismatch",
+            )
     print(f"  [{tag}] clamped lengths OK")
 
 
@@ -269,16 +274,15 @@ def _make_negative_single_coarse_bin(
 def _make_negative_midpoint_overflow(
     T: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Force count_gt >= K and count_eq > kMaxNumTie on a negative bin edge."""
+    """Overflow a coarse bin with values at and immediately below its upper edge."""
     assert T >= 6000
 
     # High edge of the negative coarse bin containing -1.0. FP16
     # round-to-nearest-even maps this exact midpoint back to -1.0 and therefore
-    # into the threshold histogram bin. The FP32 collect predicate classifies
-    # equality with v_hi as strictly above.
-    v_hi = torch.tensor((-1.0 + -0.99951171875) * 0.5, dtype=torch.float32).item()
+    # into the threshold histogram bin, along with the nearby FP32 values.
+    midpoint = (-1.0 + -0.99951171875) * 0.5
     logits = torch.full((1, T), -2.0, dtype=torch.float32, device="cuda")
-    logits[0, :3000] = v_hi
+    logits[0, :3000] = midpoint
 
     # More than kMaxNumTie distinct in-bin values force the exact fallback.
     offsets = torch.arange(3000, dtype=torch.int64, device="cuda")
@@ -427,6 +431,29 @@ def test_dispatch_boundaries_all_k_exact():
         )
 
 
+def test_cluster_dispatch_preserves_nonprimary_indices():
+    """The same short rows retain every selected index in the cluster path."""
+    rows, k, live_width = 37, 512, 5540
+    logits = torch.full((rows, 65536), float("inf"), device="cuda")
+    lengths = 5537 + torch.arange(rows, dtype=torch.int32, device="cuda") % 4
+    generator = torch.Generator(device="cuda").manual_seed(240041)
+    for row in range(rows):
+        logits[row, :live_width] = torch.randperm(
+            live_width, generator=generator, device="cuda"
+        ).float()
+
+    # Same input prefixes and stride across Register4, Cluster8, Cluster4, and Cluster2.
+    for batch, capacity in ((4, 16384), (4, 16385), (17, 65536), (37, 65536)):
+        out = _run(logits[:batch], lengths[:batch], k=k, max_seq_len=capacity)
+        _assert_equiv(
+            out,
+            logits[:batch],
+            lengths[:batch],
+            k=k,
+            tag=f"rows={batch}, width={capacity}",
+        )
+
+
 def test_special_float_values_exact():
     """Preserve ordered-FP32 selection for infinities, signed zero, and NaN."""
     seq_len, k = 4097, 512
@@ -454,6 +481,164 @@ def test_special_float_values_exact():
     assert torch.equal(out.sort(dim=1).values, expected.sort(dim=1).values)
 
     print("  [special float values] exact index sets OK")
+
+
+def test_fp32_signed_zero_and_half_rounded_negative_at_threshold():
+    # Exercise both histogram widths and the single-CTA streaming dispatch.
+    for rows, width in ((3, 4097), (37, 32768), (3, 65536)):
+        logits = torch.full((rows, width), -0.0, device="cuda")
+        logits[0::3, ::2] = 0.0
+        logits[1::3, :64] = 0.0
+        logits[2::3, :] = -1e-20  # FP16 -0, below either FP32 zero.
+        logits[2::3, -258] = -1e-21  # Also FP16 -0, but must outrank -1e-20.
+        logits[2::3, :64] = -0.0
+        logits[:, -257:] = 10.0
+        lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        out = _run(logits, lengths, k=512, max_seq_len=width)
+        _assert_value_equiv(out, logits, lengths, k=512, tag="FP32 zero boundary")
+
+
+def test_fp16_midpoint_preserves_late_higher_scores():
+    k = 512
+    for rows, width in ((4, 8192), (37, 32768), (4, 65536)):
+        lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        for midpoint in (-0.999755859375, 0.999755859375, -65520.0):
+            mid = torch.tensor(midpoint, dtype=torch.float32, device="cuda")
+            logits = mid.expand(rows, width).clone()
+            logits[:, -256:] = 10.0
+            # Keep one row exactly at the midpoint, and exercise the neighboring
+            # FP32 values in the other rows, including the FP16 -Inf boundary.
+            logits[1::3, :128] = mid.nextafter(torch.full_like(mid, torch.inf))
+            logits[2::3, :128] = mid.nextafter(torch.full_like(mid, -torch.inf))
+            out = _run(logits, lengths, k, width)
+            _assert_value_equiv(out, logits, lengths, k, tag=f"midpoint {midpoint}")
+
+
+def test_all_fp16_coarse_midpoints():
+    # The 12-bit histogram includes every cut of the 10-bit histogram as well.
+    # Decode adjacent finite FP16 values from their monotone integer keys.
+    keys = torch.arange(0x0400, 0xFC01, 16, device="cuda", dtype=torch.int32)
+
+    def from_key(key):
+        bits = torch.where(key < 0x8000, ~key, key ^ 0x8000)
+        return bits.to(torch.int16).view(torch.float16).float()
+
+    left = from_key(keys - 1)
+    right = from_key(keys)
+    left[0], right[-1] = -65536.0, 65536.0  # Ideal neighbors at FP16 overflow.
+    mid = (left + right) * 0.5
+    below = torch.nextafter(mid, torch.full_like(mid, -torch.inf))
+    above = torch.nextafter(mid, torch.full_like(mid, torch.inf))
+
+    k, width = 512, 1024
+    # Interleave lower scores in the first K columns to expose index-based
+    # padding if the kernel drops midpoint candidates.
+    logits = mid[:, None].expand(-1, width).clone()
+    logits[:, :k:4] = below[:, None]
+    logits[:, -128:] = above[:, None]
+    lengths = torch.full((mid.numel(),), width, dtype=torch.int32, device="cuda")
+    out = _run(logits, lengths, k, width).long()
+    assert ((out >= 0) & (out < width)).all()
+    assert (out.sort(dim=1).values.diff(dim=1) != 0).all()
+    actual = logits.gather(1, out).sort(dim=1).values
+    expected = logits.topk(k, dim=1).values.sort(dim=1).values
+    assert torch.equal(actual, expected)
+
+
+def test_saturated_bin_exact_fit_and_overflow():
+    rows, width, k = 4, 262144, 512
+    logits = torch.empty((rows, width), dtype=torch.float32, device="cuda")
+    lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    for count in (k - 1, k, k + 1, 2048, 2049):
+        offsets = torch.arange(count, device="cuda")
+        for spread in (1, width // count):
+            # Contiguous and cross-CTA candidates. Rows exercise saturation at
+            # finite values, +Inf, NaN, and a mixture of all three.
+            logits.fill_(0.0)
+            indices = offsets * spread
+            logits[0, indices] = 100000.0 + offsets
+            logits[1, indices] = torch.inf
+            logits[2, indices] = torch.nan
+            logits[3, indices] = 100000.0 + offsets
+            logits[3, indices[1::3]] = torch.inf
+            logits[3, indices[2::3]] = torch.nan
+            out = _run(logits, lengths, k, width)
+            _assert_clamped_value_equiv(
+                out, logits, lengths, k, width, tag=f"{count} saturated candidates"
+            )
+
+
+def test_mixed_overflow_refines_low_fp32_bits():
+    # Outliers stretch the exact key interval. The Kth score is in a dense
+    # group of adjacent FP32 values that still overflows after the first digit.
+    bits = 0x49800000 + torch.arange(4096, dtype=torch.int32, device="cuda")
+    dense = bits.view(torch.float32)
+    # The streaming dispatch needs a larger batch. Only row 0 needs refinement.
+    for rows, width in ((1, 8192), (17, 32768), (1, 65536)):
+        lengths = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        lengths[0] = width
+        logits = torch.full((rows, width), -torch.inf, device="cuda")
+        for sign in (1, -1):
+            logits[0, :: width // dense.numel()] = sign * dense
+            logits[0, 1] = sign * 70000.0
+            logits[0, -3] = sign * torch.finfo(torch.float32).max
+            logits[0, -2] = torch.inf
+            logits[0, -1] = torch.nan
+            out = _run(logits, lengths, 512, width)
+            _assert_clamped_value_equiv(
+                out[:1],
+                logits[:1],
+                lengths[:1],
+                512,
+                width,
+                tag=f"FP32 digits {width=} {sign=}",
+            )
+
+
+def test_nan_inf_and_finite_overflow_at_threshold():
+    # Move the Kth value among NaN, +Inf, and finite FP32 values that round to FP16 +Inf.
+    for rows, width in ((2, 4097), (37, 32768), (4, 65536)):
+        lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        boundary = torch.tensor(65520.0, dtype=torch.float32, device="cuda")
+        below = boundary.nextafter(torch.full_like(boundary, -torch.inf))
+        logits = below.expand(rows, width).clone()
+        logits[:, -512:] = boundary
+        out = _run(logits, lengths, 512, width)
+        _assert_value_equiv(out, logits, lengths, 512, tag="inclusive +65520 boundary")
+
+        # A singleton rank can fill only the slots left by higher ranks.
+        # Put all higher scores after the first 2048 equal candidates.
+        logits.fill_(torch.inf)
+        logits[:, -31:] = torch.nan
+        logits[1::2] = -torch.inf
+        logits[1::2, -31:] = torch.finfo(torch.float32).min
+        out = _run(logits, lengths, 512, width)
+        _assert_clamped_value_equiv(
+            out, logits, lengths, 512, width, tag="late higher rank"
+        )
+
+        finite = 70000 + torch.arange(width, dtype=torch.float32, device="cuda")
+        for nan_stride, inf_stride in ((7, 2), (1021, 2), (1021, 1021)):
+            logits = finite.repeat(rows, 1)
+            logits[:, 1::inf_stride] = torch.inf
+            logits[:, ::nan_stride] = torch.nan
+            out = _run(logits, lengths, k=512, max_seq_len=width)
+            _assert_clamped_value_equiv(
+                out, logits, lengths, 512, width, tag="saturated threshold"
+            )
+
+
+def test_late_cluster_boundary_outlier_with_high_prefix():
+    rows, width = 3, 65536
+    logits = torch.ones((rows, width), device="cuda")
+    logits[:, 1::256] = 2.0  # 256 strict-above candidates spread across all eight CTAs.
+    logits[0, -1024] = 1.0 + 2**-20
+    logits[1, -1024] = 1.0 - 2**-20
+    lengths = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    # The first CTA sees an all-equal boundary bin in each row. Only the last
+    # CTA can distinguish the higher/lower outlier from the uniform control.
+    out = _run(logits, lengths, k=512, max_seq_len=width)
+    _assert_value_equiv(out, logits, lengths, k=512, tag="late boundary outlier")
 
 
 def test_negative_infinity_tie_padding_is_minimal():
@@ -532,9 +717,8 @@ def test_cluster_repeated_pivot_replay():
     """Stress cross-CTA collect/publication and the exact overflow fallback.
 
     B=8 and max_seq_len=262144 route to direct Cluster8. Each row repeats a
-    different 64-value page, so its exact pivot occurs 4096 times. This forces
-    DSMEM histogram reduction, cross-rank candidate aggregation, and a full-row
-    exact boundary scan on every replay.
+    different 64-value page, so its exact pivot occurs 4096 times. This exceeds the tie
+    buffer and exercises the cluster-wide decision to refine or emit tied indices.
     """
     rows, stride, valid, k = 8, 262592, 262144, 2048
     generator = torch.Generator(device="cuda").manual_seed(20260731)
@@ -587,17 +771,7 @@ def test_cluster_ragged_long_short_replay():
 
 
 def test_cluster_nonprimary_candidate_overflow_exact():
-    """A local tie-buffer overflow must reach the cluster-wide exact scan.
-
-    Put 4096 distinct FP32 values from one ordered-FP16 coarse bin entirely in
-    rank 1. Before the fix, that non-primary rank reported
-    ``min(actual_count, kMaxNumTie) == 2048``. With no candidates in the other
-    ranks, rank 0 mistook the truncated 2048-value buffer for the complete
-    threshold bin and returned an approximate TopK.
-
-    The batch sizes below route the same adversarial row through Cluster8,
-    Cluster4, and Cluster2. Remaining rows take the per-row trivial branch.
-    """
+    """Rank 1 holds 4096 candidates in one bin. Winners beyond its tie buffer must survive."""
     valid = 262144
     candidate_count = 4096
     offsets = torch.arange(candidate_count, dtype=torch.int64, device="cuda")
@@ -624,12 +798,7 @@ def test_cluster_nonprimary_candidate_overflow_exact():
 
 
 def test_exact_boundary_negative_midpoint_output_bounds():
-    """Exact fallback must not write past output when collect already filled K.
-
-    Before the fix, the first K selected values looked correct, but the exact
-    fallback underflowed ``K - count_gt`` and overwrote 3000 int32 values in
-    the two guard rows backing this contiguous one-row output view.
-    """
+    """Overflowing the negative midpoint bin must select K and preserve the output guards."""
     T, K = 8193, 2048
     sentinel = -123456789
     logits, lengths = _make_negative_midpoint_overflow(T)
@@ -646,9 +815,7 @@ def test_exact_boundary_negative_midpoint_output_bounds():
     actual = logits[0, indices].sort().values
     expected = logits[0].topk(K, sorted=False).values.sort().values
     assert torch.equal(actual, expected)
-    assert (
-        storage[1:] == sentinel
-    ).all(), "exact_boundary_scan_topk wrote beyond output[:, topk]"
+    assert (storage[1:] == sentinel).all(), "TopK wrote beyond output[:, topk]"
     print("  [exact boundary negative midpoint output bounds] OK")
 
 
@@ -668,7 +835,7 @@ def test_cluster_exact_boundary_negative_midpoint():
 
 
 def test_histogram_2048_candidate_overflow_exact():
-    """DBUF=3708 overflow must rescan the full row instead of truncating."""
+    """A full single coarse bin must retain late winners beyond the tie buffer."""
     N, T = 1, 4095
     logits, lengths = _make_single_coarse_bin(N, T)
     for K in (512, 1024, 2048):
@@ -840,6 +1007,20 @@ def test_cuda_graph_replay_is_stable():
     torch.cuda.synchronize()
     _assert_value_equiv(output, logits, lengths, 2048, tag="CUDA Graph replay")
 
+    next_lengths = torch.tensor(
+        [-1, 1, 2047, 2048, 2049, 5537, 65536, 65663], device="cuda", dtype=torch.int32
+    )
+    for step in range(2):
+        lengths.copy_(next_lengths.roll(4 * step))
+        logits.neg_()
+        logits[:, step::17] = torch.inf
+        logits[:, step::31] = torch.nan
+        output.fill_(-12345)
+        graph.replay()
+        _assert_clamped_value_equiv(
+            output, logits, lengths, 2048, 65536, tag="updated graph inputs"
+        )
+
 
 def test_lengths_2d_accepted():
     """Op accepts lengths as 1D or 2D (decode passes [B, 1] in some flows)."""
@@ -912,6 +1093,50 @@ def bench_decode_sweep():
     assert not fail, f"topk_v3 slower than torch.topk at: {fail}"
 
 
+def bench_cluster_saturated_prefix():
+    """Check saturated candidates on both sides of K and of the tie-buffer capacity."""
+    rows, width, k = 4, 262144, 512
+    logits, lengths = _make(rows, width, seed=7, lengths_mode="full")
+    out = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+    ws = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(16):
+            rtp_llm_ops.topk_v3(logits, lengths, out, ws, k, width)
+
+    def measure(values):
+        count = values.numel()
+        logits[:, :count] = values
+        elapsed_ms = _bench(graph.replay, warmup=5, iters=50)
+        _assert_value_equiv(out, logits, lengths, k, tag=f"cluster prefix x {count}")
+        return elapsed_ms * 1000 / 16
+
+    for count in (k, k + 1):
+        offsets = torch.arange(count, dtype=torch.float32, device="cuda")
+        ordinary_us = measure(1000.0 + offsets)
+        saturated_us = measure(100000.0 + offsets)
+        print(
+            f"  Cluster {count} candidates: {ordinary_us:.1f} us finite, {saturated_us:.1f} us saturated"
+        )
+        # Guard against a full-row rescan when the saturated candidates fit in the tie buffer.
+        assert saturated_us < 8 * ordinary_us, f"{count} saturated candidates regressed"
+
+    logits.zero_()
+    offsets = torch.arange(2049, dtype=torch.float32, device="cuda")
+    for scores in (
+        torch.full_like(offsets, torch.inf),
+        torch.full_like(offsets, 100000.0),
+        100000.0 + offsets,
+    ):
+        buffered_us = measure(scores[:-1])
+        overflow_us = measure(scores)
+        print(
+            f"  Cluster boundary: 2048 candidates {buffered_us:.1f} us, 2049 candidates {overflow_us:.1f} us"
+        )
+        assert overflow_us < 4 * buffered_us, "cluster tie-buffer overflow regressed"
+        logits.zero_()
+
+
 if __name__ == "__main__":
     if not _HAS_OP:
         raise RuntimeError("rtp_llm_ops.topk_v3 is required for this benchmark")
@@ -926,7 +1151,15 @@ if __name__ == "__main__":
     test_unaligned_score_view_paths()
     test_fp32_subnormal_ordering_exact()
     test_dispatch_boundaries_all_k_exact()
+    test_cluster_dispatch_preserves_nonprimary_indices()
     test_special_float_values_exact()
+    test_fp32_signed_zero_and_half_rounded_negative_at_threshold()
+    test_fp16_midpoint_preserves_late_higher_scores()
+    test_all_fp16_coarse_midpoints()
+    test_saturated_bin_exact_fit_and_overflow()
+    test_mixed_overflow_refines_low_fp32_bits()
+    test_nan_inf_and_finite_overflow_at_threshold()
+    test_late_cluster_boundary_outlier_with_high_prefix()
     test_negative_infinity_tie_padding_is_minimal()
     test_mtp_batched_decode_flattened_bs_rows()
     test_batched_streaming_path_b64()
@@ -950,4 +1183,5 @@ if __name__ == "__main__":
     test_lengths_2d_accepted()
     print("\n== Benchmark ==")
     bench_decode_sweep()
+    bench_cluster_saturated_prefix()
     print("\nOK")
