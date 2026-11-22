@@ -3424,19 +3424,35 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate_config.max_thinking_tokens, 3)
 
     async def test_dash_generation_env_thinking_budget_is_default_only(self) -> None:
-        for request_budget, expected_budget in ((None, 64), (10, 10)):
-            with self.subTest(request_budget=request_budget):
+        for request_budget, prefilled, expected_budget in (
+            (None, False, 64),
+            (None, True, 64),
+            (10, False, 10),
+            (10, True, 10),
+        ):
+            with self.subTest(request_budget=request_budget, prefilled=prefilled):
                 visitor = _FakeVisitor(_FakeAsyncStream([]))
-                tok = _dsv4_tokenizer()
                 env_cfg = _GenerateEnvCfg()
+                env_cfg.think_start_tag = "<reason>"
+                env_cfg.think_end_tag = "</reason>"
                 env_cfg.max_thinking_tokens = 64
+                tok = _FakeTokenizer(
+                    {
+                        "<reason>": [80, 81],
+                        "</reason>": [82, 83],
+                        "<reason>\n</reason>": [80, 81, 198, 82, 83],
+                    }
+                )
                 servicer = DashScInferenceServicer(
                     backend_visitor=visitor,
                     tokenizer=tok,
                     generate_env_config=env_cfg,
-                    think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
+                    think_runtime=build_think_runtime(tok, env_cfg, None),
                 )
                 req = self._valid_infer_request()
+                if prefilled:
+                    req.inputs[0].shape[:] = [2]
+                    req.raw_input_contents[0] = struct.pack("<2i", 80, 81)
                 req.parameters["max_new_tokens"].int64_param = 3
                 if request_budget is not None:
                     req.parameters["thinking_budget"].int64_param = request_budget
@@ -3446,6 +3462,12 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(visitor.enqueue_called, 1)
                 generate_config = visitor.last_generate_input.generate_config
                 self.assertEqual(generate_config.max_thinking_tokens, expected_budget)
+                if request_budget is not None and prefilled:
+                    self.assertTrue(generate_config.in_think_mode)
+                    self.assertEqual(generate_config.end_think_token_ids, [82, 83])
+                    self.assertIsNone(generate_config.structural_tag)
+                else:
+                    self.assertIsNotNone(generate_config.structural_tag)
 
     async def test_dash_generation_without_explicit_mode_inherits_env(
         self,

@@ -891,15 +891,12 @@ def _clone_generate_config(generate_config: GenerateConfig) -> GenerateConfig:
 
 def _apply_dash_sc_controls_to_generate_config(
     generate_config: GenerateConfig,
-    sampling: SamplingParams,
+    request_max_think: Optional[int],
     request_controls: DashScRequestControls,
     runtime: _ThinkRuntime,
     default_thinking_mode: ThinkingMode,
 ) -> None:
     """Apply DashSC request controls over the deployment THINK_MODE default."""
-    request_max_think = sampling.max_new_think_tokens
-    if request_max_think is None:
-        request_max_think = request_controls.max_new_think_tokens
     if request_max_think is not None:
         max_think = int(request_max_think)
         generate_config.max_thinking_tokens = INT32_MAX if max_think < 0 else max_think
@@ -1083,9 +1080,12 @@ async def iter_real_model_stream_infer(
             generate_config.max_thinking_tokens = (
                 INT32_MAX if int(env_budget) < 0 else int(env_budget)
             )
+        request_max_think = sampling.max_new_think_tokens
+        if request_max_think is None:
+            request_max_think = request_controls.max_new_think_tokens
         _apply_dash_sc_controls_to_generate_config(
             generate_config,
-            sampling,
+            request_max_think,
             request_controls,
             runtime,
             default_thinking_mode,
@@ -1139,6 +1139,15 @@ async def iter_real_model_stream_infer(
                 ),
                 reasoning_format=reasoning_format,
             )
+        if (
+            request_max_think is not None
+            and request_max_think > 0
+            and generate_config.in_think_mode
+            and matched_think_bos_ids
+            and final_constraint is None
+        ):
+            # The prompt already opened reasoning. The engine enforces the budget by token ID.
+            restore_final_constraint(generate_config, None)
         if runtime.eos_tokens and not generate_config.end_think_token_ids:
             generate_config.end_think_token_ids = list(runtime.eos_tokens)
         # All these are pre-resolved at servicer init via ``build_think_runtime``;

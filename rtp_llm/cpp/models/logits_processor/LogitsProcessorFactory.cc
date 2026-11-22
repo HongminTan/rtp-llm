@@ -14,6 +14,7 @@
 #include "rtp_llm/cpp/models/logits_processor/MultiSeqLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/PrefixToCandidateTokens.h"
 #include "rtp_llm/cpp/models/logits_processor/RecommendationLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/ThinkModeLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/TreeLogitsProcessor.h"
 #include "rtp_llm/cpp/utils/ErrorCode.h"
 #include "rtp_llm/cpp/utils/Logger.h"
@@ -97,9 +98,14 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     }
     GrammarKeyCpp grammar_key = std::move(grammar_key_result.value());
 
-    // Thinking constraints reach the execution layer as normalized grammar.
-    // Thinking-only configs are not supported here; do not add a legacy processor fallback.
-    if (!grammar_key.empty()) {
+    if (grammar_key.empty()) {
+        if (config.thinking_mode == ThinkingMode::ENABLED && config.max_thinking_tokens > 0
+            && !config.end_think_token_ids.empty()) {
+            if (auto think = ThinkModeLogitsProcessor::fromGenerateInput(generate_input, max_batch_size)) {
+                result.push_back(std::move(think));
+            }
+        }
+    } else {
         if (config.hasNumBeams() || config.num_return_sequences > 1) {
             return ErrorInfo(ErrorCode::INVALID_PARAMS,
                              "grammar-constrained decoding does not support beam search or "
