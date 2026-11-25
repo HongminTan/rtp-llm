@@ -100,3 +100,20 @@ cc_test(
     exec_properties = {"gpu": "L20_CU13"},
     tags = ["L20_CU13"],
 )
+
+# useStreamAsync caches the process environment, so run this case in its own process.
+sh_test(
+    name = "mtp_executor_async_prefill_metrics_test",
+    srcs = ["//:cc_test_wrapper.sh"],
+    args = [
+        "$(location :mtp_executor_test_bin)",
+        "--gtest_filter=MtpExecutorTest.RealPrefillWithDpFakeDecodeReportsOneStepAndNoTpot",
+    ],
+    data = [":mtp_executor_test_bin"],
+    env = {
+        "RTP_LLM_STREAM_ASYNC": "1",
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
+)

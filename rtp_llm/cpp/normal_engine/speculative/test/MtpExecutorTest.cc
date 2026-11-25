@@ -9,6 +9,7 @@
 #include <thread>
 #include "torch/all.h"
 #include "gtest/gtest.h"
+#include "kmonitor/client/core/MetricsCollector.h"
 
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
@@ -737,13 +738,13 @@ public:
         ResourceContext            resource_context;
         SpeculativeExecutionConfig sp_config;
 
-        model_config.max_seq_len                           = test_config.max_seq_len;
-        model_config.vocab_size                            = test_config.vocab_size;
-        model_config.num_layers                            = test_config.num_layers;
-        model_config.attn_config.rope_config.index_factor  = test_config.position_id_len_factor;
-        sp_config.type                                     = test_config.sp_type;
-        sp_config.gen_num_per_cycle                        = test_config.gen_num_per_cycle;
-        sp_config.sp_dspark_mask_token_id                  = test_config.dspark_mask_token_id;
+        model_config.max_seq_len                          = test_config.max_seq_len;
+        model_config.vocab_size                           = test_config.vocab_size;
+        model_config.num_layers                           = test_config.num_layers;
+        model_config.attn_config.rope_config.index_factor = test_config.position_id_len_factor;
+        sp_config.type                                    = test_config.sp_type;
+        sp_config.gen_num_per_cycle                       = test_config.gen_num_per_cycle;
+        sp_config.sp_dspark_mask_token_id                 = test_config.dspark_mask_token_id;
 
         resource_context.cache_manager =
             std::make_shared<KVCacheManager>(test::makeSimpleMhaCacheConfig(/*layer_num=*/1,
@@ -778,12 +779,12 @@ public:
         test_kv_cache_config.kernel_seq_size_per_block = 2;
 
         auto configure_cache_model = [](ModelConfig& cache_model_config) {
-            cache_model_config.data_type                    = rtp_llm::TYPE_INT8;
-            cache_model_config.attn_config.kv_head_num      = 128;
-            cache_model_config.attn_config.size_per_head    = 256;
+            cache_model_config.data_type                           = rtp_llm::TYPE_INT8;
+            cache_model_config.attn_config.kv_head_num             = 128;
+            cache_model_config.attn_config.size_per_head           = 256;
             cache_model_config.attn_config.tokens_per_block        = 2;
             cache_model_config.attn_config.kernel_tokens_per_block = 2;
-            cache_model_config.attn_config.kv_cache_dtype   = KvCacheDataType::BASE;
+            cache_model_config.attn_config.kv_cache_dtype          = KvCacheDataType::BASE;
         };
         configure_cache_model(score_cache_model_config);
         configure_cache_model(propose_cache_model_config);
@@ -1135,9 +1136,9 @@ TEST_P(MtpCacheStrideTest, ForwardAndPrepareUseSingleGroupStrideOnly) {
         if (with_linear) {
             config.layer_num = single_layer ? 1 : 2;
             config.fromGroupedSpecs({test::makeLinearSpec("linear", 4, TYPE_FP16, 1, 1), full},
-                                    {{0}, {single_layer ? 0 : 1}},
-                                    {CacheGroupType::LINEAR, CacheGroupType::FULL},
-                                    {"linear", "full"});
+                                               {{0}, {single_layer ? 0 : 1}},
+                                               {CacheGroupType::LINEAR, CacheGroupType::FULL},
+                                               {"linear", "full"});
         }
         auto groups = config.topology().groups();
         for (auto& group : groups) {
@@ -1570,6 +1571,52 @@ TEST_F(MtpExecutorTest, testTargetOnlyPrefillCollectsContextTokenAndTpsMetrics) 
     EXPECT_DOUBLE_EQ(metrics_collector.tps_collector.totalTPS(), 4.0);
 }
 
+TEST_F(MtpExecutorTest, RealPrefillWithDpFakeDecodeReportsOneStepAndNoTpot) {
+    MtpExecutorTestConfig config;
+    config.role_type                        = RoleType::PDFUSION;
+    config.gen_num_per_cycle                = 1;
+    auto  components                        = createMtpExecutorComponents(config);
+    auto& executor                          = *components.executor;
+    executor.parallelism_config_.dp_size    = 2;
+    executor.parallelism_config_.world_size = 2;
+
+    components.resource_context.cache_manager = executor.cache_manager_;
+    auto monitor                              = std::make_shared<kmonitor::KMonitor>("fusion_step_test");
+    monitor->SetServiceName("");
+    executor.metrics_reporter_ = std::make_shared<kmonitor::MetricsReporter>(monitor, "", kmonitor::MetricsTags());
+
+    auto prefill = createContextStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1}, /*max_new_tokens=*/0);
+    auto            fake_decode = MtpExecutor::createMinFakeDecodeStream(config.gen_num_per_cycle,
+                                                              components.model_config,
+                                                              components.runtime_config,
+                                                              components.resource_context,
+                                                              components.model_config.vocab_size);
+    GptModelOutputs target_output;
+    target_output.all_hidden_states = torch::zeros({2, 2}, torch::kCUDA);
+    components.fake_target_model->setSkipInputCheck(true);
+    components.fake_target_model->setOutputs({target_output, target_output});
+    components.fake_draft_model->setSkipInputCheck(true);
+    components.fake_draft_model->setOutputs({GptModelOutputs{}, GptModelOutputs{}});
+    executor.setTargetModel(std::move(components.fake_target_model));
+    executor.setDraftModel(std::move(components.fake_draft_model));
+    ASSERT_TRUE(executor.process({prefill, fake_decode}).ok());
+
+    kmonitor::MetricsCollector snapshot;
+    monitor->GetMetrics(&snapshot, {kmonitor::NORMAL}, 10000);
+    int step_samples = 0;
+    for (const auto* record : snapshot.GetRecords().getRecords()) {
+        for (const auto* value : record->Values()) {
+            EXPECT_NE(value->Name(), "rtp_llm_sp_estimate_tpot_us");
+            if (value->Name() == "rtp_llm_sp_step_latency_us") {
+                // KMonitor gauges encode avg_sum_max_min_count.
+                step_samples += std::stoi(value->Value().substr(value->Value().rfind('_') + 1));
+            }
+        }
+    }
+    EXPECT_EQ(step_samples, 1);
+}
+
 TEST_F(MtpExecutorTest, testDpFakeDecodePreservesDecodeWorkContract) {
     constexpr int         propose_step = 4;
     MtpExecutorTestConfig test_config;
@@ -1659,21 +1706,21 @@ TEST_F(MtpExecutorTest, testCPChunkedPrefillRestoresGlobalPositionIds) {
     // Use the real CP splitter with fake model forwards and TP collectives.
     for (const bool explicit_position_ids : {false, true}) {
         for (const bool middle_chunk : {false, true}) {
-            SCOPED_TRACE(testing::Message() << "explicit_position_ids=" << explicit_position_ids
-                                           << ", middle_chunk=" << middle_chunk);
+            SCOPED_TRACE(testing::Message()
+                         << "explicit_position_ids=" << explicit_position_ids << ", middle_chunk=" << middle_chunk);
             MtpExecutorTestConfig test_config;
-            test_config.gen_num_per_cycle      = 2;
-            test_config.mm_position_ids_style  = explicit_position_ids ? MROPE : DEFAULT;
-            test_config.position_id_len_factor = explicit_position_ids ? 3 : 1;
-            auto  components = createMtpExecutorComponents(test_config);
-            auto& executor = *components.executor;
+            test_config.gen_num_per_cycle                         = 2;
+            test_config.mm_position_ids_style                     = explicit_position_ids ? MROPE : DEFAULT;
+            test_config.position_id_len_factor                    = explicit_position_ids ? 3 : 1;
+            auto  components                                      = createMtpExecutorComponents(test_config);
+            auto& executor                                        = *components.executor;
             executor.parallelism_config_.prefill_cp_config.method = CPRotateMethod::ALL_GATHER;
             executor.warm_up_ = true;  // Stop after draft forward, before draft sampling.
 
             constexpr int prefix_len = 4;
             constexpr int chunk_len  = 8;
             const int     prompt_len = prefix_len + chunk_len + (middle_chunk ? 2 : 0);
-            vector<int> prompt{0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1};
+            vector<int>   prompt{0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1};
             prompt.resize(prompt_len);
             auto stream = createContextStream(
                 components.model_config, components.runtime_config, components.resource_context, prompt);
@@ -1684,8 +1731,9 @@ TEST_F(MtpExecutorTest, testCPChunkedPrefillRestoresGlobalPositionIds) {
 
             torch::Tensor prompt_positions;
             if (explicit_position_ids) {
-                prompt_positions = (torch::arange(prompt_len, torch::kInt32).unsqueeze(1) * 10
-                                    + torch::arange(3, torch::kInt32)).flatten();
+                prompt_positions =
+                    (torch::arange(prompt_len, torch::kInt32).unsqueeze(1) * 10 + torch::arange(3, torch::kInt32))
+                        .flatten();
                 stream->setContextPositionIds(prompt_positions);
             }
 
@@ -1719,14 +1767,14 @@ TEST_F(MtpExecutorTest, testCPChunkedPrefillRestoresGlobalPositionIds) {
                 input.combo_position_ids = local_positions;
             };
 
-            GptModelInputs draft_input = target_input;
+            GptModelInputs draft_input     = target_input;
             draft_input.combo_tokens       = torch::tensor({1, 2, 3, 0, 1, 2, 3, middle_chunk ? 0 : 2}, torch::kInt32);
             draft_input.last_hidden_states = target_output.all_hidden_states;
             if (explicit_position_ids) {
                 auto tail = middle_chunk ? torch::tensor({120, 121, 122}, torch::kInt32) :
                                            torch::tensor({112, 112, 112}, torch::kInt32);
-                draft_input.combo_position_ids = torch::cat(
-                    {prompt_positions.narrow(0, (prefix_len + 1) * 3, (chunk_len - 1) * 3), tail});
+                draft_input.combo_position_ids =
+                    torch::cat({prompt_positions.narrow(0, (prefix_len + 1) * 3, (chunk_len - 1) * 3), tail});
             }
             components.fake_draft_model->setInputs({draft_input});
             components.fake_draft_model->setOutputs({GptModelOutputs{}});

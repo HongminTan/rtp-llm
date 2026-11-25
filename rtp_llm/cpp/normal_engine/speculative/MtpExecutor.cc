@@ -712,9 +712,9 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     spec_logits_verify_async_runner_(cuda_graph::graphGetStreamFromPool(true)),
     spec_bookkeeping_runner_(cuda_graph::graphGetStreamFromPool(true)),
     dspark_cache_store_sync_stream_(cuda_graph::graphGetStreamFromPool(true)) {
-    data_type_                  = params.model_config_.data_type;
-    hidden_size_                = params.model_config_.hidden_size * params.model_config_.hc_mult;
-    propose_step_               = propose_params->gen_num_per_circle;
+    data_type_    = params.model_config_.data_type;
+    hidden_size_  = params.model_config_.hidden_size * params.model_config_.hc_mult;
+    propose_step_ = propose_params->gen_num_per_circle;
     RTP_LLM_CHECK_WITH_INFO(
         propose_step_ > 0, "speculative proposal width/gen_num_per_cycle must be positive, got %zu", propose_step_);
     vocab_size_                 = params.model_config_.vocab_size;
@@ -827,10 +827,10 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
          cache_manager,
          std::nullopt,
          params.model_config_.hc_mult});
-    model_init_params.metrics_reporter = metrics_reporter_;
+    model_init_params.metrics_reporter               = metrics_reporter_;
     model_init_params.hidden_state_capture_layer_ids = selectHiddenStateCaptureLayerIds(
         HiddenStateCaptureModelRole::TARGET, role_type_, warm_up_, params.model_config_.hidden_state_capture_layer_ids);
-    model_init_params.hidden_state_capture_dtype     = params.model_config_.hidden_state_capture_dtype;
+    model_init_params.hidden_state_capture_dtype = params.model_config_.hidden_state_capture_dtype;
 #if USING_CUDA || USING_ROCM
     const size_t max_reserved_step = params.sp_config.speculativeReserveStep();
     if (params.hw_kernel_config.enable_cuda_graph && model_init_params.kv_cache_layer_layout.has_value()) {
@@ -910,7 +910,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                              role_type_,
                                              warm_up_,
                                              mtp_params->model_config_.hidden_state_capture_layer_ids);
-        model_params.hidden_state_capture_dtype     = mtp_params->model_config_.hidden_state_capture_dtype;
+        model_params.hidden_state_capture_dtype = mtp_params->model_config_.hidden_state_capture_dtype;
 #if USING_CUDA || USING_ROCM
         if (params.hw_kernel_config.enable_cuda_graph && model_params.kv_cache_layer_layout.has_value()) {
             const auto& topology = model_params.kv_cache_layer_layout->topology();
@@ -1201,6 +1201,10 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         model_output          = std::move(forwardModel(model_.get(), model_input, ModelInputsModelRole::TARGET));
         maybeOverrideLastHiddenWithMtpBuffer(model_output, *model_, cp_enabled ? -1 : model_input.combo_tokens.numel());
         model_forward_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+    }
+
+    if (!alignment_only && !model_input.is_fake_stream && !warm_up_) {
+        metrics_collector.report_sp_on_main = true;
     }
 
     // eplb
@@ -1864,7 +1868,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                                 std::move(draft_prefill_model_output),
                                                 std::move(draft_prefill_sampler_output),
                                                 std::move(rejection_event),
-                                                std::move(draft_event));
+                                                std::move(draft_event),
+                                                metrics_collector);
     if (dispatch_result.ok() && engram_anchor_windows.defined()) {
         auto next_history = MtpBatchStreamProcessor::advanceEngramTokenWindows(
             engram_anchor_windows, speculative_sampler_output.accept_tokens, speculative_sampler_output.accept_len);
@@ -2367,7 +2372,8 @@ absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&              
                                                GptModelOutputs                              draft_prefill_model_output,
                                                SamplerOutput                 draft_prefill_sampler_output,
                                                std::shared_ptr<torch::Event> rejection_event,
-                                               std::shared_ptr<torch::Event> draft_event) {
+                                               std::shared_ptr<torch::Event> draft_event,
+                                               MtpMetricsCollector&          metrics_collector) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(dispatch_output)");
     absl::Status result;
     if (useStreamAsync()) {
@@ -2380,7 +2386,12 @@ absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&              
                                      kv_cache_kernel_block_id,
                                      {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)},
                                      std::move(rejection_event),
-                                     std::move(draft_event));
+                                     std::move(draft_event),
+                                     metrics_collector.step_start_time_us);
+        if (result.ok()) {
+            // A dispatched worker reports the whole step, including any prefill that ran before decode.
+            metrics_collector.report_sp_on_main = false;
+        }
     } else {
         MergedOutput draft_prefill_output{std::move(draft_prefill_model_output),
                                           std::move(draft_prefill_sampler_output)};
@@ -2501,7 +2512,8 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
         schedule_time_us = process_start_time_us;
     }
     MtpMetricsCollector metrics_collector;
-    auto                tps_active_guard =
+    metrics_collector.report_sp_on_main = !useStreamAsync() || role_type_ == RoleType::PREFILL;
+    auto tps_active_guard =
         tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
     auto wall_tps_active_guard =
         wall_tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
@@ -2515,7 +2527,7 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
     prepareStreams(streams, prefill_streams, decode_streams);
 
     // step forward
-    int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+    metrics_collector.step_start_time_us = autil::TimeUtility::monotonicTimeUs();
 
     if (role_type_ == RoleType::PREFILL || role_type_ == RoleType::PDFUSION) {
         THROW_IF_STATUS_ERROR(prefillStep(prefill_streams, metrics_collector, schedule_time_us));
@@ -2525,15 +2537,18 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
         THROW_IF_STATUS_ERROR(decodeStep(decode_streams, metrics_collector));
     }
 
-    metrics_collector.sp_engine_collector.step_latency_us =
-        autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
-
     // report metrics
     if (isTpRank0() && metrics_reporter_ && metrics_collector.not_skip) {
         // decode metrics
-        auto& tps_collector       = metrics_collector.tps_collector;
-        auto& sp_engine_collector = metrics_collector.sp_engine_collector;
-        auto  decode_time         = autil::TimeUtility::currentTimeInMicroSeconds() - schedule_time_us;
+        auto&      tps_collector       = metrics_collector.tps_collector;
+        auto&      sp_engine_collector = metrics_collector.sp_engine_collector;
+        const auto decode_time         = autil::TimeUtility::currentTimeInMicroSeconds() - schedule_time_us;
+        if (metrics_collector.report_sp_on_main) {
+            sp_engine_collector.step_latency_us =
+                autil::TimeUtility::monotonicTimeUs() - metrics_collector.step_start_time_us;
+            metrics_reporter_->report<RtpLLMSpeculativeEngineMetrics, RtpLLMSpeculativeEngineMetricsCollector>(
+                nullptr, &sp_engine_collector);
+        }
         if (sp_engine_collector.total_accepted_token_num) {
             tps_collector.addTokenSize(0,
                                        0,
@@ -2559,8 +2574,6 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
             nullptr, &metrics_collector.executor_collector);
         tps_reporter_.report(&metrics_collector.tps_collector);
         wall_tps_reporter_.report(&metrics_collector.tps_collector);
-        metrics_reporter_->report<RtpLLMSpeculativeEngineMetrics, RtpLLMSpeculativeEngineMetricsCollector>(
-            nullptr, &metrics_collector.sp_engine_collector);
     }
 
     return absl::OkStatus();
@@ -2934,7 +2947,8 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                               const torch::Tensor&                         kv_cache_kernel_block_id,
                                               MergedOutput                                 draft_prefill_output,
                                               std::shared_ptr<torch::Event>                rejection_event,
-                                              std::shared_ptr<torch::Event>                draft_event) {
+                                              std::shared_ptr<torch::Event>                draft_event,
+                                              int64_t                                      step_start_time_us) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(dispatch_output_async)");
 
     const auto& accept_len_gpu_all     = spec_decode_output.accept_len;
@@ -3092,6 +3106,9 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     }
 
     spec_bookkeeping_runner_.launch([processor,
+                                     reporter = metrics_reporter_,
+                                     step_start_time_us,
+                                     propose_step       = propose_step_,
                                      stream_groups_copy = std::move(stream_groups_copy),
                                      spec_decode_copy   = std::move(spec_decode_copy),
                                      draft_prefill_copy = std::move(draft_prefill_copy),
@@ -3117,6 +3134,18 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         auto status = processor->dispatchDecode(stream_groups_copy, spec_decode_copy, draft_prefill_copy);
         if (!status.ok()) {
             RTP_LLM_LOG_ERROR("[stream-async] dispatchDecode (worker) failed: %s", status.ToString().c_str());
+            return;
+        }
+        if (reporter) {
+            RtpLLMSpeculativeEngineMetricsCollector sp;
+            sp.step_latency_us = autil::TimeUtility::monotonicTimeUs() - step_start_time_us;
+            dec_guard.reset();
+            // dispatchDecode has already synchronized this round's host accept lengths.
+            sp.total_accepted_token_num = spec_decode_copy.accept_len_cpu.sum().item<int64_t>();
+            sp.total_stream_num         = stream_groups_copy.size();
+            sp.spec_steps               = propose_step;
+            sp.total_propose_token_num  = sp.total_stream_num * sp.spec_steps;
+            reporter->report<RtpLLMSpeculativeEngineMetrics, RtpLLMSpeculativeEngineMetricsCollector>(nullptr, &sp);
         }
     });
 
