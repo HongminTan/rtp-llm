@@ -396,8 +396,9 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
                                             (int64_t)cur_stream);
             if (need_renorm_probs) {
                 torch::Tensor temp_t = torch::zeros_like(sampling_probs_t);
-                top_k_renorm_probs(probs_t, temp_t, top_k_t, 1.0, (int64_t)cur_stream);
-                top_p_renorm_probs(temp_t, sampling_probs_t, top_p_t, 1.0, (int64_t)cur_stream);
+                /** Joint sampling applies top-p to the original distribution; return the same support. */
+                top_p_renorm_probs(probs_t, temp_t, top_p_t, 1.0, (int64_t)cur_stream);
+                top_k_renorm_probs(temp_t, sampling_probs_t, top_k_t, 0, (int64_t)cur_stream);
             }
         }
     }
