@@ -2,6 +2,8 @@
 
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 
 namespace rtp_llm {
@@ -214,9 +216,9 @@ __global__ void mtpDispatchStatePrepareKernel(const int32_t* __restrict__ accept
     if (idx >= batch_size) {
         return;
     }
-    const int32_t al   = accept_len[idx];
-    next_seq_len[idx]  = prev_seq_len[idx] + al;
-    hidden_idx[idx]    = static_cast<int64_t>(al - 1);
+    const int32_t al  = accept_len[idx];
+    next_seq_len[idx] = prev_seq_len[idx] + al;
+    hidden_idx[idx]   = static_cast<int64_t>(al - 1);
 }
 
 void invokeMtpDispatchStatePrepare(const torch::Tensor& accept_len,
@@ -234,10 +236,8 @@ void invokeMtpDispatchStatePrepare(const torch::Tensor& accept_len,
     RTP_LLM_CHECK_WITH_INFO(hidden_idx.defined() && hidden_idx.is_cuda(), "hidden_idx must be CUDA");
     RTP_LLM_CHECK_WITH_INFO(hidden_idx.scalar_type() == torch::kInt64, "hidden_idx must be int64");
     RTP_LLM_CHECK_WITH_INFO(hidden_idx.is_contiguous(), "hidden_idx must be contiguous");
-    RTP_LLM_CHECK_WITH_INFO(hidden_idx.numel() >= batch_size,
-                            "hidden_idx numel %ld < batch_size %ld",
-                            hidden_idx.numel(),
-                            batch_size);
+    RTP_LLM_CHECK_WITH_INFO(
+        hidden_idx.numel() >= batch_size, "hidden_idx numel %ld < batch_size %ld", hidden_idx.numel(), batch_size);
 
     constexpr int block_size = 256;
     const int     grid_size  = static_cast<int>((batch_size + block_size - 1) / block_size);
@@ -246,6 +246,71 @@ void invokeMtpDispatchStatePrepare(const torch::Tensor& accept_len,
                                                                         next_seq_len.data_ptr<int32_t>(),
                                                                         hidden_idx.data_ptr<int64_t>(),
                                                                         static_cast<int32_t>(batch_size));
+}
+
+__global__ void mtpSpecSamplerTokenMatrixKernel(const int32_t* __restrict__ history,
+                                                const int32_t* __restrict__ draft,
+                                                const int64_t* __restrict__ base_lengths,
+                                                int32_t* __restrict__ output,
+                                                int64_t work_items,
+                                                int64_t width,
+                                                int64_t rows,
+                                                int64_t gamma) {
+    const int64_t row_stride = width * rows;
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < work_items;
+         i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+        const int64_t column = i % width;
+        const int64_t batch  = i / row_stride;
+        const int64_t base   = base_lengths[batch];
+        int32_t       value  = 0;
+        if (column < base) {
+            value = history[batch * width + column];
+        } else if (column < base + gamma) {
+            value = draft[batch * gamma + (column - base)];
+        }
+        output[i] = value;
+    }
+}
+
+void invokeMtpSpecSamplerTokenMatrix(const torch::Tensor& history,
+                                     const torch::Tensor& draft,
+                                     const torch::Tensor& base_lengths,
+                                     torch::Tensor&       output,
+                                     int64_t              gamma,
+                                     cudaStream_t         stream) {
+    RTP_LLM_CHECK_WITH_INFO(history.defined() && history.is_cuda() && history.scalar_type() == torch::kInt32
+                                && history.dim() == 2 && history.is_contiguous(),
+                            "sampler history must be contiguous CUDA int32 [B, width]");
+    RTP_LLM_CHECK_WITH_INFO(draft.defined() && draft.is_cuda() && draft.scalar_type() == torch::kInt32
+                                && draft.dim() == 2 && draft.is_contiguous() && draft.size(0) == history.size(0)
+                                && draft.size(1) == gamma,
+                            "sampler draft tokens must be contiguous CUDA int32 [B, gamma]");
+    RTP_LLM_CHECK_WITH_INFO(base_lengths.defined() && base_lengths.is_cuda()
+                                && base_lengths.scalar_type() == torch::kInt64 && base_lengths.dim() == 1
+                                && base_lengths.is_contiguous() && base_lengths.numel() == history.size(0),
+                            "sampler base lengths must be contiguous CUDA int64 [B]");
+    RTP_LLM_CHECK_WITH_INFO(output.defined() && output.is_cuda() && output.scalar_type() == torch::kInt32
+                                && output.dim() == 3 && output.is_contiguous() && output.size(0) == history.size(0)
+                                && output.size(2) == history.size(1) && output.size(1) == gamma + 1,
+                            "sampler token matrix must be contiguous CUDA int32 [B, rows, width]");
+    RTP_LLM_CHECK_WITH_INFO(history.device() == output.device() && draft.device() == output.device()
+                                && base_lengths.device() == output.device(),
+                            "sampler token matrix tensors must share one CUDA device");
+    if (output.numel() == 0) {
+        return;
+    }
+    const c10::cuda::CUDAGuard guard(output.device());
+    constexpr int              block_size = 256;
+    const int grid_size = static_cast<int>(std::min<int64_t>((output.numel() + block_size - 1) / block_size, 65535));
+    mtpSpecSamplerTokenMatrixKernel<<<grid_size, block_size, 0, stream>>>(history.data_ptr<int32_t>(),
+                                                                          draft.data_ptr<int32_t>(),
+                                                                          base_lengths.data_ptr<int64_t>(),
+                                                                          output.data_ptr<int32_t>(),
+                                                                          output.numel(),
+                                                                          history.size(1),
+                                                                          output.size(1),
+                                                                          gamma);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace rtp_llm

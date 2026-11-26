@@ -16,6 +16,7 @@
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
+#include "rtp_llm/cpp/models/Sampler.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
 #include "rtp_llm/cpp/models/logits_processor/ThinkModeLogitsProcessor.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -239,6 +240,8 @@ TEST_F(MtpBatchStreamProcessorTest, testGatherSpecSamplerInputBuildsPositionSpec
     stream2->generateConfig()->top_p       = 0.7f;
     stream2->generateConfig()->temperature = 1.0f;
 
+    stream2->generateConfig()->repetition_penalty = 1.2f;  // One active row needs history for the mixed batch.
+
     auto stream_groups = StreamGroups({stream1, stream2});
     auto processor     = MtpBatchStreamProcessor(
         model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
@@ -282,7 +285,92 @@ TEST_F(MtpBatchStreamProcessorTest, testGatherSpecSamplerInputBuildsPositionSpec
     EXPECT_EQ((std::vector<float>{0.8f, 0.8f, 0.8f, 0.8f, 0.7f, 0.7f, 0.7f, 0.7f}), toVec<float>(sampler_inputs.top_p));
     EXPECT_EQ((std::vector<float>{0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f}),
               toVec<float>(sampler_inputs.temperature));
+
+#if USING_CUDA
+    // The next round starts with different numbers of newly committed tokens per request.
+    stream1->update({torch::tensor({{1}}, torch::kInt32), 1});
+    stream2->update({torch::tensor({{3, 2}}, torch::kInt32), 2});
+    auto next_draft = torch::tensor({{3, 2, 1}, {1, 2, 3}}, torch::kInt32).to(torch::kCUDA);
+    auto ready      = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    ready->record(cuda_graph::graphGetCurrentStream());
+    auto next = processor.gatherSpecSamplerInput(StreamGroups({stream1, stream2}), model_output, {}, next_draft, ready);
+    ASSERT_TRUE(next.ok());
+    const auto& inputs = next.value();
+    EXPECT_EQ((std::vector<int32_t>{2, 3, 4, 5, 4, 5, 6, 7}), toVec<int32_t>(inputs.sequence_lengths));
+    const auto matrix = inputs.token_ids.cpu();
+    for (int64_t row = 0; row < 4; ++row) {
+        EXPECT_EQ((std::vector<int32_t>{5, 1, 3, 2, 1}), toVec<int32_t>(matrix[row].narrow(0, 0, 5)));
+        EXPECT_EQ((std::vector<int32_t>{6, 7, 3, 2, 1, 2, 3}), toVec<int32_t>(matrix[4 + row].narrow(0, 0, 7)));
+    }
+#endif
 }
+
+#if USING_CUDA
+TEST_F(MtpBatchStreamProcessorTest, SamplerHistoryGateAndDraftEventAcrossRounds) {
+    ModelConfig model_config;
+    model_config.max_seq_len = 2048;
+    model_config.vocab_size  = 32;
+    model_config.num_layers  = 1;
+    SpeculativeExecutionConfig sp_config;
+    sp_config.gen_num_per_cycle = 2;
+    sp_config.type              = SP_TYPE_DSPARK;
+    ResourceContext resource_context;
+    RuntimeConfig   runtime_config;
+    auto            stream = createContextStream(model_config, runtime_config, resource_context, {7, 8}, 2);
+    stream->setScoreLen(3);
+    stream->generateConfig()->do_sample   = true;
+    stream->generateConfig()->top_k       = 1;
+    stream->generateConfig()->temperature = 1.0f;
+    auto                    groups        = StreamGroups({stream});
+    MtpBatchStreamProcessor processor(model_config, {}, {}, makeProcessorCacheConfig(), sp_config, false);
+    GptModelOutputs         output;
+    output.logits = torch::zeros({3, 32}, torch::TensorOptions().device(torch::kCUDA));
+    output.logits.select(1, 7).fill_(5.0f);
+    output.logits.select(1, 31).fill_(4.0f);
+    Sampler    sampler({});
+    auto       draft = torch::empty({1, 2}, output.logits.options().dtype(torch::kInt32));
+    const auto main  = cuda_graph::graphGetCurrentStream();
+
+    std::vector<torch::Tensor> histories;
+    for (int round = 0; round < 6; ++round) {
+        stream->generateConfig()->no_repeat_ngram_size = round % 2 == 0 ? 0 : 2;
+        stream->generateConfig()->repetition_penalty   = round % 2 == 0 ? 1.0f : 2.0f;
+        draft.fill_(10 + round);
+        auto ready = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+        ready->record(main);
+        auto result = processor.gatherSpecSamplerInput(groups, output, {}, draft, ready);
+        ASSERT_TRUE(result.ok());
+        const auto& tokens = result.value().token_ids;
+        ASSERT_EQ(tokens.size(0), 3);
+        if (round % 2 == 0) {
+            EXPECT_EQ(tokens.size(1), 1);  // sampler's writable last column
+        } else {
+            ASSERT_EQ(tokens.size(1), 5);
+            histories.push_back(tokens.clone());
+        }
+        // Same logits and parameters, with the old full-width token history layout.
+        auto candidate = result.value();
+        auto reference = candidate;
+        reference.token_ids =
+            torch::tensor({7, 8, 10 + round, 10 + round, 0}, torch::kInt32).to(torch::kCUDA).repeat({3, 1});
+        reference.logits = candidate.logits.clone();
+        if (candidate.all_probs.defined()) {
+            reference.all_probs = candidate.all_probs.clone();
+        }
+        auto actual   = sampler.forward(candidate);
+        auto expected = sampler.forward(reference);
+        EXPECT_TRUE(torch::equal(actual.token_ids.select(1, -1), expected.token_ids.select(1, -1)));
+        EXPECT_TRUE(actual.token_ids.select(1, -1).eq(round % 2 == 0 ? 7 : 31).all().item<bool>());
+    }
+    for (size_t i = 0; i < histories.size(); ++i) {
+        auto observed = histories[i].cpu();
+        int  token    = 11 + 2 * static_cast<int>(i);
+        for (int row = 0; row < 3; ++row) {
+            EXPECT_EQ((std::vector<int32_t>{7, 8, token, token, 0}), toVec<int32_t>(observed[row]));
+        }
+    }
+}
+#endif
 
 TEST_F(MtpBatchStreamProcessorTest, testSpecSamplerInputMasksThinkBoundaryTokens) {
     ModelConfig                 model_config;
@@ -1181,11 +1269,10 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInput) {
     ResourceContext resource_context;
     resource_context.cache_manager = cache_manager;
 
-    GenerateStreamPtr stream1 = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
-    GenerateStreamPtr stream2 = createContextStream(model_config, runtime_config, resource_context, {1, 2}, 2);
-    GenerateStreamPtr stream3 = createContextStream(model_config, runtime_config, resource_context, {1, 2}, 3);
-    GenerateStreamPtr middle_stream =
-        createContextStream(model_config, runtime_config, resource_context, {1, 2, 3}, 4);
+    GenerateStreamPtr stream1       = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
+    GenerateStreamPtr stream2       = createContextStream(model_config, runtime_config, resource_context, {1, 2}, 2);
+    GenerateStreamPtr stream3       = createContextStream(model_config, runtime_config, resource_context, {1, 2}, 3);
+    GenerateStreamPtr middle_stream = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3}, 4);
     middle_stream->setChunkSize(2);
     ASSERT_TRUE(middle_stream->isMiddleChunk());
 
@@ -1204,8 +1291,7 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInput) {
     model_output.all_hidden_states = torch::zeros({7, 2}, torch::kFloat32);
 
     SamplerOutput sampler_output;
-    sampler_output.token_ids =
-        torch::tensor({1, -2, 2, 1, 2, 3, 3, 2, 1, 0, 1, 2}, torch::kInt32).reshape({4, 3});
+    sampler_output.token_ids = torch::tensor({1, -2, 2, 1, 2, 3, 3, 2, 1, 0, 1, 2}, torch::kInt32).reshape({4, 3});
 
     processor.updatePrefillPostDraftModelInput(stream_groups, model_input, model_output, sampler_output, holder);
 
@@ -1231,8 +1317,7 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInputShiftsCo
     ResourceContext resource_context;
     auto            stream1 = createContextStream(model_config, runtime_config, resource_context, {1, 2}, 1);
     auto            stream2 = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3}, 2);
-    auto            middle_stream =
-        createContextStream(model_config, runtime_config, resource_context, {1, 2, 3, 0}, 3);
+    auto middle_stream      = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3, 0}, 3);
     stream1->setContextPositionIds(torch::tensor({100, 101, 102, 110, 111, 112}, torch::kInt32));
     stream2->setContextPositionIds(torch::tensor({200, 201, 202, 210, 211, 212, 220, 221, 222}, torch::kInt32));
     middle_stream->setContextPositionIds(
@@ -1241,12 +1326,11 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInputShiftsCo
     ASSERT_TRUE(middle_stream->isMiddleChunk());
     auto           stream_groups = StreamGroups({stream1, stream2, middle_stream});
     GptModelInputs model_input;
-    model_input.input_lengths = torch::tensor({2, 3, 2}, torch::kInt32);
-    model_input.combo_tokens  = torch::tensor({10, 11, 20, 21, 22, 30, 31}, torch::kInt32);
-    model_input.combo_position_ids =
-        torch::tensor({100, 101, 102, 110, 111, 112, 200, 201, 202, 210, 211, 212,
-                       220, 221, 222, 300, 301, 302, 310, 311, 312},
-                      torch::kInt32);
+    model_input.input_lengths      = torch::tensor({2, 3, 2}, torch::kInt32);
+    model_input.combo_tokens       = torch::tensor({10, 11, 20, 21, 22, 30, 31}, torch::kInt32);
+    model_input.combo_position_ids = torch::tensor(
+        {100, 101, 102, 110, 111, 112, 200, 201, 202, 210, 211, 212, 220, 221, 222, 300, 301, 302, 310, 311, 312},
+        torch::kInt32);
     GptModelOutputs model_output;
     model_output.all_hidden_states = torch::zeros({7, 2}, torch::kFloat32);
     SamplerOutput sampler_output;
@@ -1254,9 +1338,8 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdatePrefillPostDraftModelInputShiftsCo
     TensorHolder holder;
     processor.updatePrefillPostDraftModelInput(stream_groups, model_input, model_output, sampler_output, holder);
     EXPECT_EQ((vector<int>{11, 12, 21, 22, 23, 31, 3}), toVec<int>(model_input.combo_tokens));
-    EXPECT_EQ((vector<int>{110, 111, 112, 112, 112, 112,
-                           210, 211, 212, 220, 221, 222, 222, 222, 222,
-                           310, 311, 312, 320, 321, 322}),
+    EXPECT_EQ((vector<int>{110, 111, 112, 112, 112, 112, 210, 211, 212, 220, 221,
+                           222, 222, 222, 222, 310, 311, 312, 320, 321, 322}),
               toVec<int>(model_input.combo_position_ids));
 }
 

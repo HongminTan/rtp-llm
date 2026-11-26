@@ -7,6 +7,9 @@
 #include "rtp_llm/cpp/utils/StringUtil.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
+#if USING_CUDA
+#include "rtp_llm/models_py/bindings/cuda/kernels/mtp_target_verify_prepare.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -553,19 +556,6 @@ torch::Tensor interleaveTokenPairs(const torch::Tensor& first, const torch::Tens
     return torch::stack({first, second}, /*dim=*/1).reshape({-1});
 }
 
-void copyScoreSamplerTokenIds(torch::Tensor&       token_ids,
-                              const torch::Tensor& complete_token_ids,
-                              int64_t              batch_idx,
-                              int64_t              score_len,
-                              int64_t              seq_len) {
-    if (score_len <= 0 || seq_len <= 0) {
-        return;
-    }
-    auto dst = token_ids.narrow(0, batch_idx, score_len).narrow(1, 0, seq_len);
-    auto src = complete_token_ids.narrow(0, 0, 1).narrow(1, 0, seq_len).expand({score_len, seq_len});
-    dst.copy_(src);
-}
-
 const char* missingMtpStateReason(const GenerateStream::MtpAsyncDeviceState& state) {
     if (!state.accept_tokens_gpu.defined()) {
         return "accept_tokens_gpu_missing";
@@ -860,7 +850,8 @@ absl::StatusOr<SamplerInputs>
 MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&                         stream_groups,
                                                 const GptModelOutputs&                      model_output,
                                                 const SpecLogitsVerifyRunner::LaunchResult& spec_logits_result,
-                                                const torch::Tensor&                        draft_token_ids) const {
+                                                const torch::Tensor&                        draft_token_ids,
+                                                const std::shared_ptr<torch::Event>&        draft_tokens_ready) const {
     RTP_LLM_PROFILE_SCOPE("mtp_batch_stream_processor.gather_spec_sampler_input");
     RTP_LLM_CHECK(!stream_groups.empty());
     auto               all_streams      = stream_groups.allStreams();
@@ -874,26 +865,43 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
     size_t total_batch_size = stream_groups.size() * score_len;
 
     SamplerInputs sampler_inputs =
-        allocateSamplerInputs(stream_groups, total_batch_size, total_batch_size, propose_step_);
+        allocateSamplerInputs(stream_groups, total_batch_size, total_batch_size, propose_step_, false);
     fillSamplerCommonInputs(sampler_inputs, all_streams, true, propose_step_);
-
-    int64_t batch_idx = 0;
-    for (auto& stream : all_streams) {
-        auto complete_token_ids = stream->completeTokenIds();
-        auto seq_len            = static_cast<int64_t>(stream->seqLength());
-
-        copyScoreSamplerTokenIds(
-            sampler_inputs.token_ids, complete_token_ids, batch_idx, static_cast<int64_t>(score_len), seq_len);
-        RTP_LLM_CHECK_WITH_INFO(
-            seq_len + static_cast<int64_t>(propose_step_) <= static_cast<int64_t>(sampler_inputs.step + 1),
-            "MTP verify sampler history exceeds its allocated width: seq_len=%ld gamma=%zu step=%zu",
-            seq_len,
-            propose_step_,
-            sampler_inputs.step);
-        batch_idx += static_cast<int64_t>(score_len);
-        RTP_LLM_LOG_DEBUG("stream [%s], sampler inputs token ids = [%s]",
-                          stream->streamLogTag().c_str(),
-                          tensorDebugStringWithData<int32_t>(sampler_inputs.token_ids).c_str());
+    const auto history_width = static_cast<int64_t>(sampler_inputs.step + 1);
+    const auto batch_size    = static_cast<int64_t>(stream_groups.size());
+    const auto gamma         = static_cast<int64_t>(propose_step_);
+    const auto rows          = static_cast<int64_t>(score_len);
+    // Only the sampled last column survives rejection when no row reads history.
+#if USING_CUDA
+    const bool need_history = std::any_of(all_streams.begin(), all_streams.end(), [](const auto& stream) {
+        const auto& config = *stream->generateConfig();
+        return config.repetition_penalty != 1.0f || config.presence_penalty != 0.0f || config.frequency_penalty != 0.0f
+               || config.no_repeat_ngram_size.value_or(0) != 0 || stream->currentNumBeams() != 1
+               || stream->nextNumBeams() != 1;
+    });
+#else
+    const bool need_history = true;
+#endif
+    torch::Tensor history_host;
+    if (need_history) {
+        // One immutable pinned snapshot per round; do not overwrite it while DMA is in flight.
+        history_host = torch::empty({static_cast<int64_t>(all_streams.size()), history_width},
+                                    torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+    }
+    // Verify row j consumes L + j tokens. Row zero gives the committed prefix length L.
+    const auto* sequence_lengths = sampler_inputs.sequence_lengths.data_ptr<int32_t>();
+    int64_t     row              = 0;
+    for (const auto& stream : all_streams) {
+        const auto seq_len = static_cast<int64_t>(sequence_lengths[row * rows]);
+        RTP_LLM_CHECK_WITH_INFO(seq_len + propose_step_ <= history_width,
+                                "MTP verify sampler history exceeds width: seq_len=%ld gamma=%d width=%ld",
+                                seq_len,
+                                propose_step_,
+                                history_width);
+        if (need_history) {
+            history_host[row].narrow(0, 0, seq_len).copy_(stream->completeTokenIds()[0].narrow(0, 0, seq_len));
+        }
+        ++row;
     }
 
     RTP_LLM_CHECK_WITH_INFO(model_output.logits.dim() == 2
@@ -910,33 +918,62 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
         }
     }
 
-    const auto batch_size = static_cast<int64_t>(stream_groups.size());
-    const auto gamma      = static_cast<int64_t>(propose_step_);
-    const auto rows       = static_cast<int64_t>(score_len);
     RTP_LLM_CHECK_WITH_INFO(draft_token_ids.defined() && draft_token_ids.scalar_type() == torch::kInt32
                                 && draft_token_ids.dim() == 2 && draft_token_ids.size(0) == batch_size
                                 && draft_token_ids.size(1) == gamma,
                             "MTP verify draft tokens must be int32 [B,gamma]");
 
-    // The sampler already needs token history on device. Fill every proposal
-    // slot once for all score rows, then let each row's sequence length expose
-    // exactly proposals [0, score_position).
-    auto token_ids_gpu = sampler_inputs.token_ids.to(torch::kCUDA, /*non_blocking=*/true);
-    auto histories     = token_ids_gpu.view({batch_size, rows, static_cast<int64_t>(sampler_inputs.step + 1)});
-    auto proposals     = draft_token_ids.to(torch::kCUDA, /*non_blocking=*/true)
-                         .contiguous()
-                         .view({batch_size, 1, gamma})
-                         .expand({batch_size, rows, gamma});
-    auto base_lengths = sampler_inputs.sequence_lengths.view({batch_size, rows})
-                            .select(1, 0)
-                            .to(torch::Device(torch::kCUDA), torch::kLong, /*non_blocking=*/true)
-                            .view({batch_size, 1, 1});
-    auto proposal_offsets =
-        torch::arange(gamma, torch::TensorOptions().dtype(torch::kLong).device(torch::Device(torch::kCUDA)))
-            .view({1, 1, gamma});
-    auto proposal_columns = (base_lengths + proposal_offsets).expand({batch_size, rows, gamma});
-    histories.scatter_(2, proposal_columns, proposals);
-    sampler_inputs.token_ids = std::move(token_ids_gpu);
+    const auto options = draft_token_ids.options().device(torch::kCUDA);
+    if (!need_history) {
+        sampler_inputs.token_ids = torch::empty({batch_size * rows, 1}, options);
+    } else {
+        const auto base_lengths = sampler_inputs.sequence_lengths.view({batch_size, rows}).select(1, 0);
+#if USING_CUDA
+        auto main_stream = cuda_graph::graphGetCurrentStream();
+        auto stream      = main_stream;
+        if (draft_tokens_ready) {
+            if (!sampler_copy_stream_ || sampler_copy_stream_->device_index() != main_stream.device_index()
+                || *sampler_copy_stream_ == main_stream) {
+                do {
+                    sampler_copy_stream_ = cuda_graph::graphGetStreamFromPool(false);
+                } while (*sampler_copy_stream_ == main_stream);
+            }
+            stream = cuda_graph::toGraphStream(*sampler_copy_stream_);
+        }
+        {
+            cuda_graph::GraphStreamGuard guard(stream);
+            auto                         history = history_host.to(options, /*non_blocking=*/true);
+            auto lengths = base_lengths.to(history.device(), torch::kLong, /*non_blocking=*/true);
+            // Only expansion reads draft tokens. The prefix DMA can start independently of proposal.
+            if (draft_tokens_ready) {
+                draft_tokens_ready->block(stream);
+                if (draft_token_ids.is_cuda()) {
+                    draft_token_ids.record_stream(stream);
+                }
+            }
+            auto draft  = draft_token_ids.to(options, /*non_blocking=*/true).contiguous();
+            auto matrix = torch::empty({batch_size, rows, history_width}, options);
+            invokeMtpSpecSamplerTokenMatrix(history, draft, lengths, matrix, gamma, stream.stream());
+            sampler_inputs.token_ids = matrix.view({batch_size * rows, history_width});
+            if (draft_tokens_ready) {
+                auto history_ready = cuda_graph::makeGraphEvent();
+                history_ready.record(stream);
+                history_ready.block(main_stream);
+                matrix.record_stream(main_stream);
+            }
+        }
+#else
+        auto history = history_host.to(options, /*non_blocking=*/true);
+        auto matrix  = torch::empty({batch_size, rows, history_width}, options);
+        matrix.copy_(history.unsqueeze(1).expand_as(matrix));
+        auto proposals = draft_token_ids.to(options).view({batch_size, 1, gamma}).expand({batch_size, rows, gamma});
+        auto offsets   = torch::arange(gamma, options.dtype(torch::kLong));
+        auto columns =
+            base_lengths.to(history.device(), torch::kLong, /*non_blocking=*/true).view({batch_size, 1, 1}) + offsets;
+        matrix.scatter_(2, columns.expand_as(proposals), proposals);
+        sampler_inputs.token_ids = matrix.view({batch_size * rows, history_width});
+#endif
+    }
 
     // lm_head shards may contain TP-alignment padding. Synthetic columns must
     // not participate in target sampling or the rejection distribution.
@@ -1268,17 +1305,18 @@ void MtpBatchStreamProcessor::updatePrefillPostDraftModelInput(const StreamGroup
     int* combo_tokens  = combo_tokens_cpu.data_ptr<int>();
 
     const int* sampled_tokens = new_all_token_ids_cpu.data_ptr<int>();
-    int* combo_position_ids =
+    int*       combo_position_ids =
         model_input.combo_position_ids.defined() ? model_input.combo_position_ids.data_ptr<int>() : nullptr;
     const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
     auto         all_streams            = stream_groups.allStreams();
-    const size_t stream_row_count = std::accumulate(
+    const size_t stream_row_count       = std::accumulate(
         all_streams.begin(), all_streams.end(), size_t{0}, [](size_t count, const GenerateStreamPtr& stream) {
             return count + static_cast<size_t>(stream->nextBatchSize());
         });
     RTP_LLM_CHECK_WITH_INFO(stream_row_count == batch_size,
                             "prefill draft input stream rows %zu != sampler rows %zu",
-                            stream_row_count, batch_size);
+                            stream_row_count,
+                            batch_size);
 
     size_t row_idx = 0;
     int    offset  = 0;
@@ -1291,8 +1329,8 @@ void MtpBatchStreamProcessor::updatePrefillPostDraftModelInput(const StreamGroup
 
             // Middle chunk tail is the next prompt token; other prefill tails use sampled token.
             // Using sampled token at a chunk boundary would build draft KV from the wrong input.
-            const int tail_token = middle_chunk ? stream->nextChunkBoundaryToken() :
-                                                  sampled_tokens[row_idx * token_stride + token_stride - 1];
+            const int tail_token                    = middle_chunk ? stream->nextChunkBoundaryToken() :
+                                                                     sampled_tokens[row_idx * token_stride + token_stride - 1];
             combo_tokens[offset + input_length - 1] = tail_token;
 
             if (combo_position_ids != nullptr) {

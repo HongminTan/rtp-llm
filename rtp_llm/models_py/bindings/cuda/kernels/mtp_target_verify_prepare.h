@@ -37,4 +37,11 @@ void invokeMtpDispatchStatePrepare(const torch::Tensor& accept_len,
                                    int64_t              batch_size,
                                    cudaStream_t         stream);
 
+void invokeMtpSpecSamplerTokenMatrix(const torch::Tensor& history,
+                                     const torch::Tensor& draft,
+                                     const torch::Tensor& base_lengths,
+                                     torch::Tensor&       output,
+                                     int64_t              gamma,
+                                     cudaStream_t         stream);
+
 }  // namespace rtp_llm

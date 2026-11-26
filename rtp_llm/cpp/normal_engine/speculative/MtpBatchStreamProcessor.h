@@ -54,10 +54,12 @@ public:
                                                       const std::vector<CacheGroupType>& group_types,
                                                       int64_t                            seq_size_per_block);
 
-    absl::StatusOr<SamplerInputs> gatherSpecSamplerInput(const StreamGroups&                         stream_groups,
-                                                         const GptModelOutputs&                      model_output,
-                                                         const SpecLogitsVerifyRunner::LaunchResult& spec_logits_result,
-                                                         const torch::Tensor& draft_token_ids) const;
+    absl::StatusOr<SamplerInputs>
+    gatherSpecSamplerInput(const StreamGroups&                         stream_groups,
+                           const GptModelOutputs&                      model_output,
+                           const SpecLogitsVerifyRunner::LaunchResult& spec_logits_result,
+                           const torch::Tensor&                        draft_token_ids,
+                           const std::shared_ptr<torch::Event>&        draft_tokens_ready = nullptr) const;
 
     void prepareDecodeDraftModelInput(const StreamGroups& stream_groups,
                                       GptModelInputs&     model_input,
@@ -188,6 +190,9 @@ protected:
         return propose_step_ + static_cast<int64_t>(!dspark_sample_from_anchor_);
     }
 
+#if USING_CUDA
+    mutable std::optional<torch::Stream> sampler_copy_stream_;
+#endif
     int     propose_step_;
     size_t  vocab_size_                = 0;
     bool    is_dspark_                 = false;
