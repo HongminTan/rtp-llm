@@ -140,7 +140,7 @@ protected:
     void            waitPreviousBookkeepingBeforeStreamPreparation(const std::list<GenerateStreamPtr>& streams);
     void            launchTargetVerifyPrepareAsync(const GptModelInputs& model_input, size_t batch_size);
     void            launchDraftPrefillPrepareAsync(const GptModelInputs& model_input);
-    GptModelOutputs runTargetVerifyForward(GptModelInputs& model_input, const StreamGroups& stream_groups);
+    GptModelOutputs runTargetVerifyForward(GptModelInputs model_input, const StreamGroups& stream_groups);
     absl::Status    runDecodeAlignmentOnly(GptModelInputs& model_input);
     void            debugCheckLinearBlockMapAtKernelRead(const GptModelInputs& model_input,
                                                          const StreamGroups&   stream_groups) const;
@@ -167,6 +167,7 @@ protected:
     absl::Status dispatchDecodeOutput(const StreamGroups&                          stream_groups,
                                       const std::list<GenerateStreamPtr>&          streams,
                                       const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+                                      const torch::Tensor&                         decode_prefix_lengths,
                                       const torch::Tensor&                         verify_position_ids,
                                       const torch::Tensor&                         kv_cache_block_id,
                                       const torch::Tensor&                         kv_cache_kernel_block_id,
@@ -217,6 +218,7 @@ protected:
     // the main thread.
     absl::Status dispatchDecodeAsync(const StreamGroups&                          stream_groups,
                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                     const torch::Tensor&                         decode_prefix_lengths,
                                      const torch::Tensor&                         verify_position_ids,
                                      const torch::Tensor&                         kv_cache_block_id,
                                      const torch::Tensor&                         kv_cache_kernel_block_id,
@@ -225,10 +227,11 @@ protected:
                                      std::shared_ptr<torch::Event>                draft_event,
                                      int64_t                                      step_start_time_us);
 
-    // Synchronous dispatch also publishes the same per-stream device state as
-    // the async path, using the host seqLength after specUpdate as truth.
+    // Synchronous dispatch publishes the same per-stream device state as the
+    // async path, reusing decode_prefix_lengths instead of re-copying host seqLength.
     void publishSyncMtpDeviceState(const StreamGroups&                          stream_groups,
                                    const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                   const torch::Tensor&                         decode_prefix_lengths,
                                    const torch::Tensor&                         verify_position_ids,
                                    const MergedOutput&                          draft_prefill_output);
 

@@ -49,10 +49,18 @@ public:
     // groups are copied unchanged.  Keeping this operation tensor-native lets
     // proposal/verify overlap host bookkeeping without a per-round D2H join.
     static torch::Tensor advanceLinearCacheBlockTable(const torch::Tensor&               current_table,
-                                                      const torch::Tensor&               previous_seq_lengths,
+                                                      const torch::Tensor&               decode_prefix_lengths,
                                                       const torch::Tensor&               accept_lengths,
                                                       const std::vector<CacheGroupType>& group_types,
                                                       int64_t                            seq_size_per_block);
+
+    // Resolve per-request cached KV prefix length (committed length - 1) as a
+    // contiguous CUDA int32 [batch] tensor. Steady streams read next_seq_len_gpu - 1
+    // when allow_device_state is true; fresh streams keep model_input.sequence_lengths.
+    static torch::Tensor resolveDecodePrefixLengths(const StreamGroups&   stream_groups,
+                                                    const GptModelInputs& model_input,
+                                                    TensorHolder&         host_holder,
+                                                    bool                  allow_device_state = true);
 
     absl::StatusOr<SamplerInputs>
     gatherSpecSamplerInput(const StreamGroups&                         stream_groups,

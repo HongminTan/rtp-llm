@@ -1615,6 +1615,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         }
     }
 
+    // Cached KV prefix lengths before this decode round (committed length - 1),
+    // shared across target verification and post-step device-state publishing.
+    const auto decode_prefix_lengths = model_input.prefix_lengths;
+
     spec_logits_processor_present =
         isTpRank0() && !warm_up_ && !model_input.is_fake_stream && hasSpecLogitsProcessor(streams);
 
@@ -1866,6 +1870,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     auto dispatch_result = dispatchDecodeOutput(stream_groups,
                                                 streams,
                                                 speculative_sampler_output,
+                                                decode_prefix_lengths,
                                                 model_input.combo_position_ids,
                                                 model_input.kv_cache_block_id,
                                                 model_input.kv_cache_kernel_block_id,
@@ -2026,7 +2031,7 @@ void MtpExecutor::launchDraftPrefillPrepareAsync(const GptModelInputs& model_inp
         });
 }
 
-GptModelOutputs MtpExecutor::runTargetVerifyForward(GptModelInputs& model_input, const StreamGroups& stream_groups) {
+GptModelOutputs MtpExecutor::runTargetVerifyForward(GptModelInputs model_input, const StreamGroups& stream_groups) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_model_verify)");
     maybePrintModelInput(model_input, "decode target model");
     model_input.is_target_verify = true;
@@ -2056,7 +2061,6 @@ GptModelOutputs MtpExecutor::runTargetVerifyForward(GptModelInputs& model_input,
     ensureModelInputsOnCuda(model_input, "decode.target_verify_forward");
     GptModelOutputs model_output = forwardModel(model_.get(), model_input, ModelInputsModelRole::TARGET);
     RTP_LLM_LOG_DEBUG("[MTP decode] target model verify forward end");
-    model_input.is_target_verify = false;
     return model_output;
 }
 
@@ -2370,6 +2374,7 @@ void MtpExecutor::collectDecodeMetrics(const StreamGroups&                      
 absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&                          stream_groups,
                                                const std::list<GenerateStreamPtr>&          streams,
                                                const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+                                               const torch::Tensor&                         decode_prefix_lengths,
                                                const torch::Tensor&                         verify_position_ids,
                                                const torch::Tensor&                         kv_cache_block_id,
                                                const torch::Tensor&                         kv_cache_kernel_block_id,
@@ -2385,6 +2390,7 @@ absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&              
         // via cudaStreamWaitEvent; the main thread returns immediately.
         result = dispatchDecodeAsync(stream_groups,
                                      speculative_sampler_output,
+                                     decode_prefix_lengths,
                                      verify_position_ids,
                                      kv_cache_block_id,
                                      kv_cache_kernel_block_id,
@@ -2402,8 +2408,11 @@ absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&              
         result =
             batch_stream_processor_->dispatchDecode(stream_groups, speculative_sampler_output, draft_prefill_output);
         if (result.ok() && useAsyncDeviceState()) {
-            publishSyncMtpDeviceState(
-                stream_groups, speculative_sampler_output, verify_position_ids, draft_prefill_output);
+            publishSyncMtpDeviceState(stream_groups,
+                                      speculative_sampler_output,
+                                      decode_prefix_lengths,
+                                      verify_position_ids,
+                                      draft_prefill_output);
         }
     }
     return result;
@@ -2844,6 +2853,7 @@ torch::Tensor MtpExecutor::advanceDSparkPositionIds(const torch::Tensor& verify_
 
 void MtpExecutor::publishSyncMtpDeviceState(const StreamGroups&                          stream_groups,
                                             const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                            const torch::Tensor&                         decode_prefix_lengths,
                                             const torch::Tensor&                         verify_position_ids,
                                             const MergedOutput&                          draft_prefill_output) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(publish_sync_mtp_device_state)");
@@ -2860,6 +2870,7 @@ void MtpExecutor::publishSyncMtpDeviceState(const StreamGroups&                 
 
     torch::Tensor accept_len_all     = to_cuda_i32(spec_decode_output.accept_len);
     torch::Tensor accept_tokens_all  = to_cuda_i32(spec_decode_output.accept_tokens);
+    torch::Tensor decode_prefix_gpu  = to_cuda_i32(decode_prefix_lengths);
     torch::Tensor propose_tokens_all = draft_prefill_output.sampler_output.token_ids.defined() ?
                                            to_cuda_i32(draft_prefill_output.sampler_output.token_ids) :
                                            torch::Tensor();
@@ -2872,27 +2883,19 @@ void MtpExecutor::publishSyncMtpDeviceState(const StreamGroups&                 
             toCudaWithHostHold(draft_prefill_output.model_output.all_hidden_states, buffer_holder_) :
             torch::Tensor();
 
-    if (!accept_len_all.defined() || !accept_tokens_all.defined()) {
-        RTP_LLM_LOG_WARNING(
-            "[mtp-device-state] skip sync publish: accept_len/accept_tokens undefined, stream_count=%zu",
-            all_streams.size());
+    if (!accept_len_all.defined() || !accept_tokens_all.defined() || !decode_prefix_gpu.defined()
+        || decode_prefix_gpu.numel() != batch_size) {
+        RTP_LLM_LOG_WARNING("[mtp-device-state] skip sync publish: invalid inputs "
+                            "(accept_len=%d accept_tokens=%d decode_prefix_numel=%ld batch_size=%ld)",
+                            static_cast<int>(accept_len_all.defined()),
+                            static_cast<int>(accept_tokens_all.defined()),
+                            decode_prefix_gpu.defined() ? decode_prefix_gpu.numel() : -1L,
+                            batch_size);
         return;
     }
 
-    // Batch compute next_seq_len from host seqLength (sync path: host is authoritative)
-    const auto pin_i32          = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
-    const auto cuda_i32         = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
-    auto       next_seq_len_cpu = torch::empty({batch_size}, pin_i32);
-    {
-        int64_t i = 0;
-        for (const auto& stream : all_streams) {
-            next_seq_len_cpu.data_ptr<int32_t>()[i] = static_cast<int32_t>(stream->seqLength());
-            ++i;
-        }
-    }
-    buffer_holder_.hold_host(next_seq_len_cpu);
-    auto next_seq_len_owned = torch::empty({batch_size}, cuda_i32);
-    next_seq_len_owned.copy_(next_seq_len_cpu, /*non_blocking=*/true);
+    auto next_seq_len_owned =
+        (decode_prefix_gpu.reshape({batch_size}) + accept_len_all.reshape({batch_size}) + 1).to(torch::kInt32);
 
     // Batch gather hidden states
     torch::Tensor last_hidden_all;
@@ -2946,6 +2949,7 @@ void MtpExecutor::publishSyncMtpDeviceState(const StreamGroups&                 
 
 absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&                          stream_groups,
                                               const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                              const torch::Tensor&                         decode_prefix_lengths,
                                               const torch::Tensor&                         verify_position_ids,
                                               const torch::Tensor&                         kv_cache_block_id,
                                               const torch::Tensor&                         kv_cache_kernel_block_id,
@@ -2969,37 +2973,31 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     const auto cuda_i64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
 
-    torch::Tensor prev_seq_len_all;
+    torch::Tensor decode_prefix_gpu;
     torch::Tensor next_seq_len_all;
     torch::Tensor hidden_idx_all;
     if (accept_len_gpu_all.defined() && batch_size > 0) {
-        // Build prev_seq_len per-stream: use device state when available,
-        // fall back to host seqLength for new streams without device state.
-        std::vector<torch::Tensor> prev_slices;
-        prev_slices.reserve(batch_size);
-        for (const auto& stream : all_streams) {
-            const auto& gpu_val = stream->getNextSeqLenGpu();
-            if (gpu_val.defined() && gpu_val.is_cuda()) {
-                prev_slices.push_back(gpu_val.reshape({1}));
-            } else {
-                prev_slices.push_back(torch::tensor({static_cast<int32_t>(stream->seqLength())}, cuda_i32));
-            }
-        }
-        prev_seq_len_all = torch::cat(prev_slices, 0);
+        decode_prefix_gpu = toCudaInt32WithHostHold(decode_prefix_lengths, buffer_holder_);
+        RTP_LLM_CHECK_WITH_INFO(decode_prefix_gpu.defined() && decode_prefix_gpu.is_cuda()
+                                    && decode_prefix_gpu.scalar_type() == torch::kInt32
+                                    && decode_prefix_gpu.numel() == batch_size,
+                                "dispatchDecodeAsync requires CUDA int32 decode_prefix_lengths [batch=%ld]",
+                                batch_size);
+        decode_prefix_gpu = decode_prefix_gpu.reshape({batch_size}).contiguous();
 
         next_seq_len_all = torch::empty({batch_size}, cuda_i32);
         hidden_idx_all   = torch::empty({batch_size}, cuda_i64);
 
-        auto accept_len_i32 = accept_len_gpu_all.to(torch::kInt32);
+        auto accept_len_i32 = accept_len_gpu_all.to(torch::kInt32).contiguous();
 #if USING_CUDA
         invokeMtpDispatchStatePrepare(accept_len_i32,
-                                      prev_seq_len_all,
+                                      decode_prefix_gpu,
                                       next_seq_len_all,
                                       hidden_idx_all,
                                       batch_size,
                                       at::cuda::getCurrentCUDAStream().stream());
 #else
-        next_seq_len_all = prev_seq_len_all + accept_len_i32;
+        next_seq_len_all = decode_prefix_gpu + accept_len_i32 + 1;
         hidden_idx_all   = (accept_len_i32.to(torch::kInt64) - 1);
 #endif
     }
@@ -3026,8 +3024,8 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
 
     torch::Tensor next_kv_cache_block_id;
     torch::Tensor next_kv_cache_kernel_block_id;
-    if (is_linear_attention_model_ && useDeviceInput() && kv_cache_block_id.defined() && kv_cache_block_id.is_cuda()
-        && kv_cache_kernel_block_id.defined() && kv_cache_kernel_block_id.is_cuda()) {
+    if (is_linear_attention_model_ && useDeviceInput() && decode_prefix_gpu.defined() && kv_cache_block_id.defined()
+        && kv_cache_block_id.is_cuda() && kv_cache_kernel_block_id.defined() && kv_cache_kernel_block_id.is_cuda()) {
         RTP_LLM_CHECK_WITH_INFO(kv_cache_block_id.dim() == 3 && kv_cache_block_id.size(1) == batch_size,
                                 "MTP physical cache snapshot source must be [group,batch,blocks], batch=%ld",
                                 batch_size);
@@ -3045,9 +3043,9 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         if (hasLinearCacheSnapshotCapacity(all_streams, table_width, static_cast<int>(propose_step_ + 1), block_size)) {
             auto accept_i32        = accept_len_gpu_all.to(torch::kInt32);
             next_kv_cache_block_id = MtpBatchStreamProcessor::advanceLinearCacheBlockTable(
-                kv_cache_block_id, prev_seq_len_all, accept_i32, group_types, block_size);
+                kv_cache_block_id, decode_prefix_gpu, accept_i32, group_types, block_size);
             next_kv_cache_kernel_block_id = MtpBatchStreamProcessor::advanceLinearCacheBlockTable(
-                kv_cache_kernel_block_id, prev_seq_len_all, accept_i32, group_types, block_size);
+                kv_cache_kernel_block_id, decode_prefix_gpu, accept_i32, group_types, block_size);
         } else {
             // This should coincide with an allocator boundary. Publishing no
             // snapshot makes the next scheduler iteration join bookkeeping and

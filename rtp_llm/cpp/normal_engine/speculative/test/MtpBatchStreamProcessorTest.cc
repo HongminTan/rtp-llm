@@ -718,7 +718,8 @@ TEST_F(MtpBatchStreamProcessorTest, testPrepareOneStepSpecDecodeModelInput) {
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testPrepareOneStepSpecDecodeModelInputFromDeviceState) {
-    setenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "1", 1);
+    autil::EnvGuard             stream_async_off("RTP_LLM_STREAM_ASYNC", "0");
+    autil::EnvGuard             device_state_off("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "0");
     ModelConfig                 model_config;
     RuntimeConfig               runtime_config;
     SpeculativeExecutionConfig  sp_config;
@@ -794,28 +795,54 @@ TEST_F(MtpBatchStreamProcessorTest, testPrepareOneStepSpecDecodeModelInputFromDe
     auto processor = MtpBatchStreamProcessor(
         model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
     TensorHolder holder;
-    auto         model_input_status = processor.gatherDecodeModelInput(stream_groups, holder);
-    EXPECT_TRUE(model_input_status.ok());
+    {
+        autil::EnvGuard device_state_on("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "1");
+        auto            model_input_status = processor.gatherDecodeModelInput(stream_groups, holder);
+        EXPECT_TRUE(model_input_status.ok());
 
-    auto& model_input            = model_input_status.value();
-    model_input.sequence_lengths = torch::tensor({99, 99}, torch::kInt32);
+        auto& model_input            = model_input_status.value();
+        model_input.sequence_lengths = torch::tensor({99, 99}, torch::kInt32);
 
+        processor.prepareOneStepSpecDecodeModelInput(stream_groups, model_input, holder);
+
+        vector<int> expect_combo_tokens = {3, 1, 1, 2};
+        EXPECT_TRUE(model_input.combo_tokens.is_cuda());
+        EXPECT_EQ(expect_combo_tokens, toVec<int>(model_input.combo_tokens));
+
+        vector<int> expect_prefix_lengths = {6, 3};
+        EXPECT_TRUE(model_input.prefix_lengths.is_cuda());
+        EXPECT_EQ(expect_prefix_lengths, toVec<int>(model_input.prefix_lengths));
+        EXPECT_TRUE(model_input.sequence_lengths.is_cuda());
+        EXPECT_EQ(0, model_input.sequence_lengths.size(0));
+
+        vector<int> expect_input_lengths = {2, 2};
+        EXPECT_TRUE(model_input.input_lengths.is_cuda());
+        EXPECT_EQ(expect_input_lengths, toVec<int>(model_input.input_lengths));
+
+        // Mixed steady + fresh batch keeps steady row's device prefix and fresh row's host prefix.
+        stream2->setMtpAsyncDeviceState({});
+        stream2->getSPOutputBuffer()->tokens = torch::tensor({{1, 2}}, torch::kInt32);
+        model_input                          = processor.gatherDecodeModelInput(stream_groups, holder).value();
+        model_input.sequence_lengths         = torch::tensor({99, 2}, torch::kInt32);
+        processor.prepareOneStepSpecDecodeModelInput(stream_groups, model_input, holder);
+        EXPECT_EQ((vector<int>{6, 2}), toVec<int>(model_input.prefix_lengths));
+    }
+
+    // RTP_LLM_STREAM_ASYNC=1 alone also enables device-state prefix resolution.
+    {
+        autil::EnvGuard stream_async_on("RTP_LLM_STREAM_ASYNC", "1");
+        auto            model_input  = processor.gatherDecodeModelInput(stream_groups, holder).value();
+        model_input.sequence_lengths = torch::tensor({99, 2}, torch::kInt32);
+        processor.prepareOneStepSpecDecodeModelInput(stream_groups, model_input, holder);
+        EXPECT_EQ((vector<int>{6, 2}), toVec<int>(model_input.prefix_lengths));
+    }
+
+    // With both device-state env vars off, one-step preparation falls back to host sequence_lengths.
+    stream1->getSPOutputBuffer()->tokens = torch::tensor({{3, 1}}, torch::kInt32);
+    auto model_input                     = processor.gatherDecodeModelInput(stream_groups, holder).value();
+    model_input.sequence_lengths         = torch::tensor({99, 2}, torch::kInt32);
     processor.prepareOneStepSpecDecodeModelInput(stream_groups, model_input, holder);
-
-    vector<int> expect_combo_tokens = {3, 1, 1, 2};
-    EXPECT_TRUE(model_input.combo_tokens.is_cuda());
-    EXPECT_EQ(expect_combo_tokens, toVec<int>(model_input.combo_tokens));
-
-    vector<int> expect_prefix_lengths = {6, 3};
-    EXPECT_TRUE(model_input.prefix_lengths.is_cuda());
-    EXPECT_EQ(expect_prefix_lengths, toVec<int>(model_input.prefix_lengths));
-    EXPECT_TRUE(model_input.sequence_lengths.is_cuda());
-    EXPECT_EQ(0, model_input.sequence_lengths.size(0));
-
-    vector<int> expect_input_lengths = {2, 2};
-    EXPECT_TRUE(model_input.input_lengths.is_cuda());
-    EXPECT_EQ(expect_input_lengths, toVec<int>(model_input.input_lengths));
-    unsetenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE");
+    EXPECT_EQ((vector<int>{99, 2}), toVec<int>(model_input.prefix_lengths));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testprepareDecodeDraftModelInput) {
@@ -941,6 +968,12 @@ TEST_F(MtpBatchStreamProcessorTest, testprepareDecodeDraftModelInput) {
     processor.prepareDecodeDraftModelInput(stream_groups, model_input, holder);
 
     expect_positions(model_input, {6, 3}, {6, 3});
+
+    // Mixed steady + fresh batch preserves steady row's device prefix and fresh row's host prefix.
+    stream2->setMtpAsyncDeviceState({});
+    model_input.sequence_lengths = torch::tensor({99, 2}, torch::kInt32);
+    processor.prepareDecodeDraftModelInput(stream_groups, model_input, holder);
+    expect_positions(model_input, {6, 2}, {6, 2});
 }
 
 TEST_F(MtpBatchStreamProcessorTest, DraftCacheWritesRemainContiguousAcrossPreparationPaths) {
@@ -1565,7 +1598,8 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputAdvancesCombo
     GptModelInputs model_input;
     model_input.combo_tokens       = torch::tensor({11, 21}, torch::kInt32);
     model_input.sequence_lengths   = torch::tensor({5, 7}, torch::kInt32);
-    model_input.combo_position_ids = torch::tensor({5, 6, 7, 10, 11, 12}, torch::kInt32);
+    model_input.combo_position_ids = torch::tensor({5, 6, 7, 10, 11, 12}, torch::kInt32).pin_memory();
+    const auto original_positions  = model_input.combo_position_ids;
 
     GptModelOutputs model_output;
     model_output.all_hidden_states = torch::tensor({0.1f, 0.2f, 1.1f, 1.2f}, torch::kFloat32).reshape({2, 2});
@@ -1577,7 +1611,18 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputAdvancesCombo
     EXPECT_EQ((vector<int>{12, 22}), toVec<int>(model_input.combo_tokens));
     EXPECT_EQ((vector<int>{6, 8}), toVec<int>(model_input.sequence_lengths));
     EXPECT_EQ((vector<float>{0.1, 0.2, 1.1, 1.2}), toVec<float>(model_input.last_hidden_states));
+    EXPECT_FALSE(model_input.combo_position_ids.is_cuda());
+    EXPECT_TRUE(model_input.combo_position_ids.is_pinned());
+    EXPECT_EQ(torch::kInt32, model_input.combo_position_ids.scalar_type());
     EXPECT_EQ((vector<int>{6, 7, 8, 11, 12, 13}), toVec<int>(model_input.combo_position_ids));
+    EXPECT_EQ((vector<int>{5, 6, 7, 10, 11, 12}), toVec<int>(original_positions));
+
+    // Device-resident combo_position_ids must advance in place on CUDA without D2H bounce.
+    model_input.combo_position_ids = model_input.combo_position_ids.to(torch::kCUDA);
+    processor.updateDecodeDraftModelInput(model_input, model_output, draft_token_ids, holder);
+    EXPECT_TRUE(model_input.combo_position_ids.is_cuda());
+    EXPECT_EQ(torch::kInt32, model_input.combo_position_ids.scalar_type());
+    EXPECT_EQ((vector<int>{7, 8, 9, 12, 13, 14}), toVec<int>(model_input.combo_position_ids));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testExpandTargetVerifyPositionIdsInitializesNonDriverPlaceholder) {
@@ -1887,17 +1932,17 @@ TEST_F(MtpBatchStreamProcessorTest, testDSparkCommitOnlyPrefillDispatch) {
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesHostCommitSemantics) {
-    const std::vector<int32_t> previous_lengths = {1, 63, 64, 65, 127, 128, 129, 191};
-    const std::vector<int32_t> accept_lengths   = {1, 2, 3, 4, 5, 6, 7, 8};
-    constexpr int64_t          group_count      = 3;
-    constexpr int64_t          block_count      = 12;
-    const int64_t              batch_size       = static_cast<int64_t>(previous_lengths.size());
+    const std::vector<int32_t> decode_prefix_lengths = {0, 62, 63, 64, 126, 127, 128, 190};
+    const std::vector<int32_t> accept_lengths        = {1, 2, 3, 4, 5, 6, 7, 8};
+    constexpr int64_t          group_count           = 3;
+    constexpr int64_t          block_count           = 12;
+    const int64_t              batch_size            = static_cast<int64_t>(decode_prefix_lengths.size());
 
     auto current = torch::arange(group_count * batch_size * block_count, torch::kInt32)
                        .reshape({group_count, batch_size, block_count});
     auto actual = MtpBatchStreamProcessor::advanceLinearCacheBlockTable(
                       current.to(torch::kCUDA),
-                      torch::tensor(previous_lengths, torch::kInt32).to(torch::kCUDA),
+                      torch::tensor(decode_prefix_lengths, torch::kInt32).to(torch::kCUDA),
                       torch::tensor(accept_lengths, torch::kInt32).to(torch::kCUDA),
                       {CacheGroupType::LINEAR, CacheGroupType::FULL, CacheGroupType::LINEAR},
                       /*seq_size_per_block=*/64)
@@ -1909,7 +1954,7 @@ TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesHostC
         if (accept <= 1) {
             continue;
         }
-        const int  current_cached = previous_lengths[static_cast<size_t>(batch)] - 1;
+        const int  current_cached = decode_prefix_lengths[static_cast<size_t>(batch)];
         const int  next_cached    = current_cached + accept;
         const auto cached_swap    = getCachedTokenBlockSwapIdx(current_cached, next_cached, 64);
         const auto final_swap     = getFinalTokenBlockSwapIdx(current_cached, next_cached, 64);
@@ -1931,14 +1976,14 @@ TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesEvery
     constexpr int64_t    block_count = 16;
     constexpr int64_t    offsets     = block_size;
     constexpr int64_t    batch_size  = offsets * max_accept;
-    std::vector<int32_t> previous_lengths;
+    std::vector<int32_t> decode_prefix_lengths;
     std::vector<int32_t> accept_lengths;
-    previous_lengths.reserve(batch_size);
+    decode_prefix_lengths.reserve(batch_size);
     accept_lengths.reserve(batch_size);
     for (int32_t offset = 0; offset < block_size; ++offset) {
         for (int32_t accept = 1; accept <= max_accept; ++accept) {
-            // previous_length - 1 covers every cached-token offset in a block.
-            previous_lengths.push_back(block_size + offset + 1);
+            // Cover every cached-token offset in a block.
+            decode_prefix_lengths.push_back(block_size + offset);
             accept_lengths.push_back(accept);
         }
     }
@@ -1947,7 +1992,7 @@ TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesEvery
                        .reshape({group_count, batch_size, block_count});
     auto actual = MtpBatchStreamProcessor::advanceLinearCacheBlockTable(
                       current.to(torch::kCUDA),
-                      torch::tensor(previous_lengths, torch::kInt32).to(torch::kCUDA),
+                      torch::tensor(decode_prefix_lengths, torch::kInt32).to(torch::kCUDA),
                       torch::tensor(accept_lengths, torch::kInt32).to(torch::kCUDA),
                       {CacheGroupType::LINEAR, CacheGroupType::FULL},
                       block_size)
@@ -1959,7 +2004,7 @@ TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesEvery
         if (accept <= 1) {
             continue;
         }
-        const int  current_cached = previous_lengths[static_cast<size_t>(batch)] - 1;
+        const int  current_cached = decode_prefix_lengths[static_cast<size_t>(batch)];
         const int  next_cached    = current_cached + accept;
         const auto cached_swap    = getCachedTokenBlockSwapIdx(current_cached, next_cached, block_size);
         const auto final_swap     = getFinalTokenBlockSwapIdx(current_cached, next_cached, block_size);

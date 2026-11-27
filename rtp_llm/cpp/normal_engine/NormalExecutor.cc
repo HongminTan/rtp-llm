@@ -23,7 +23,6 @@ namespace rtp_llm {
 
 namespace {
 
-
 bool readEnvFlagOnce(const char* env_name, const char* log_tag, const char* label) {
     const char* env = std::getenv(env_name);
     const bool  on  = (env != nullptr && std::string(env) == "1");
@@ -142,13 +141,13 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
          cache_manager,
          is_propose_ ? std::make_optional(propose_model_index_) : std::nullopt,
          params.model_config_.hc_mult});
-    model_init_params.metrics_reporter = metrics_reporter_;
+    model_init_params.metrics_reporter               = metrics_reporter_;
     model_init_params.hidden_state_capture_layer_ids = selectHiddenStateCaptureLayerIds(
         is_propose_ ? HiddenStateCaptureModelRole::DRAFT : HiddenStateCaptureModelRole::TARGET,
         role_type_,
         warm_up_,
         params.model_config_.hidden_state_capture_layer_ids);
-    model_init_params.hidden_state_capture_dtype     = params.model_config_.hidden_state_capture_dtype;
+    model_init_params.hidden_state_capture_dtype = params.model_config_.hidden_state_capture_dtype;
 #if USING_CUDA || USING_ROCM
     if (params.hw_kernel_config.enable_cuda_graph && model_init_params.kv_cache_layer_layout.has_value()) {
         const auto& model_cache_config =
@@ -304,6 +303,9 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                                                      model_input.kv_cache_group_tags);
         }
     }
+    // Capture cached decode prefix lengths before model_->forward so downstream
+    // device-state publication reuses them without per-stream H2D copies.
+    const auto decode_prefix_lengths = model_input.sequence_lengths;
     {
         bool force = tp_rank_ == 0 && enable_detail_log_;
         if (force) {
@@ -405,6 +407,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         reportMetrics(stream_groups, executor_collector, tps_collector, tps_execute_time_us, token_counts_by_priority);
 
         return dispatchOutputAsync(stream_groups,
+                                   decode_prefix_lengths,
                                    std::move(model_output),
                                    std::move(sampler_output),
                                    std::move(sampler_event),
@@ -422,7 +425,7 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         } else {
             MergedOutput merge_outputs{std::move(model_output), std::move(sampler_output)};
             if (useDeviceInput()) {
-                publishNormalDeviceState(stream_groups, merge_outputs.sampler_output);
+                publishNormalDeviceState(stream_groups, merge_outputs.sampler_output, decode_prefix_lengths);
             }
             result = batch_stream_processor_->dispatch(stream_groups, merge_outputs);
         }
@@ -657,7 +660,9 @@ void NormalExecutor::prepareGrpcNormalDeviceState(const StreamGroups& stream_gro
     }
 }
 
-void NormalExecutor::publishNormalDeviceState(const StreamGroups& stream_groups, const SamplerOutput& sampler_output) {
+void NormalExecutor::publishNormalDeviceState(const StreamGroups&  stream_groups,
+                                              const SamplerOutput& sampler_output,
+                                              const torch::Tensor& decode_prefix_lengths) {
     RTP_LLM_PROFILE_SCOPE("executor.publish_normal_device_state");
 
     auto all_streams = stream_groups.allStreams();
@@ -701,6 +706,19 @@ void NormalExecutor::publishNormalDeviceState(const StreamGroups& stream_groups,
         return;
     }
 
+    const int64_t decode_rows = static_cast<int64_t>(stream_groups.totalDecodeBatchSize());
+    torch::Tensor next_decode_seq_lens;
+    if (decode_rows > 0) {
+        RTP_LLM_CHECK_WITH_INFO(decode_prefix_lengths.defined() && decode_prefix_lengths.is_cuda()
+                                    && decode_prefix_lengths.scalar_type() == torch::kInt32
+                                    && decode_prefix_lengths.dim() == 1 && decode_prefix_lengths.numel() == decode_rows,
+                                "[normal-device-state] decode_prefix_lengths must be CUDA int32 [%ld]",
+                                decode_rows);
+        // Decode streams precede context streams in allStreams(); after sampling
+        // one token, next committed length = cached prefix + current + sampled.
+        next_decode_seq_lens = (decode_prefix_lengths + 2).to(torch::kInt32);
+    }
+
     int64_t batch_idx_out = 0;
     for (auto& stream : all_streams) {
         // Middle chunks do not commit a token or advance logits processor state.
@@ -723,14 +741,6 @@ void NormalExecutor::publishNormalDeviceState(const StreamGroups& stream_groups,
         const int   cur_real_seq_len =
             prev_state.next_real_seq_len > 0 ? prev_state.next_real_seq_len : stream->seqLength();
 
-        torch::Tensor cur_seq_len_gpu;
-        const auto&   prev_next_seq_len = prev_state.next_seq_len_gpu;
-        if (prev_next_seq_len.defined() && prev_next_seq_len.is_cuda()) {
-            cur_seq_len_gpu = prev_next_seq_len;
-        } else {
-            cur_seq_len_gpu = torch::full({1}, static_cast<int64_t>(cur_real_seq_len), cuda_i32);
-        }
-
         for (const auto& processor : stream->getAllLogitsProcessorPtr()) {
             if (processor != nullptr && processor->supportsNormalAsyncDeviceState()) {
                 processor->prepareNormalAsyncUpdate(last_sample_token_gpu, 1);
@@ -739,7 +749,11 @@ void NormalExecutor::publishNormalDeviceState(const StreamGroups& stream_groups,
 
         GenerateStream::NormalAsyncDeviceState state;
         state.last_sample_token_gpu = std::move(last_sample_token_gpu);
-        state.next_seq_len_gpu      = (cur_seq_len_gpu + 1).to(torch::kInt32);
+        if (batch_idx_out < decode_rows) {
+            state.next_seq_len_gpu = next_decode_seq_lens.narrow(0, batch_idx_out, 1);
+        } else {
+            state.next_seq_len_gpu = torch::full({1}, static_cast<int64_t>(cur_real_seq_len) + 1, cuda_i32);
+        }
         if (has_engram_) {
             torch::Tensor previous = prev_state.engram_token_window_gpu;
             if (!previous.defined()) {
@@ -763,6 +777,7 @@ void NormalExecutor::publishNormalDeviceState(const StreamGroups& stream_groups,
 }
 
 absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           stream_groups,
+                                                 const torch::Tensor&          decode_prefix_lengths,
                                                  GptModelOutputs               model_output,
                                                  SamplerOutput                 sampler_output,
                                                  std::shared_ptr<torch::Event> sampler_event,
@@ -770,7 +785,7 @@ absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           s
     RTP_LLM_PROFILE_SCOPE("executor.dispatch_output_async");
 
     if (useDeviceInput()) {
-        publishNormalDeviceState(stream_groups, sampler_output);
+        publishNormalDeviceState(stream_groups, sampler_output, decode_prefix_lengths);
     }
 
     auto* processor           = batch_stream_processor_.get();

@@ -68,13 +68,16 @@ protected:
     // sampler_->forward, then forks the bookkeeping worker to wait on the
     // event and run dispatch + per-stream update off the main thread.
     absl::Status dispatchOutputAsync(const StreamGroups&           stream_groups,
+                                     const torch::Tensor&          decode_prefix_lengths,
                                      GptModelOutputs               model_output,
                                      SamplerOutput                 sampler_output,
                                      std::shared_ptr<torch::Event> sampler_event,
                                      std::function<void()>         profile_step_finish = nullptr);
 
     bool has_engram_ = false;
-    void publishNormalDeviceState(const StreamGroups& stream_groups, const SamplerOutput& sampler_output);
+    void publishNormalDeviceState(const StreamGroups&  stream_groups,
+                                  const SamplerOutput& sampler_output,
+                                  const torch::Tensor& decode_prefix_lengths = torch::Tensor());
     void prepareGrpcNormalDeviceState(const StreamGroups& stream_groups);
 
     // Mirror the use_normal_device_state condition in processDecodeStreams.

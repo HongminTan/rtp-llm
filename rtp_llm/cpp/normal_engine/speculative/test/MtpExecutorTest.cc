@@ -3171,19 +3171,23 @@ TEST_F(MtpExecutorTest, testDispatchStatePrepareKernel) {
     auto          cuda_i32   = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     auto          cuda_i64   = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
 
-    auto accept_len   = torch::tensor({3, 1, 5, 2, 4, 1, 3, 2}, cuda_i32);
-    auto prev_seq_len = torch::tensor({100, 200, 50, 300, 150, 400, 75, 250}, cuda_i32);
-    auto next_seq_len = torch::empty({batch_size}, cuda_i32);
-    auto hidden_idx   = torch::empty({batch_size}, cuda_i64);
+    auto accept_len            = torch::tensor({3, 1, 5, 2, 4, 1, 3, 2}, cuda_i32);
+    auto decode_prefix_lengths = torch::tensor({99, 199, 49, 299, 149, 399, 74, 249}, cuda_i32);
+    auto next_seq_len          = torch::empty({batch_size}, cuda_i32);
+    auto hidden_idx            = torch::empty({batch_size}, cuda_i64);
 
 #if USING_CUDA
-    invokeMtpDispatchStatePrepare(
-        accept_len, prev_seq_len, next_seq_len, hidden_idx, batch_size, at::cuda::getCurrentCUDAStream().stream());
+    invokeMtpDispatchStatePrepare(accept_len,
+                                  decode_prefix_lengths,
+                                  next_seq_len,
+                                  hidden_idx,
+                                  batch_size,
+                                  at::cuda::getCurrentCUDAStream().stream());
     cudaDeviceSynchronize();
 #endif
 
-    // Verify next_seq_len = prev_seq_len + accept_len
-    auto expected_next = (prev_seq_len + accept_len).cpu();
+    // Verify next_seq_len = decode_prefix_lengths + 1 + accept_len
+    auto expected_next = (decode_prefix_lengths + 1 + accept_len).cpu();
     auto actual_next   = next_seq_len.cpu();
     EXPECT_TRUE(torch::equal(actual_next, expected_next)) << "next_seq_len mismatch:\n"
                                                           << actual_next << "\nvs expected:\n"
@@ -3204,8 +3208,8 @@ TEST_F(MtpExecutorTest, testDispatchStatePrepareBenchmark) {
     auto          cuda_i32   = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
     auto          cuda_i64   = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
 
-    auto accept_len   = torch::randint(1, 5, {batch_size}, cuda_i32);
-    auto prev_seq_len = torch::randint(10, 1000, {batch_size}, cuda_i32);
+    auto accept_len            = torch::randint(1, 5, {batch_size}, cuda_i32);
+    auto decode_prefix_lengths = torch::randint(10, 1000, {batch_size}, cuda_i32);
 
     // Pre-allocate output buffers
     auto next_seq_len = torch::empty({batch_size}, cuda_i32);
@@ -3214,8 +3218,12 @@ TEST_F(MtpExecutorTest, testDispatchStatePrepareBenchmark) {
     // Warm up
     for (int i = 0; i < 10; i++) {
 #if USING_CUDA
-        invokeMtpDispatchStatePrepare(
-            accept_len, prev_seq_len, next_seq_len, hidden_idx, batch_size, at::cuda::getCurrentCUDAStream().stream());
+        invokeMtpDispatchStatePrepare(accept_len,
+                                      decode_prefix_lengths,
+                                      next_seq_len,
+                                      hidden_idx,
+                                      batch_size,
+                                      at::cuda::getCurrentCUDAStream().stream());
 #endif
     }
     cudaDeviceSynchronize();
@@ -3224,8 +3232,12 @@ TEST_F(MtpExecutorTest, testDispatchStatePrepareBenchmark) {
     auto start_batched = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iterations; i++) {
 #if USING_CUDA
-        invokeMtpDispatchStatePrepare(
-            accept_len, prev_seq_len, next_seq_len, hidden_idx, batch_size, at::cuda::getCurrentCUDAStream().stream());
+        invokeMtpDispatchStatePrepare(accept_len,
+                                      decode_prefix_lengths,
+                                      next_seq_len,
+                                      hidden_idx,
+                                      batch_size,
+                                      at::cuda::getCurrentCUDAStream().stream());
 #endif
     }
     cudaDeviceSynchronize();
@@ -3237,8 +3249,8 @@ TEST_F(MtpExecutorTest, testDispatchStatePrepareBenchmark) {
     for (int i = 0; i < iterations; i++) {
         for (int64_t j = 0; j < batch_size; j++) {
             auto al_slice     = accept_len.narrow(0, j, 1);
-            auto prev_slice   = prev_seq_len.narrow(0, j, 1);
-            auto next_slice   = (prev_slice + al_slice).to(torch::kInt32);
+            auto prefix_slice = decode_prefix_lengths.narrow(0, j, 1);
+            auto next_slice   = (prefix_slice + 1 + al_slice).to(torch::kInt32);
             auto hidden_slice = (al_slice - 1).to(torch::kLong);
             (void)next_slice;
             (void)hidden_slice;
@@ -3254,6 +3266,73 @@ TEST_F(MtpExecutorTest, testDispatchStatePrepareBenchmark) {
         "[dispatch-bench] batched: %ld us total, %.2f us/iter", us_batched, (double)us_batched / iterations);
     RTP_LLM_LOG_INFO("[dispatch-bench] scalar:  %ld us total, %.2f us/iter", us_scalar, (double)us_scalar / iterations);
     RTP_LLM_LOG_INFO("[dispatch-bench] speedup: %.1fx", speedup);
+}
+
+TEST_F(MtpExecutorTest, testDispatchReusesDecodePrefixLengths) {
+    MtpExecutorTestConfig test_config;
+    test_config.gen_num_per_cycle   = 1;
+    test_config.vocab_size_override = 4;
+    auto components                 = createMtpExecutorComponents(test_config);
+
+    auto                 stream_new_tokens        = torch::tensor({{2}}, torch::kInt32);
+    auto                 stream_hidden_states     = torch::tensor({{0.03f, 0.04f}});
+    auto                 stream_draft_token_probs = torch::tensor({{0.0f, 0.0f, 0.0f, 1.0f}});
+    StreamSpecUpdateInfo spec_update_info{stream_new_tokens, 1, 3, stream_hidden_states, stream_draft_token_probs};
+
+    GenerateStreamPtr steady = createDecodeStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1}, spec_update_info);
+    GenerateStreamPtr fresh = createDecodeStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1}, spec_update_info);
+
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    const auto cuda_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // Steady stream's host seqLength() (3) deliberately trails decode_prefix_lengths (10 -> committed 11).
+    GenerateStream::MtpAsyncDeviceState prior_state;
+    prior_state.next_seq_len_gpu = torch::tensor({11}, cuda_i32);
+    steady->setMtpAsyncDeviceState(std::move(prior_state));
+
+    StreamGroups stream_groups({steady, fresh});
+
+    spec::SpeculativeSamplerOutput spec_output;
+    spec_output.accept_tokens     = torch::tensor({{3, 2}, {1, 0}}, cuda_i32);
+    spec_output.accept_len        = torch::tensor({2, 1}, cuda_i32);
+    spec_output.accept_tokens_cpu = spec_output.accept_tokens.cpu();
+    spec_output.accept_len_cpu    = spec_output.accept_len.cpu();
+
+    MergedOutput draft_output;
+    draft_output.sampler_output.token_ids = torch::tensor({{2}, {3}}, cuda_i32);
+    draft_output.sampler_output.all_probs = torch::zeros({2, 4}, cuda_f32);
+
+    auto decode_prefix_lengths = torch::tensor({10, 2}, cuda_i32);
+
+    // Sync publish: next_seq_len = decode_prefix_lengths + 1 + accept_len = {13, 4}.
+    components.executor->publishSyncMtpDeviceState(
+        stream_groups, spec_output, decode_prefix_lengths, torch::Tensor(), draft_output);
+    EXPECT_EQ((std::vector<int32_t>{13}), toVec<int32_t>(steady->getMtpAsyncDeviceState().next_seq_len_gpu));
+    EXPECT_EQ((std::vector<int32_t>{4}), toVec<int32_t>(fresh->getMtpAsyncDeviceState().next_seq_len_gpu));
+
+    // Async dispatch: fresh stream has no prior next_seq_len_gpu, steady stream has stale host seqLength().
+    fresh->setMtpAsyncDeviceState({});
+    auto rejection_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    auto draft_event     = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    rejection_event->record(cuda_graph::graphGetCurrentStream());
+    draft_event->record(cuda_graph::graphGetCurrentStream());
+
+    auto status = components.executor->dispatchDecodeAsync(stream_groups,
+                                                           spec_output,
+                                                           decode_prefix_lengths,
+                                                           torch::Tensor(),
+                                                           torch::Tensor(),
+                                                           torch::Tensor(),
+                                                           draft_output,
+                                                           rejection_event,
+                                                           draft_event,
+                                                           /*step_start_time_us=*/0);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ((std::vector<int32_t>{13}), toVec<int32_t>(steady->getMtpAsyncDeviceState().next_seq_len_gpu));
+    EXPECT_EQ((std::vector<int32_t>{4}), toVec<int32_t>(fresh->getMtpAsyncDeviceState().next_seq_len_gpu));
+    components.executor->spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
 }
 
 // MTP-incompatible stateful processor: main's capability contract makes the
