@@ -43,17 +43,22 @@ void initCacheKeys(BatchKVCacheResourcePtr batch_kv_cache_resource,
 void updateCacheKeys(BatchKVCacheResourcePtr batch_kv_cache_resource,
                      CompleteTokenIdsPtr     complete_token_ids,
                      int                     seq_size_per_block,
-                     int64_t                 initial_hash) {
+                     int64_t                 initial_hash,
+                     int                     max_seq_len) {
     const int batch_size = batch_kv_cache_resource->batchSize();
-    const int seq_len    = complete_token_ids->seqLength();
+    const int raw_len    = complete_token_ids->seqLength();
+    const int seq_len    = max_seq_len >= 0 ? std::min(raw_len, max_seq_len) : raw_len;
 
     for (int i = 0; i < batch_size; ++i) {
         const auto& keys         = batch_kv_cache_resource->cacheKeys(i);
         const int   total_blocks = seq_len / seq_size_per_block;  // floor, only full blocks
 
         // If last_block_aligned was false previously, the last cache key corresponds to a partial block.
-        // Drop it before we append new full-block cache keys.
+        // Drop it before we adjust full-block cache keys.
         if (!batch_kv_cache_resource->lastBlockAligned() && !keys.empty()) {
+            batch_kv_cache_resource->popBackCacheKey(i);
+        }
+        while (static_cast<int>(keys.size()) > total_blocks) {
             batch_kv_cache_resource->popBackCacheKey(i);
         }
 

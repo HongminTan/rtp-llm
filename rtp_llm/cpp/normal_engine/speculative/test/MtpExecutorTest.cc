@@ -3430,4 +3430,160 @@ TEST_F(MtpExecutorTest, testErroredSpecLogitsStreamDoesNotAbortExecutor) {
     EXPECT_TRUE(stream->hasError());
 }
 
+TEST_F(MtpExecutorTest, testDispatchPublishesNonLinearZeroCopyCacheSnapshotUnderDeviceInput) {
+    MtpExecutorTestConfig test_config;
+    test_config.gen_num_per_cycle   = 1;
+    test_config.vocab_size_override = 4;
+    auto components                 = createMtpExecutorComponents(test_config);
+    ASSERT_FALSE(components.executor->is_linear_attention_model_);
+
+    auto                 stream_new_tokens        = torch::tensor({{2}}, torch::kInt32);
+    auto                 stream_hidden_states     = torch::tensor({{0.03f, 0.04f}});
+    auto                 stream_draft_token_probs = torch::tensor({{0.0f, 0.0f, 0.0f, 1.0f}});
+    StreamSpecUpdateInfo spec_update_info{stream_new_tokens, 1, 3, stream_hidden_states, stream_draft_token_probs};
+
+    GenerateStreamPtr s0 = createDecodeStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1}, spec_update_info);
+    GenerateStreamPtr s1 = createDecodeStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1}, spec_update_info);
+
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    const auto cuda_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    StreamGroups stream_groups({s0, s1});
+
+    spec::SpeculativeSamplerOutput spec_output;
+    spec_output.accept_tokens     = torch::tensor({{3, 2}, {1, 0}}, cuda_i32);
+    spec_output.accept_len        = torch::tensor({2, 1}, cuda_i32);
+    spec_output.accept_tokens_cpu = spec_output.accept_tokens.cpu();
+    spec_output.accept_len_cpu    = spec_output.accept_len.cpu();
+
+    MergedOutput draft_output;
+    draft_output.sampler_output.token_ids = torch::tensor({{2}, {3}}, cuda_i32);
+    draft_output.sampler_output.all_probs = torch::zeros({2, 4}, cuda_f32);
+
+    auto decode_prefix_lengths = torch::tensor({2, 2}, cuda_i32);
+    auto verify_position_ids   = torch::tensor({10, 10, 10, 11, 11, 11, 20, 20, 20, 21, 21, 21}, cuda_i32);
+    auto kv_cache_block_id =
+        torch::tensor({11, 12, 13, 21, 22, 23, 31, 32, 33, 41, 42, 43}, cuda_i32).reshape({2, 2, 3});
+    auto kv_cache_kernel_block_id =
+        torch::tensor({111, 112, 113, 121, 122, 123, 131, 132, 133, 141, 142, 143}, cuda_i32).reshape({2, 2, 3});
+
+    auto rejection_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    auto draft_event     = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    rejection_event->record(cuda_graph::graphGetCurrentStream());
+    draft_event->record(cuda_graph::graphGetCurrentStream());
+
+    auto status = components.executor->dispatchDecodeAsync(stream_groups,
+                                                           spec_output,
+                                                           decode_prefix_lengths,
+                                                           verify_position_ids,
+                                                           kv_cache_block_id,
+                                                           kv_cache_kernel_block_id,
+                                                           draft_output,
+                                                           rejection_event,
+                                                           draft_event,
+                                                           /*step_start_time_us=*/0);
+    ASSERT_TRUE(status.ok()) << status.ToString();
+
+    // Non-DSpARK MTP publishes next_position_ids_gpu = verify[:, 0, :] + accept_len.
+    EXPECT_EQ((std::vector<int32_t>{12, 12, 12}), toVec<int32_t>(s0->getMtpAsyncDeviceState().next_position_ids_gpu));
+    EXPECT_EQ((std::vector<int32_t>{21, 21, 21}), toVec<int32_t>(s1->getMtpAsyncDeviceState().next_position_ids_gpu));
+
+    if (components.executor->useDeviceInput()) {
+        for (int idx = 0; idx < 2; ++idx) {
+            auto&      stream = idx == 0 ? s0 : s1;
+            const auto state  = stream->getMtpAsyncDeviceState();
+            EXPECT_TRUE(GenerateStream::hasMtpCacheSnapshot(state));
+            EXPECT_TRUE(GenerateStream::hasMtpAsyncDecodeState(state));
+            EXPECT_TRUE(state.async_decode_state_ready);
+            // Zero-copy narrow view shares the underlying storage of the round's GPU table.
+            EXPECT_EQ(state.next_kv_cache_block_id_gpu.storage().data(), kv_cache_block_id.storage().data());
+            EXPECT_EQ(state.next_kv_cache_kernel_block_id_gpu.storage().data(),
+                      kv_cache_kernel_block_id.storage().data());
+            EXPECT_TRUE(torch::equal(state.next_kv_cache_block_id_gpu, kv_cache_block_id.narrow(1, idx, 1)));
+            EXPECT_TRUE(
+                torch::equal(state.next_kv_cache_kernel_block_id_gpu, kv_cache_kernel_block_id.narrow(1, idx, 1)));
+        }
+        // Clearing the block-table snapshot preserves async_decode_state_ready.
+        s0->clearMtpCacheSnapshot();
+        EXPECT_FALSE(s0->hasMtpCacheSnapshot());
+        EXPECT_TRUE(s0->hasMtpAsyncDecodeState());
+    } else {
+        for (auto& stream : {s0, s1}) {
+            EXPECT_FALSE(stream->hasMtpCacheSnapshot());
+            EXPECT_FALSE(stream->hasMtpAsyncDecodeState());
+        }
+    }
+
+    components.executor->spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+}
+
+// In a mixed batch (one steady stream with CUDA accept state + one fresh
+// local-prefill stream without accept state), draftModelDecode resolves
+// verify col 0 per row so the steady stream reads its CUDA accepted token.
+TEST_F(MtpExecutorTest, testMixedBatchDraftModelDecodeResolvesPreTargetTokenPerRow) {
+    MtpExecutorTestConfig test_config;
+    test_config.gen_num_per_cycle   = 2;
+    test_config.vocab_size_override = 64;
+    auto components                 = createMtpExecutorComponents(test_config);
+
+    auto                 dummy_hidden = torch::tensor({{0.03f, 0.04f}});
+    auto                 dummy_probs  = torch::zeros({1, 64}, torch::kFloat32);
+    StreamSpecUpdateInfo steady_host_info{torch::tensor({{11}}, torch::kInt32), 1, 12, dummy_hidden, dummy_probs};
+    StreamSpecUpdateInfo fresh_host_info{torch::tensor({{22}}, torch::kInt32), 1, 23, dummy_hidden, dummy_probs};
+
+    GenerateStreamPtr steady = createDecodeStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1}, steady_host_info);
+    GenerateStreamPtr fresh = createDecodeStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1}, fresh_host_info);
+
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+
+    // Steady stream accepted token 55 on GPU while host sp_output_buffer still holds stale 11.
+    GenerateStream::MtpAsyncDeviceState steady_state;
+    steady_state.async_decode_state_ready = true;
+    steady_state.accept_tokens_gpu        = torch::tensor({{44, 55, 0}}, cuda_i32);
+    steady_state.accept_len_gpu           = torch::tensor({2}, cuda_i32);
+    steady_state.next_seq_len_gpu         = torch::tensor({5}, cuda_i32);
+    steady_state.propose_tokens_gpu       = torch::tensor({{12}}, cuda_i32);
+    steady->setMtpAsyncDeviceState(std::move(steady_state));
+    fresh->setMtpAsyncDeviceState({});
+
+    StreamGroups stream_groups({steady, fresh});
+
+    GptModelInputs model_input;
+    model_input.combo_tokens      = torch::tensor({12, 23}, cuda_i32);
+    model_input.input_lengths     = torch::tensor({1, 1}, cuda_i32);
+    model_input.sequence_lengths  = torch::tensor({4, 2}, cuda_i32);
+    model_input.prefix_lengths    = torch::tensor({4, 2}, cuda_i32);
+    model_input.lm_output_indexes = torch::tensor({0, 1}, cuda_i32);
+    model_input.last_hidden_states =
+        torch::zeros({2, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+
+    auto draft_output = createRandomGptModelOutputs(2, 64, 2);
+    components.fake_draft_model->setSkipInputCheck(true);
+    components.fake_draft_model->setOutputs({draft_output});
+    spec::FastTopKSamplerOutput sampler_out;
+    sampler_out.token_ids = torch::tensor({{13}, {24}}, cuda_i32);
+    sampler_out.all_probs = torch::zeros({2, 64}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    components.fake_fast_topk_sampler->setInputs({draft_output.logits});
+    components.fake_fast_topk_sampler->setOutputs({sampler_out});
+
+    components.executor->setDraftModel(std::move(components.fake_draft_model));
+    components.executor->setFastTopKSampler(std::move(components.fake_fast_topk_sampler));
+
+    std::vector<torch::Tensor> draft_probs_list;
+    torch::Tensor              draft_token_ids_t;
+    int64_t                    model_forward_us = 0;
+    components.executor->draftModelDecode(
+        model_input, stream_groups, draft_probs_list, draft_token_ids_t, model_forward_us);
+
+    // When async device state is active, steady row col 0 must be 55 (not stale host 11), fresh row col 0 is 22.
+    const int32_t expected_steady_col0 =
+        (components.executor->useStreamAsync() || components.executor->useAsyncDeviceState()) ? 55 : 11;
+    EXPECT_EQ((std::vector<int32_t>{expected_steady_col0, 12, 13, 22, 23, 24}),
+              toVec<int32_t>(model_input.combo_tokens));
+}
+
 }  // namespace rtp_llm

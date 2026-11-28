@@ -38,7 +38,9 @@ size_t blockTableWidth(const StreamGroups& stream_groups, const std::vector<std:
                                     "MTP cache snapshot must be a CUDA int32 [group,1,blocks] tensor");
             RTP_LLM_CHECK_WITH_INFO(static_cast<size_t>(table.size(0)) == tags.size(),
                                     "MTP cache snapshot group count differs from gather tags");
-            width = std::max(width, static_cast<size_t>(table.size(2)));
+            const int64_t snapshot_width = kernel ? GenerateStream::mtpCacheSnapshotKernelWidth(state) :
+                                                      GenerateStream::mtpCacheSnapshotPhysicalWidth(state);
+            width                        = std::max(width, static_cast<size_t>(snapshot_width));
             return;  // The bookkeeping worker owns the host rows while this snapshot is published.
         }
         // An entirely empty ordinary resource keeps the absent-table contract;
@@ -47,10 +49,12 @@ size_t blockTableWidth(const StreamGroups& stream_groups, const std::vector<std:
             return;
         }
         const auto& resource = *stream->kvCachePtr();
-        for (int batch = 0; batch < stream->currentBatchSize(); ++batch) {
+        const int   batch_size =
+            (decode && GenerateStream::hasMtpAsyncDecodeState(state)) ? 1 : stream->currentBatchSize();
+        for (int batch = 0; batch < batch_size; ++batch) {
             for (const auto& tag : tags) {
                 const auto& ids = resource.cacheResource(batch).blockIds(tag);
-                width = std::max(width, ids.blocksNum() * (kernel ? ids.kernelBlocksPerKvBlock() : 1));
+                width           = std::max(width, ids.blocksNum() * (kernel ? ids.kernelBlocksPerKvBlock() : 1));
             }
         }
     };
@@ -412,11 +416,10 @@ GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamG
     if (config_.has_engram) {
         model_input.engram_token_windows = torch::full({(int64_t)current_tokens_size, 4}, -1, pinned_i32);
     }
-    model_input.input_lengths    = torch::empty({(int64_t)total_batch_size}, pinned_i32);
-    model_input.sequence_lengths = torch::empty({(int64_t)total_decode_batch_size}, pinned_i32);
-    model_input.prefix_lengths   = torch::empty({(int64_t)total_context_batch_size}, pinned_i32);
-    model_input.cache_store_publish_start_tokens =
-        torch::empty({(int64_t)total_context_batch_size}, pinned_i32);
+    model_input.input_lengths                    = torch::empty({(int64_t)total_batch_size}, pinned_i32);
+    model_input.sequence_lengths                 = torch::empty({(int64_t)total_decode_batch_size}, pinned_i32);
+    model_input.prefix_lengths                   = torch::empty({(int64_t)total_context_batch_size}, pinned_i32);
+    model_input.cache_store_publish_start_tokens = torch::empty({(int64_t)total_context_batch_size}, pinned_i32);
     if (needs_custom_output_indexes) {
         model_input.custom_output_indexes = torch::empty({(int64_t)total_context_batch_size}, pinned_i64);
     }
@@ -498,7 +501,7 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
                                    && stream_groups.totalDecodeBatchSize() > 0 && !ctx.need_cal_position_id;
     if (use_normal_device_state) {
         for (const auto& stream : stream_groups.decodeStreams()) {
-            if (stream->hasMtpCacheSnapshot()) {
+            if (stream->hasMtpAsyncDecodeState()) {
                 use_normal_device_state = false;
                 break;
             }
@@ -523,17 +526,19 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
     for (const auto& stream : stream_groups.decodeStreams()) {
         model_input.need_all_logits        = model_input.need_all_logits || stream->calculateLoss();
         model_input.need_all_hidden_states = model_input.need_all_hidden_states || stream->needReturnHiddenStates();
-        const bool use_mtp_cache_snapshot  = stream->hasMtpCacheSnapshot();
-        if (config_.has_engram && !use_mtp_cache_snapshot && !use_normal_device_state) {
+        const auto mtp_state               = stream->getMtpAsyncDeviceState();
+        const bool use_mtp_async_state     = GenerateStream::hasMtpAsyncDecodeState(mtp_state);
+        const bool use_mtp_cache_snapshot  = GenerateStream::hasMtpCacheSnapshot(mtp_state);
+        if (config_.has_engram && !use_mtp_async_state && !use_normal_device_state) {
             stream->waitPendingAsyncBookkeeping();
         }
-        const auto current_batch_size = use_mtp_cache_snapshot ? 1 : stream->currentBatchSize();
-        if (use_mtp_cache_snapshot) {
+        const auto current_batch_size = use_mtp_async_state ? 1 : stream->currentBatchSize();
+        if (use_mtp_async_state) {
             RTP_LLM_CHECK_WITH_INFO(stream->maxBatchSize() == 1 && !stream->hasNumBeams(),
-                                    "MTP cache snapshots require one non-beam sequence per stream, stream=%ld",
+                                    "MTP async decode state requires one non-beam sequence per stream, stream=%ld",
                                     stream->streamId());
         }
-        if (!use_mtp_cache_snapshot) {
+        if (!use_mtp_async_state) {
             auto& kv_cache = *stream->kvCachePtr();
             RTP_LLM_LOG_DEBUG("decode kv_cache: %s", kv_cache.debugString().c_str());
             RTP_LLM_LOG_DEBUG("decode stream: %s", stream->debugString().c_str());
@@ -541,13 +546,13 @@ absl::Status NormalModelInputGatherer::processDecodeStreams(GptModelInputs&     
 
         for (auto i = 0; i < current_batch_size; ++i) {
             model_input.trace_ids.push_back(stream->traceId());
-            if (use_mtp_cache_snapshot) {
+            if (use_mtp_async_state) {
                 // MtpBatchStreamProcessor replaces every model-semantic field
                 // below from the immutable per-round device state. Populate
                 // only shape-safe sentinels here; reading token history,
                 // seqLength or MRoPE state would race the prior worker.
                 ctx.merged_tokens[ctx.batch_idx]    = 0;
-                ctx.input_lengths[ctx.batch_idx]    = 1;
+                ctx.input_lengths[ctx.batch_idx]    = stream->inputLength();
                 ctx.sequence_lengths[ctx.batch_idx] = 0;
                 if (ctx.need_cal_position_id) {
                     std::fill_n(ctx.combo_position_ids + ctx.batch_idx * config_.position_id_len_factor,
@@ -705,8 +710,8 @@ absl::Status NormalModelInputGatherer::processContextStreams(GptModelInputs&    
 
             if (ctx.need_cal_position_id) {
                 auto context_pos_ids = stream->generateContextPositionIds();
-                int begin_off = stream->prefixLength() * config_.position_id_len_factor;
-                int copy_len  = stream->contextLength() * config_.position_id_len_factor;
+                int  begin_off       = stream->prefixLength() * config_.position_id_len_factor;
+                int  copy_len        = stream->contextLength() * config_.position_id_len_factor;
                 memcpy(ctx.combo_position_ids + ctx.token_idx * config_.position_id_len_factor,
                        context_pos_ids.data_ptr<int>() + begin_off,
                        copy_len * sizeof(int));
@@ -790,11 +795,13 @@ absl::StatusOr<torch::Tensor> NormalModelInputGatherer::gatherKvCacheKernelBlock
     int32_t*     dst_base         = host_tensor.data_ptr<int32_t>();
 
     auto fill_one_stream = [&](const GenerateStreamPtr& stream, int& batch_idx, bool decode) {
-        if (decode && stream->hasMtpCacheSnapshot()) {
+        const auto state = stream->getMtpAsyncDeviceState();
+        if (decode && GenerateStream::hasMtpCacheSnapshot(state)) {
             ++batch_idx;
             return;
         }
-        auto current_batch_size = stream->currentBatchSize();
+        const bool use_mtp_async_state = decode && GenerateStream::hasMtpAsyncDecodeState(state);
+        auto       current_batch_size  = use_mtp_async_state ? 1 : stream->currentBatchSize();
         if (!ordinaryStreamHasBlockTable(stream)) {
             batch_idx += current_batch_size;
             return;
@@ -838,20 +845,24 @@ absl::StatusOr<torch::Tensor> NormalModelInputGatherer::gatherKvCacheKernelBlock
                                     "MTP kernel snapshot must be a CUDA int32 [group,batch,blocks] tensor");
             RTP_LLM_CHECK_WITH_INFO(source.size(0) == device_tensor.size(0),
                                     "MTP kernel snapshot group count differs from gathered table");
-            RTP_LLM_CHECK_WITH_INFO(source.size(2) <= device_tensor.size(2),
-                                    "MTP kernel snapshot exceeds gathered table width");
+            const int64_t valid_width = GenerateStream::mtpCacheSnapshotKernelWidth(state);
+            RTP_LLM_CHECK_WITH_INFO(valid_width <= device_tensor.size(2),
+                                    "MTP kernel snapshot valid width %ld exceeds gathered table width %ld",
+                                    valid_width,
+                                    device_tensor.size(2));
+            const int64_t copy_width = std::min(source.size(2), device_tensor.size(2));
             for (size_t row = 0; row < group_tags.size(); ++row) {
                 const auto position =
                     std::find(config_.kv_cache_group_tags.begin(), config_.kv_cache_group_tags.end(), group_tags[row]);
                 const auto source_row = std::distance(config_.kv_cache_group_tags.begin(), position);
                 device_tensor.select(0, row)
                     .select(0, batch_idx)
-                    .narrow(0, 0, source.size(2))
-                    .copy_(source.select(0, source_row).select(0, 0), /*non_blocking=*/true);
+                    .narrow(0, 0, copy_width)
+                    .copy_(source.select(0, source_row).select(0, 0).narrow(0, 0, copy_width), /*non_blocking=*/true);
             }
             ++batch_idx;
         } else {
-            batch_idx += stream->currentBatchSize();
+            batch_idx += GenerateStream::hasMtpAsyncDecodeState(state) ? 1 : stream->currentBatchSize();
         }
     }
     return device_tensor;

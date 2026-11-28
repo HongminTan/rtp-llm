@@ -151,7 +151,7 @@ void GenerateStateMachine::handleRunning() {
     int             seq_len_override = -1;
     GenerateStream* stream           = stream_cache_resource_->stream();
     if (stream != nullptr) {
-        const bool  pending   = stream->hasPendingAsyncBookkeeping();
+        const bool pending   = stream->hasPendingAsyncBookkeeping();
         const auto mtp_state = stream->getMtpAsyncDeviceState();
         if (pending && GenerateStream::hasMtpCacheSnapshot(mtp_state) && mtp_state.next_seq_len_upper_bound > 0
             && stream_cache_resource_->singleBatchNeedBlocks(mtp_state.next_seq_len_upper_bound,
@@ -205,12 +205,11 @@ void GenerateStateMachine::releaseResource() {
     if (stream_cache_resource_->isResourceReleased()) {
         return;
     }
-    // releaseResource runs under GenerateStream::mutex_; do not wait here.
-    // If a worker still owns KV blocks, mark deferred and let its dec path
-    // perform the release after the pending count drains.
+    // releaseResource runs under GenerateStream::mutex_; do not wait for
+    // pending workers here. Decide atomically with the coordinator whether a
+    // worker will perform the release after draining or we can release now.
     GenerateStream* stream = stream_cache_resource_->stream();
-    if (stream != nullptr && stream->hasPendingAsyncBookkeeping()) {
-        stream->markDeferredRelease();
+    if (stream != nullptr && stream->tryMarkDeferredRelease()) {
         return;
     }
     stream_cache_resource_->releaseResource();

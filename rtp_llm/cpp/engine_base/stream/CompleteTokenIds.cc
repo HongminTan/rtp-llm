@@ -17,8 +17,8 @@ CompleteTokenIds::CompleteTokenIds(const CompleteTokenIds& other, bool share, in
     max_batch_size_(other.max_batch_size_),
     max_seq_len_(other.max_seq_len_),
     seq_size_per_block_(other.seq_size_per_block_),
-    seq_length_(other.seq_length_),
-    common_len_(other.common_len_),
+    seq_length_(other.seq_length_.load(std::memory_order_acquire)),
+    common_len_(other.common_len_.load(std::memory_order_acquire)),
     start_check_seq_length_(other.start_check_seq_length_),
     first_token_time_us_(other.first_token_time_us_),
     first_token_latency_us_(other.first_token_latency_us_) {
@@ -47,15 +47,17 @@ CompleteTokenIds::CompleteTokenIds(const CompleteTokenIds& other, bool share, in
 void CompleteTokenIds::init(const std::shared_ptr<GenerateInput>& generate_input, size_t extra_reserve_token_num) {
     RTP_LLM_CHECK(generate_input != nullptr);
 
-    v41_inputs_       = generate_input->v41_inputs;
-    canonical_offset_ = 0;
-    seq_length_       = generate_input->inputLength();
+    v41_inputs_        = generate_input->v41_inputs;
+    canonical_offset_  = 0;
+    const int init_len = generate_input->inputLength();
+    seq_length_.store(init_len, std::memory_order_release);
     RTP_LLM_CHECK_WITH_INFO(
-        (seq_length_ <= max_seq_len_), "seq_length[%d] must be less than max_seq_len[%d]", seq_length_, max_seq_len_);
+        (init_len <= max_seq_len_), "seq_length[%d] must be less than max_seq_len[%d]", init_len, max_seq_len_);
 
-    common_len_ = max_batch_size_ == 1 ? seq_length_ : seq_length_ / seq_size_per_block_ * seq_size_per_block_;
+    common_len_.store(max_batch_size_ == 1 ? init_len : init_len / seq_size_per_block_ * seq_size_per_block_,
+                      std::memory_order_release);
 
-    start_check_seq_length_ = seq_length_;
+    start_check_seq_length_ = init_len;
 
     size_t max_token_num = max_seq_len_ + extra_reserve_token_num;
 
@@ -132,20 +134,20 @@ std::vector<int> CompleteTokenIds::completeTokenIdsVec(int batch_idx) {
     RTP_LLM_CHECK_WITH_INFO(
         batch_idx < batch_size_, "batch_idx is out of bound, expected < %d, found %d", batch_size_, batch_idx);
     auto* ptr = data(batch_idx);
-    return std::vector<int>(ptr, ptr + seq_length_);
+    return std::vector<int>(ptr, ptr + seqLength());
 }
 
 std::vector<int> CompleteTokenIds::commonCompleteTokenIdsVec(int batch_idx) {
     RTP_LLM_CHECK_WITH_INFO(
         batch_idx < batch_size_, "batch_idx is out of bound, expected < %d, found %d", batch_size_, batch_idx);
     auto* ptr = data(batch_idx);
-    return std::vector<int>(ptr, ptr + common_len_);
+    return std::vector<int>(ptr, ptr + commonSeqLength());
 }
 
 std::vector<int> CompleteTokenIds::currentExecuteTokens(int batch_idx) {
     RTP_LLM_CHECK_WITH_INFO(
         batch_idx < batch_size_, "batch_idx is out of bound, expected < %d, found %d", batch_size_, batch_idx);
-    return {*(data(batch_idx) + seq_length_ - 1)};
+    return {*(data(batch_idx) + seqLength() - 1)};
 }
 
 std::vector<int> CompleteTokenIds::contextTokens(int batch_idx, int prefix_length, int context_length) {
@@ -156,16 +158,19 @@ std::vector<int> CompleteTokenIds::contextTokens(int batch_idx, int prefix_lengt
 }
 
 std::vector<int> CompleteTokenIds::getLatestTokens(size_t token_num) {
-    RTP_LLM_CHECK(seq_length_ >= token_num);
-    auto* ptr = data(0) + seq_length_ - token_num;
+    const int cur_len = seqLength();
+    RTP_LLM_CHECK(cur_len >= 0 && static_cast<size_t>(cur_len) >= token_num);
+    auto* ptr = data(0) + cur_len - token_num;
     return std::vector<int>(ptr, ptr + token_num);
 }
 
 bool CompleteTokenIds::matchEosToken(int batch_id, int token_id) {
-    int* token_ids = data(batch_id);
-    for (size_t i = start_check_seq_length_; i <= seq_length_; ++i) {
+    int*         token_ids = data(batch_id);
+    const int    raw_len   = seqLength();
+    const size_t cur_len   = raw_len > 0 ? static_cast<size_t>(raw_len) : 0;
+    for (size_t i = start_check_seq_length_; i <= cur_len; ++i) {
         if (token_id == token_ids[i - 1]) {
-            seq_length_ = i;
+            seq_length_.store(static_cast<int>(i), std::memory_order_release);
             return true;
         }
     }
@@ -173,8 +178,10 @@ bool CompleteTokenIds::matchEosToken(int batch_id, int token_id) {
 }
 
 bool CompleteTokenIds::matchStopWordsList(int batch_id, const std::vector<int>& stop_words) {
-    int* token_ids = data(batch_id);
-    for (size_t i = start_check_seq_length_; i <= seq_length_; ++i) {
+    int*         token_ids = data(batch_id);
+    const int    raw_len   = seqLength();
+    const size_t cur_len   = raw_len > 0 ? static_cast<size_t>(raw_len) : 0;
+    for (size_t i = start_check_seq_length_; i <= cur_len; ++i) {
         bool   match_one   = true;
         size_t begin_index = i - stop_words.size();
         for (auto& token : stop_words) {
@@ -184,7 +191,7 @@ bool CompleteTokenIds::matchStopWordsList(int batch_id, const std::vector<int>& 
             }
         }
         if (match_one) {
-            seq_length_ = i;
+            seq_length_.store(static_cast<int>(i), std::memory_order_release);
             return true;
         }
     }
@@ -204,10 +211,11 @@ bool CompleteTokenIds::update(const torch::Tensor& new_tokens,
     RTP_LLM_CHECK_WITH_INFO(
         new_batch_size <= max_batch_size_, "too many batches, expect < %d, found %d", max_batch_size_, new_batch_size);
 
-    if (seq_length_ + num_new_tokens > max_token_num) {
-        num_new_tokens = max_token_num - seq_length_;
+    const int cur_len = seqLength();
+    if (cur_len + num_new_tokens > max_token_num) {
+        num_new_tokens = max_token_num - cur_len;
     }
-    const bool commits_first_token = seq_length_ == input_length && num_new_tokens > 0;
+    const bool commits_first_token = cur_len == input_length && num_new_tokens > 0;
 
     // # NOTE: new tokens indicate num of newly genearted tokens
     // # typically 1 but can be > 1 under speculative decoding
@@ -219,7 +227,7 @@ bool CompleteTokenIds::update(const torch::Tensor& new_tokens,
     auto       max_num_new_tokens = new_tokens.size(1);
     const auto get_token_id       = [&](auto batch_idx, auto token_idx) {
         if (is_beam_search) {
-            return (new_tokens_ptr + max_num_new_tokens * batch_idx)[seq_length_ + token_idx];
+            return (new_tokens_ptr + max_num_new_tokens * batch_idx)[cur_len + token_idx];
         } else {
             return (new_tokens_ptr + num_new_tokens * batch_idx)[token_idx];
         }
@@ -237,13 +245,13 @@ bool CompleteTokenIds::update(const torch::Tensor& new_tokens,
             memcpy(data(i), new_tokens_ptr + i * max_num_new_tokens, sizeof(int) * max_num_new_tokens);
         } else {
             if (batch_size_ != new_batch_size && i > 0) {
-                memcpy(data(i), data(0), sizeof(int) * seq_length_);
+                memcpy(data(i), data(0), sizeof(int) * cur_len);
             }
-            memcpy(data(i) + seq_length_, new_tokens_ptr + i * num_new_tokens, sizeof(int) * num_new_tokens);
+            memcpy(data(i) + cur_len, new_tokens_ptr + i * num_new_tokens, sizeof(int) * num_new_tokens);
         }
     }
     batch_size_ = new_batch_size;
-    setSeqLength(seq_length_ + num_new_tokens);
+    setSeqLength(cur_len + num_new_tokens);
     if (commits_first_token) {
         first_token_time_us_    = autil::TimeUtility::currentTimeInMicroSeconds();
         first_token_latency_us_ = first_token_time_us_ - begin_time_us;
@@ -263,28 +271,29 @@ int CompleteTokenIds::getReserveStep() const {
 
 void CompleteTokenIds::setSeqLength(int seq_length) {
     RTP_LLM_CHECK(seq_length <= complete_token_ids_.size(1));
-    if (seq_length > seq_length_) {
-        start_check_seq_length_ = seq_length_ + 1;
+    const int prev_len = seq_length_.load(std::memory_order_relaxed);
+    if (seq_length > prev_len) {
+        start_check_seq_length_ = prev_len + 1;
     } else {
         start_check_seq_length_ = seq_length;
     }
-    seq_length_ = seq_length;
+    seq_length_.store(seq_length, std::memory_order_release);
 
     if (batch_size_ == 1) {  // reset common len
-        common_len_ = seq_length_;
+        common_len_.store(seq_length, std::memory_order_release);
     }
 }
 
 int CompleteTokenIds::totalSeqLength() const {
-    return seq_length_ + (int)reserve_step_;
+    return seqLength() + (int)reserve_step_;
 }
 
 int CompleteTokenIds::commonSeqLength() const {
-    return common_len_;
+    return common_len_.load(std::memory_order_acquire);
 }
 
 int CompleteTokenIds::seqLength() const {
-    return seq_length_;
+    return seq_length_.load(std::memory_order_acquire);
 }
 
 void CompleteTokenIds::copyTokensTo(int batch_id, void* dst, int offset, size_t token_num) {
@@ -300,10 +309,11 @@ int64_t CompleteTokenIds::firstTokenLatencyUs() const {
 }
 
 std::string CompleteTokenIds::toString(int batch_id) const {
-    auto*              ptr = const_cast<CompleteTokenIds*>(this)->data(batch_id);
+    auto*              ptr     = const_cast<CompleteTokenIds*>(this)->data(batch_id);
+    const int          cur_len = seqLength();
     std::ostringstream oss;
     oss << "[";
-    for (int i = 0; i < seq_length_; ++i) {
+    for (int i = 0; i < cur_len; ++i) {
         if (i > 0)
             oss << ", ";
         oss << ptr[i];
@@ -317,9 +327,10 @@ int32_t* CompleteTokenIds::data(int batch_id) {
 }
 
 std::string CompleteTokenIds::showStatus(int batch_id) {
-    int   start = seq_length_ > 10 ? seq_length_ - 10 : 0;
-    int   len   = seq_length_ - start;
-    auto* ptr   = data(batch_id) + start;
+    const int cur_len = seqLength();
+    int       start   = cur_len > 10 ? cur_len - 10 : 0;
+    int       len     = cur_len - start;
+    auto*     ptr     = data(batch_id) + start;
 
     std::ostringstream debug_oss;
     debug_oss << "[";
@@ -331,7 +342,7 @@ std::string CompleteTokenIds::showStatus(int batch_id) {
     debug_oss << "]";
 
     std::ostringstream oss;
-    oss << "complete tokenids seq length " << seq_length_ << ", tokenids size " << completeTokenIdsVec(batch_id).size()
+    oss << "complete tokenids seq length " << cur_len << ", tokenids size " << completeTokenIdsVec(batch_id).size()
         << ", last 10 tokenids is " << debug_oss.str();
     return oss.str();
 }

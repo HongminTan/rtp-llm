@@ -12,12 +12,14 @@ void initCacheKeys(BatchKVCacheResourcePtr batch_kv_cache_resource,
                    int                     seq_size_per_block,
                    int64_t                 initial_hash = 0);
 
-// Subsequent fill: rebuild cache_keys only for fully-aligned blocks (ignores the tail partial block).
-// Also updates BatchKVCacheResource::last_block_aligned based on current seq_len.
+// Subsequent fill: rebuild cache_keys only for fully-aligned blocks up to
+// max_seq_len (defaults to complete_token_ids->seqLength() when negative).
+// Also updates BatchKVCacheResource::last_block_aligned.
 void updateCacheKeys(BatchKVCacheResourcePtr batch_kv_cache_resource,
                      CompleteTokenIdsPtr     complete_token_ids,
                      int                     seq_size_per_block,
-                     int64_t                 initial_hash = 0);
+                     int64_t                 initial_hash = 0,
+                     int                     max_seq_len  = -1);
 
 // Drop the last block in cache_keys
 void dropLastPartialBlock(BatchKVCacheResourcePtr batch_kv_cache_resource);

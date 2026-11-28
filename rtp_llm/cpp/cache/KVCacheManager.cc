@@ -530,6 +530,19 @@ void KVCacheManager::insertIntoCache(const InsertInfo& insert_info, size_t& resi
     reportCacheOperation(metrics_reporter_, RtpLLMCacheOperationMetricsCollector::OpType::INSERT, begin_time_us);
 }
 
+void KVCacheManager::syncCacheKeys(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                                   const CompleteTokenIdsPtr&     complete_token_ids,
+                                   int                            max_seq_len) {
+    if (!batch_kv_cache_resource || !complete_token_ids || !batch_kv_cache_resource->cacheKeysInitialized()) {
+        return;
+    }
+    updateCacheKeys(batch_kv_cache_resource,
+                    complete_token_ids,
+                    config_.seq_size_per_block,
+                    config_.cache_key_hash_seed,
+                    max_seq_len);
+}
+
 int KVCacheManager::singleBatchNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
                                           int                            seq_len,
                                           int                            reserve_step) const {

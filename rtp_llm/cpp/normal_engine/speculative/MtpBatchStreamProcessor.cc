@@ -300,29 +300,65 @@ torch::Tensor MtpBatchStreamProcessor::advanceLinearCacheBlockTable(const torch:
 }
 
 void MtpBatchStreamProcessor::expandTargetVerifyPositionIds(const StreamGroups& stream_groups,
-                                                            GptModelInputs&     model_input) const {
+                                                            GptModelInputs&     model_input,
+                                                            TensorHolder*       host_holder) const {
     if (!model_input.combo_position_ids.defined()) {
         return;
     }
 
     const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
     const size_t batch_size             = model_input.combo_position_ids.numel() / position_id_len_factor;
-    auto         target_combo_position_ids =
-        torch::empty({(int64_t)(batch_size * (propose_step_ + 1) * position_id_len_factor)}, torch::kInt32)
-            .pin_memory();
-
-    int* dst_position_ids = target_combo_position_ids.data_ptr<int>();
     if (stream_groups.empty()) {
         // Non-driver TP ranks only need a correctly shaped placeholder here; draftModelDecode broadcasts rank0's
         // stream-derived combo_position_ids into this storage before target verify.
-        target_combo_position_ids.zero_();
+        auto target_combo_position_ids =
+            torch::zeros({(int64_t)(batch_size * (propose_step_ + 1) * position_id_len_factor)},
+                         torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
         model_input.combo_position_ids = std::move(target_combo_position_ids);
         return;
     }
 
-    size_t batch_idx = 0;
+    const auto all_streams         = stream_groups.allStreams();
+    const bool any_device_position = std::any_of(all_streams.begin(), all_streams.end(), [&](const auto& stream) {
+        const auto pos = stream->getNextPositionIdsGpu();
+        return pos.defined() && pos.is_cuda() && pos.scalar_type() == torch::kInt32
+               && pos.numel() == static_cast<int64_t>(position_id_len_factor);
+    });
+    if (any_device_position) {
+        std::vector<torch::Tensor> base_positions;
+        base_positions.reserve(all_streams.size());
+        const int64_t factor = static_cast<int64_t>(position_id_len_factor);
+        for (const auto& stream : all_streams) {
+            const auto device_positions = stream->getNextPositionIdsGpu();
+            if (device_positions.defined() && device_positions.is_cuda()
+                && device_positions.scalar_type() == torch::kInt32 && device_positions.numel() == factor) {
+                base_positions.push_back(device_positions.reshape({1, factor}));
+                continue;
+            }
+            auto host_positions =
+                torch::zeros({factor}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+            stream->generateNextPositionId(host_positions.data_ptr<int32_t>());
+            torch::Tensor row_cuda;
+            if (host_holder != nullptr) {
+                host_holder->hold_host(host_positions);
+                row_cuda = host_positions.to(torch::kCUDA, /*non_blocking=*/true);
+            } else {
+                row_cuda = host_positions.to(torch::kCUDA);
+            }
+            base_positions.push_back(row_cuda.reshape({1, factor}));
+        }
+        auto position_bases = torch::cat(base_positions, 0).reshape({static_cast<int64_t>(all_streams.size()), factor});
+        model_input.combo_position_ids = expandDSparkPositionIds(position_bases, propose_step_ + 1);
+        return;
+    }
+
+    auto target_combo_position_ids =
+        torch::empty({(int64_t)(batch_size * (propose_step_ + 1) * position_id_len_factor)}, torch::kInt32)
+            .pin_memory();
+    int*   dst_position_ids = target_combo_position_ids.data_ptr<int>();
+    size_t batch_idx        = 0;
     // Speculative decoding rejects num_return_sequences > 1 and beam search before this path.
-    for (const auto& stream : stream_groups.allStreams()) {
+    for (const auto& stream : all_streams) {
         int* base_position_ids = dst_position_ids + batch_idx * (propose_step_ + 1) * position_id_len_factor;
         stream->generateNextPositionId(base_position_ids);
         for (int step = 0; step < propose_step_ + 1; ++step) {
@@ -555,21 +591,6 @@ void logMtpStateFallback(const GenerateStreamPtr& stream, const char* reason) {
                      stream->seqLength());
 }
 
-bool collectMtpStateProposeSlices(const std::list<GenerateStreamPtr>& streams,
-                                  std::vector<torch::Tensor>&         propose_slices) {
-    propose_slices.clear();
-    for (const auto& stream : streams) {
-        const auto    state = stream->getMtpAsyncDeviceState();
-        torch::Tensor gpu_t = state.propose_tokens_gpu;
-        if (!gpu_t.defined() || !gpu_t.is_cuda()) {
-            logMtpStateFallback(stream, "propose_tokens_gpu_missing");
-            return false;
-        }
-        propose_slices.push_back(lastColumnAsFlat(gpu_t));
-    }
-    return true;
-}
-
 bool collectLegacyProposeSlices(const std::list<GenerateStreamPtr>& streams,
                                 std::vector<torch::Tensor>&         propose_slices) {
     propose_slices.clear();
@@ -760,7 +781,8 @@ absl::StatusOr<GptModelInputs> MtpBatchStreamProcessor::gatherDecodeModelInput(c
             auto state  = stream->getMtpAsyncDeviceState();
             auto window = state.engram_token_window_gpu;
             if (!window.defined()) {
-                RTP_LLM_CHECK_WITH_INFO(!stream->hasMtpCacheSnapshot(), "MTP snapshot missing Engram history");
+                RTP_LLM_CHECK_WITH_INFO(!GenerateStream::hasMtpAsyncDecodeState(state),
+                                        "MTP async decode state missing Engram history");
                 window = model_input.value().engram_token_windows.narrow(0, row, stream->currentBatchSize());
             }
             history.push_back(toCudaInt32(window, host_holder));
@@ -785,6 +807,8 @@ void MtpBatchStreamProcessor::overlayMtpCacheSnapshots(const StreamGroups& strea
         std::vector<torch::Tensor> physical_tables;
         std::vector<torch::Tensor> kernel_tables;
         std::vector<int64_t>       rows;
+        int64_t                    max_valid_physical = 0;
+        int64_t                    max_valid_kernel   = 0;
     };
 
     std::map<std::pair<int64_t, int64_t>, SnapshotBucket> buckets;
@@ -811,8 +835,12 @@ void MtpBatchStreamProcessor::overlayMtpCacheSnapshots(const StreamGroups& strea
             bucket.physical_tables.push_back(physical);
             bucket.kernel_tables.push_back(kernel);
             bucket.rows.push_back(row);
+            bucket.max_valid_physical =
+                std::max(bucket.max_valid_physical, GenerateStream::mtpCacheSnapshotPhysicalWidth(state));
+            bucket.max_valid_kernel =
+                std::max(bucket.max_valid_kernel, GenerateStream::mtpCacheSnapshotKernelWidth(state));
         }
-        row += use_snapshot ? 1 : stream->currentBatchSize();
+        row += GenerateStream::hasMtpAsyncDecodeState(state) ? 1 : stream->currentBatchSize();
     }
 
     if (buckets.empty()) {
@@ -833,27 +861,37 @@ void MtpBatchStreamProcessor::overlayMtpCacheSnapshots(const StreamGroups& strea
         "MTP cache snapshot overlay requires physical and kernel CUDA int32 destinations "
         "[group,batch,blocks]");
 
-    auto overlay =
-        [](torch::Tensor& destination, const std::vector<torch::Tensor>& sources, const std::vector<int64_t>& rows) {
-            auto source = torch::cat(sources, 1);
-            RTP_LLM_CHECK_WITH_INFO(source.size(0) == destination.size(0),
-                                    "MTP cache snapshot group mismatch: source=%ld destination=%ld",
-                                    source.size(0),
-                                    destination.size(0));
-            RTP_LLM_CHECK_WITH_INFO(source.size(2) <= destination.size(2),
-                                    "MTP cache snapshot exceeds destination width: source=%ld destination=%ld",
-                                    source.size(2),
-                                    destination.size(2));
-            const int64_t copy_width  = source.size(2);
-            auto          row_indices = torch::tensor(rows, torch::TensorOptions().dtype(torch::kInt64))
-                                   .to(destination.device(), /*non_blocking=*/true);
-            destination.narrow(2, 0, copy_width).index_copy_(1, row_indices, source);
-        };
+    auto overlay = [](torch::Tensor&                    destination,
+                      const std::vector<torch::Tensor>& sources,
+                      const std::vector<int64_t>&       rows,
+                      int64_t                           max_valid_width) {
+        RTP_LLM_CHECK_WITH_INFO(max_valid_width <= destination.size(2),
+                                "MTP cache snapshot valid width exceeds destination width: valid=%ld destination=%ld",
+                                max_valid_width,
+                                destination.size(2));
+        // Columns beyond max_valid_width are zero padding from a wider batch;
+        // narrow each source before concatenating so shrinking batches avoid
+        // materializing trailing zero columns.
+        const int64_t              copy_width = std::min(sources.front().size(2), destination.size(2));
+        std::vector<torch::Tensor> narrowed_sources;
+        narrowed_sources.reserve(sources.size());
+        for (const auto& s : sources) {
+            narrowed_sources.push_back(s.size(2) == copy_width ? s : s.narrow(2, 0, copy_width));
+        }
+        auto source = torch::cat(narrowed_sources, 1);
+        RTP_LLM_CHECK_WITH_INFO(source.size(0) == destination.size(0),
+                                "MTP cache snapshot group mismatch: source=%ld destination=%ld",
+                                source.size(0),
+                                destination.size(0));
+        auto row_indices = torch::tensor(rows, torch::TensorOptions().dtype(torch::kInt64))
+                               .to(destination.device(), /*non_blocking=*/true);
+        destination.narrow(2, 0, copy_width).index_copy_(1, row_indices, source);
+    };
 
     for (auto& [widths, bucket] : buckets) {
         (void)widths;
-        overlay(model_input.kv_cache_block_id, bucket.physical_tables, bucket.rows);
-        overlay(model_input.kv_cache_kernel_block_id, bucket.kernel_tables, bucket.rows);
+        overlay(model_input.kv_cache_block_id, bucket.physical_tables, bucket.rows, bucket.max_valid_physical);
+        overlay(model_input.kv_cache_kernel_block_id, bucket.kernel_tables, bucket.rows, bucket.max_valid_kernel);
     }
 }
 
@@ -1103,36 +1141,146 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
         }
     };
 
+    // Restore explicit position IDs for rows whose NormalModelInputGatherer
+    // slot was zero-filled because async MTP device state is active. Leave
+    // caller-supplied positions untouched when no stream carries GPU positions.
+    auto restore_device_position_ids = [&]() {
+        if (!model_input.combo_position_ids.defined()) {
+            return;
+        }
+        const int64_t factor = static_cast<int64_t>(model_input_gatherer_config_.position_id_len_factor);
+        if (factor <= 0) {
+            return;
+        }
+        const auto all_streams = stream_groups.allStreams();
+        const bool any_device_pos =
+            std::any_of(all_streams.begin(), all_streams.end(), [factor](const GenerateStreamPtr& stream) {
+                const auto pos = stream->getNextPositionIdsGpu();
+                return pos.defined() && pos.is_cuda() && pos.scalar_type() == torch::kInt32 && pos.numel() == factor;
+            });
+        if (!any_device_pos) {
+            return;
+        }
+        const bool all_device_pos =
+            std::all_of(all_streams.begin(), all_streams.end(), [factor](const GenerateStreamPtr& stream) {
+                const auto pos = stream->getNextPositionIdsGpu();
+                return pos.defined() && pos.is_cuda() && pos.scalar_type() == torch::kInt32 && pos.numel() == factor;
+            });
+        if (all_device_pos) {
+            std::vector<torch::Tensor> rows;
+            rows.reserve(all_streams.size());
+            for (const auto& stream : all_streams) {
+                rows.push_back(stream->getNextPositionIdsGpu().reshape({1, factor}));
+            }
+            model_input.combo_position_ids = torch::cat(rows, 0).reshape({-1}).contiguous();
+            return;
+        }
+
+        auto base = toCudaInt32(model_input.combo_position_ids, host_holder);
+        if (base.is_same(model_input.combo_position_ids)) {
+            base = base.clone();
+        } else if (!base.is_contiguous()) {
+            base = base.contiguous();
+        }
+        base = base.reshape({static_cast<int64_t>(batch_size), factor});
+        std::vector<torch::Tensor> steady_pos;
+        std::vector<int64_t>       steady_rows;
+        int64_t                    row = 0;
+        for (const auto& stream : all_streams) {
+            const auto pos = stream->getNextPositionIdsGpu();
+            if (pos.defined() && pos.is_cuda() && pos.scalar_type() == torch::kInt32 && pos.numel() == factor) {
+                steady_pos.push_back(pos.reshape({1, factor}));
+                steady_rows.push_back(row);
+            }
+            ++row;
+        }
+        auto rows_cpu = torch::empty({static_cast<int64_t>(steady_rows.size())},
+                                     torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
+        std::memcpy(rows_cpu.data_ptr<int64_t>(), steady_rows.data(), steady_rows.size() * sizeof(int64_t));
+        host_holder.hold_host(rows_cpu);
+        auto rows_gpu = rows_cpu.to(torch::kCUDA, /*non_blocking=*/true);
+        base.index_copy_(0, rows_gpu, torch::cat(steady_pos, 0));
+        model_input.combo_position_ids = base.reshape({-1}).contiguous();
+    };
+
+    const auto all_streams = stream_groups.allStreams();
+
     // Fast path: consume next-step propose tokens published by dispatchDecodeAsync.
+    // Mixed batches (e.g. a freshly prefilled PDFUSION stream alongside steady
+    // async streams) pick per-row so steady rows never fall back to reading
+    // worker-owned SPOutputBuffer fields.
     {
-        const auto                 all_streams = stream_groups.allStreams();
         std::vector<torch::Tensor> propose_slices_gpu;
         propose_slices_gpu.reserve(batch_size);
-        if (!all_streams.empty() && collectMtpStateProposeSlices(all_streams, propose_slices_gpu)) {
+        bool any_state_propose = false;
+        bool all_state_propose = !all_streams.empty();
+        for (const auto& stream : all_streams) {
+            const auto    state = stream->getMtpAsyncDeviceState();
+            torch::Tensor gpu_t = state.propose_tokens_gpu;
+            if (gpu_t.defined() && gpu_t.is_cuda()) {
+                any_state_propose = true;
+                propose_slices_gpu.push_back(lastColumnAsFlat(gpu_t));
+            } else {
+                all_state_propose = false;
+            }
+        }
+        if (all_state_propose) {
             auto combo_tokens_gpu         = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
             model_input.combo_tokens      = std::move(combo_tokens_gpu);
             model_input.lm_output_indexes = makeCudaInt32Range(model_input.combo_tokens.numel());
             set_decode_prefix_lengths();
+            restore_device_position_ids();
+            model_input.input_lengths = toCudaInt32(model_input.input_lengths, host_holder);
+            return;
+        }
+        if (any_state_propose) {
+            std::vector<torch::Tensor> mixed_slices;
+            mixed_slices.reserve(batch_size);
+            for (const auto& stream : all_streams) {
+                const auto    state = stream->getMtpAsyncDeviceState();
+                torch::Tensor gpu_t = state.propose_tokens_gpu;
+                if (gpu_t.defined() && gpu_t.is_cuda()) {
+                    mixed_slices.push_back(lastColumnAsFlat(gpu_t).to(torch::kInt32).reshape({1}));
+                    continue;
+                }
+                logMtpStateFallback(stream, "propose_tokens_gpu_missing");
+                auto sp_output_buffer = stream->getSPOutputBuffer();
+                RTP_LLM_CHECK_WITH_INFO(
+                    sp_output_buffer != nullptr, "missing SPOutputBuffer for stream %ld", stream->streamId());
+                if (sp_output_buffer->propose_tokens_gpu.defined() && sp_output_buffer->propose_tokens_gpu.is_cuda()) {
+                    mixed_slices.push_back(
+                        lastColumnAsFlat(sp_output_buffer->propose_tokens_gpu).to(torch::kInt32).reshape({1}));
+                } else {
+                    auto token_cpu = torch::full({1},
+                                                 sp_output_buffer->tokens.data_ptr<int>()[1],
+                                                 torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+                    mixed_slices.push_back(toCudaInt32(token_cpu, host_holder).reshape({1}));
+                }
+            }
+            model_input.combo_tokens      = torch::cat(mixed_slices, 0).to(torch::kInt32);
+            model_input.lm_output_indexes = makeCudaInt32Range(model_input.combo_tokens.numel());
+            set_decode_prefix_lengths();
+            restore_device_position_ids();
             model_input.input_lengths = toCudaInt32(model_input.input_lengths, host_holder);
             return;
         }
     }
 
     std::vector<torch::Tensor> propose_slices_gpu;
-    if (legacyGpuProposePathEnabled(batch_size)
-        && collectLegacyProposeSlices(stream_groups.allStreams(), propose_slices_gpu)) {
+    if (legacyGpuProposePathEnabled(batch_size) && collectLegacyProposeSlices(all_streams, propose_slices_gpu)) {
         auto combo_tokens_gpu         = torch::cat(propose_slices_gpu, 0).to(torch::kInt32);
         model_input.combo_tokens      = std::move(combo_tokens_gpu);
         model_input.lm_output_indexes = makeCudaInt32Range(model_input.combo_tokens.numel());
         model_input.input_lengths     = toCudaInt32(model_input.input_lengths, host_holder);
         set_decode_prefix_lengths();
+        restore_device_position_ids();
         return;
     }
 
     int  batch_idx    = 0;
     auto combo_tokens = torch::empty({(int64_t)batch_size}, torch::kInt32).pin_memory();
 
-    for (const auto& stream : stream_groups.allStreams()) {
+    for (const auto& stream : all_streams) {
         int propose_token                       = stream->getSPOutputBuffer()->tokens.data_ptr<int>()[1];
         combo_tokens.data_ptr<int>()[batch_idx] = propose_token;
         batch_idx++;
@@ -1141,6 +1289,7 @@ void MtpBatchStreamProcessor::prepareDecodeDraftModelInput(const StreamGroups& s
     model_input.combo_tokens  = toCudaInt32(combo_tokens, host_holder);
     model_input.input_lengths = toCudaInt32(model_input.input_lengths, host_holder);
     set_decode_prefix_lengths();
+    restore_device_position_ids();
     model_input.lm_output_indexes = makeCudaInt32Range(static_cast<int64_t>(batch_size));
 }
 
@@ -1207,6 +1356,7 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
     }
 
     if (gatherMtpDecodeModelInputFromDeviceState(stream_groups, model_input, host_holder)) {
+        expandTargetVerifyPositionIds(stream_groups, model_input, &host_holder);
         return;
     }
 
@@ -1226,7 +1376,7 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
         propose_slices.push_back(toCudaInt32(propose, host_holder));
     }
 
-    expandTargetVerifyPositionIds(stream_groups, model_input);
+    expandTargetVerifyPositionIds(stream_groups, model_input, &host_holder);
     auto target_last_gpu = torch::cat(target_last_slices, 0).to(torch::kInt32);
     auto propose_gpu     = torch::cat(propose_slices, 0).to(torch::kInt32);
 
@@ -1648,12 +1798,15 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
     std::vector<torch::Tensor> draft_token_probs_list;
     std::vector<torch::Tensor> draft_token_id_slices;
     draft_token_id_slices.reserve(batch_size);
+    bool any_draft_token_on_cuda = false;
+    bool any_draft_probs_on_cuda = false;
 
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer = stream->getSPOutputBuffer();
         auto draft_token      = pickOneStepDraftToken(stream);
         RTP_LLM_CHECK_WITH_INFO(
             draft_token.defined(), "one-step MTP draft sampler token missing for stream %ld", stream->streamId());
+        any_draft_token_on_cuda = any_draft_token_on_cuda || draft_token.is_cuda();
         draft_token_id_slices.push_back(draft_token);
 
         // Prefer main-thread device-state all_probs; fallback is safe after
@@ -1663,16 +1816,29 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
         RTP_LLM_CHECK_WITH_INFO(use_dev_probs || (sp_output_buffer && sp_output_buffer->all_probs.defined()),
                                 "one-step MTP draft all_probs missing for stream %ld",
                                 stream->streamId());
-        draft_token_probs_list.push_back(use_dev_probs ? dev_probs : sp_output_buffer->all_probs);
+        auto probs              = use_dev_probs ? dev_probs : sp_output_buffer->all_probs;
+        any_draft_probs_on_cuda = any_draft_probs_on_cuda || probs.is_cuda();
+        draft_token_probs_list.push_back(std::move(probs));
     }
 
     if (!draft_token_id_slices.empty()) {
+        const bool need_cuda_tokens = useMtpDeviceInput() || any_draft_token_on_cuda;
+        if (need_cuda_tokens) {
+            for (auto& slice : draft_token_id_slices) {
+                slice = toCudaInt32(slice, host_holder);
+            }
+        }
         draft_token_ids = torch::cat(draft_token_id_slices, 0)
                               .to(torch::kInt32)
                               .reshape({(int64_t)batch_size, (int64_t)propose_step_});
-        if (useMtpDeviceInput() && !draft_token_ids.is_cuda()) {
-            host_holder.hold_host(draft_token_ids);
-            draft_token_ids = draft_token_ids.to(torch::kCUDA, /*non_blocking=*/true);
+    }
+
+    if (any_draft_probs_on_cuda) {
+        for (auto& probs : draft_token_probs_list) {
+            if (!probs.is_cuda()) {
+                host_holder.hold_host(probs);
+                probs = probs.to(torch::kCUDA, /*non_blocking=*/true);
+            }
         }
     }
 

@@ -78,7 +78,7 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
     // CompleteTokenIds has already applied this step, so currentBatchSize is the output row count.
     for (int i = 0; i < currentBatchSize(); i++) {
         GenerateOutput generate_output;
-        generate_output.aux_info.iter_count = iter_count_;
+        generate_output.aux_info.iter_count = committed_iter_count_;
         generate_output.output_ids          = torch::empty({1, (int64_t)output_len}, torch::kInt32);
 
         // TODO(xinfei.sxf) optimize this copy : only copy last token
@@ -122,7 +122,7 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
             }
         }
         if (generate_input_->generate_config->return_all_hidden_states && update_info.all_hidden_states.defined()
-            && iter_count_ == 1) {
+            && committed_iter_count_ == 1) {
             generate_output.all_hidden_states = update_info.all_hidden_states.cpu();
         }
         if (loss_.defined()) {
@@ -147,7 +147,7 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
 
         generate_output.finished = isSubGenerateDoneWithoutLock(i);
         if (generate_input_->generate_config->aux_info) {
-            generate_output.aux_info.iter_count   = iter_count_;
+            generate_output.aux_info.iter_count   = committed_iter_count_;
             generate_output.aux_info.cost_time_us = autil::TimeUtility::currentTimeInMicroSeconds() - begin_time_us_;
             generate_output.aux_info.first_token_cost_time_us = complete_token_ids_->firstTokenLatencyUs();
             generate_output.aux_info.wait_time_us             = wait_time_us_;

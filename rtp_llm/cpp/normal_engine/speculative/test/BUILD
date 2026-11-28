@@ -117,3 +117,21 @@ sh_test(
     exec_properties = {"gpu": "L20_CU13"},
     tags = ["L20_CU13"],
 )
+
+# useDeviceInput caches the process environment, so run the non-linear snapshot and mixed-batch async cases in their own process.
+sh_test(
+    name = "mtp_executor_non_linear_device_input_snapshot_test",
+    srcs = ["//:cc_test_wrapper.sh"],
+    args = [
+        "$(location :mtp_executor_test_bin)",
+        "--gtest_filter=MtpExecutorTest.testDispatchPublishesNonLinearZeroCopyCacheSnapshotUnderDeviceInput:MtpExecutorTest.testMixedBatchDraftModelDecodeResolvesPreTargetTokenPerRow",
+    ],
+    data = [":mtp_executor_test_bin"],
+    env = {
+        "RTP_LLM_DEVICE_INPUT": "1",
+        "RTP_LLM_MTP_ASYNC_DEVICE_STATE": "1",
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
+)

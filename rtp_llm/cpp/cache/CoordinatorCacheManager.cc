@@ -73,7 +73,7 @@ RequiredPositions chunkRequiredPositions(const MallocInfo&             malloc_in
                                          const SingleTypeCacheManager& group,
                                          const RequiredPositions&      base_positions = {}) {
     auto        required_positions = base_positions;
-    const auto& blocks = malloc_info.batch_kv_cache_resource->blocks(0, group.tag());
+    const auto& blocks             = malloc_info.batch_kv_cache_resource->blocks(0, group.tag());
     for (const size_t pos : chunkCachePositions(malloc_info, group.config())) {
         if (!malloc_info.reuse_cache || pos >= blocks.size() || isNullBlockIdx(blocks[pos])) {
             required_positions.insert(pos);
@@ -148,8 +148,8 @@ MallocResult CoordinatorCacheManager::initMalloc(const MallocInfo& malloc_info) 
 
     auto init_result = initMallocForCommonLen(malloc_info);
     if (malloc_info.batch_kv_cache_resource != nullptr) {
-        const CacheKeysType& cache_keys        = malloc_info.batch_kv_cache_resource->cacheKeys(0);
-        init_result.device_input_length        = static_cast<int64_t>(cache_keys.size()) * config_.seq_size_per_block;
+        const CacheKeysType& cache_keys = malloc_info.batch_kv_cache_resource->cacheKeys(0);
+        init_result.device_input_length = static_cast<int64_t>(cache_keys.size()) * config_.seq_size_per_block;
     }
     if (!init_result.success) {
         return finalize_init_failure(init_result);
@@ -166,10 +166,10 @@ MallocResult CoordinatorCacheManager::initMalloc(const MallocInfo& malloc_info) 
             }
             pending_async_context.reset();
             load_context.reset();
-            incr_result.match_cost_time_us         = init_result.match_cost_time_us;
-            incr_result.match_end_time_us          = init_result.match_end_time_us;
-            incr_result.device_input_length        = init_result.device_input_length;
-            incr_result.load_attempted             = init_result.load_attempted;
+            incr_result.match_cost_time_us  = init_result.match_cost_time_us;
+            incr_result.match_end_time_us   = init_result.match_end_time_us;
+            incr_result.device_input_length = init_result.device_input_length;
+            incr_result.load_attempted      = init_result.load_attempted;
             return finalize_init_failure(std::move(incr_result));
         }
         if (pending_async_context != nullptr) {
@@ -917,20 +917,38 @@ void CoordinatorCacheManager::free(const FreeInfo& free_info) {
         for (const auto& [block, count] : counts) {
             updates.push_back({block, count, 0});
         }
-        BlockIndicesType replacements;
-        int              required_free_blocks = 0;
-        const bool       released =
-            group_block_pools_.front()->tryReplaceRequestReferences(updates, 0, replacements, required_free_blocks);
-        RTP_LLM_CHECK_WITH_INFO(released, "releasing request references must not require free capacity");
+        BlockIndicesType   replacements;
+        int                required_free_blocks = 0;
+        std::exception_ptr first_err;
+        try {
+            const bool released =
+                group_block_pools_.front()->tryReplaceRequestReferences(updates, 0, replacements, required_free_blocks);
+            RTP_LLM_CHECK_WITH_INFO(released, "releasing request references must not require free capacity");
+        } catch (...) {
+            first_err = std::current_exception();
+        }
         kv_cache_resource->clearBlocks();
+        if (first_err) {
+            std::rethrow_exception(first_err);
+        }
         return;
     }
+    std::exception_ptr first_err;
     for (const auto& blocks_by_group : blocks_by_batch) {
         for (size_t group_id = 0; group_id < group_tags.size(); ++group_id) {
-            kv_cache_groups_[group_id]->unreference(*blocks_by_group[group_id]);
+            try {
+                kv_cache_groups_[group_id]->unreference(*blocks_by_group[group_id]);
+            } catch (...) {
+                if (!first_err) {
+                    first_err = std::current_exception();
+                }
+            }
         }
     }
     kv_cache_resource->clearBlocks();
+    if (first_err) {
+        std::rethrow_exception(first_err);
+    }
 }
 
 void CoordinatorCacheManager::insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length) {
@@ -1476,17 +1494,17 @@ int CoordinatorCacheManager::getNeedBlocks(const MallocInfo& malloc_info) const 
     int common_blocks_total = 0;
     int extra_blocks_total  = 0;
     for (int group_id = 0; group_id < static_cast<int>(kv_cache_groups_.size()); ++group_id) {
-        const auto& tag              = config_.groupTags()[static_cast<size_t>(group_id)];
-        const auto  group            = kv_cache_groups_[static_cast<size_t>(group_id)];
-        const int   group_common_seq = cpEffectiveSeqLenForGroup(cp_mapper, config_, tag, raw_common_seq_len);
-        const int   group_seq_len    = cpEffectiveSeqLenForGroup(cp_mapper, config_, tag, raw_seq_len);
+        const auto& tag                = config_.groupTags()[static_cast<size_t>(group_id)];
+        const auto  group              = kv_cache_groups_[static_cast<size_t>(group_id)];
+        const int   group_common_seq   = cpEffectiveSeqLenForGroup(cp_mapper, config_, tag, raw_common_seq_len);
+        const int   group_seq_len      = cpEffectiveSeqLenForGroup(cp_mapper, config_, tag, raw_seq_len);
         const auto  required_positions = chunkRequiredPositions(malloc_info, *group);
         const auto  need               = group->getNeedBlocks(group_common_seq,
-                                                              group_seq_len,
-                                                              malloc_info.complete_token_ids->getReserveStep(),
-                                                              reuse_blocks_len,
-                                                              reuse_enabled,
-                                                              required_positions);
+                                               group_seq_len,
+                                               malloc_info.complete_token_ids->getReserveStep(),
+                                               reuse_blocks_len,
+                                               reuse_enabled,
+                                               required_positions);
         common_blocks_total += need.common_blocks;
         extra_blocks_total += need.extra_blocks;
     }
@@ -2091,11 +2109,11 @@ CoordinatorCacheManager::evaluateInitCapacityImpl(const MallocInfo&             
         const int    group_common_seq       = cpEffectiveSeqLenForReserve(cp_mapper, config_, tag, raw_common_seq_len);
         const int    group_seq_len          = cpEffectiveSeqLenForReserve(cp_mapper, config_, tag, raw_seq_len);
         const int    group_reuse_blocks_len = malloc_info.batch_kv_cache_resource->blocksNum(0, tag);
-        const auto& base_required_positions =
+        const auto&  base_required_positions =
             required_positions == nullptr ? no_required_positions : (*required_positions)[group_index];
         const auto group_required_positions =
             chunkRequiredPositions(malloc_info, *kv_cache_groups_[group_index], base_required_positions);
-        const auto need = kv_cache_groups_[group_index]->getNeedBlocks(group_common_seq,
+        const auto   need           = kv_cache_groups_[group_index]->getNeedBlocks(group_common_seq,
                                                                        group_seq_len,
                                                                        malloc_info.complete_token_ids->getReserveStep(),
                                                                        group_reuse_blocks_len,

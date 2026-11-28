@@ -15,10 +15,11 @@
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 #include <atomic>
 #include <condition_variable>
-#include <iterator>
-#include <condition_variable>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <iterator>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -136,7 +137,17 @@ public:
                    bool                                  pert_test               = false);
     virtual ~GenerateStream() {
         reportMetricOnce();
-        releaseResource();
+        try {
+            releaseResource();
+        } catch (const std::exception& e) {
+            try {
+                RTP_LLM_LOG_ERROR("GenerateStream destructor releaseResource failed: %s", e.what());
+            } catch (...) {}
+        } catch (...) {
+            try {
+                RTP_LLM_LOG_ERROR("GenerateStream destructor releaseResource failed with unknown exception");
+            } catch (...) {}
+        }
         stream_magic_ = 0;
     }
 
@@ -260,7 +271,7 @@ public:
     // When useChunkWindow() is true, contextLength() returns the current chunk length.
     // initial_reuse_length_ stays frozen for cache-hit metrics.
     void setChunkSize(int chunk_size) {
-        chunk_size_ = chunk_size;
+        chunk_size_     = chunk_size;
         max_chunk_size_ = std::max(max_chunk_size_, chunk_size);
     }
     int maxChunkSize() const {
@@ -276,7 +287,7 @@ public:
     int  currentChunkLen() const;  // tokens to compute in the current chunk
     bool isLastChunk() const;      // current chunk reaches seqLength()
     bool isMiddleChunk() const;    // chunked + context + !last → no sample / no output row
-    void advanceChunk();  // reuse_length_ += currentChunkLen()
+    void advanceChunk();           // reuse_length_ += currentChunkLen()
     int  cacheStorePublishStartToken() const {
         return chunk_advanced_ ? prefixLength() : 0;
     }
@@ -612,13 +623,16 @@ public:
     }
 
     // Count worker claims on this stream's KV resource.
-    // releaseResource waits for zero so worker-side update/specUpdate cannot
-    // write into blocks already returned to the pool.
+    // releaseResource waits for zero so worker-side update/specUpdate and the
+    // round's GPU work cannot access blocks already returned to the pool.
     void incPendingAsyncBookkeeping();
-    void decPendingAsyncBookkeepingAndMaybeRelease();
+    void decPendingAsyncBookkeepingAndMaybeRelease(bool                gpu_completed = true,
+                                                   std::exception_ptr* err_out       = nullptr) noexcept;
+    int  pendingAsyncBookkeepingCount() const;
     bool hasPendingAsyncBookkeeping() const;
+    bool hasUnconfirmedAsyncGpuAccess() const;
     void waitPendingAsyncBookkeeping();
-    void markDeferredRelease();
+    bool tryMarkDeferredRelease();
     bool isDeferredReleasePending() const;
 
     // Per-stream CUDA state used to prepare the next MTP decode step while host
@@ -644,6 +658,11 @@ public:
         // kernel-granularity table.
         torch::Tensor next_kv_cache_block_id_gpu;
         torch::Tensor next_kv_cache_kernel_block_id_gpu;
+        // True logical block widths for this stream inside the batch-padded
+        // snapshots above (0 = unset, fall back to tensor.size(2)). Prevents
+        // short streams from inheriting an exited long stream's padded width.
+        int64_t next_kv_cache_physical_blocks = 0;
+        int64_t next_kv_cache_kernel_blocks   = 0;
         // Main-thread mirrors used when DROP_BROAD_SYNC lets the next step run
         // before worker-side specUpdate has written sp_output_buffer fields.
         torch::Tensor last_hidden_states_gpu;
@@ -655,11 +674,23 @@ public:
         // the device sequence.
         // -1 = unset (first iter / cleared).
         int previous_seq_len_upper_bound = -1;
-        // Conservative host-visible bound for the next iteration. It advances
-        // monotonically while workers overlap and resets to exact host state
+        // Conservative host-visible bounds for the next iteration. They advance
+        // monotonically while workers overlap and reset to exact host state
         // once bookkeeping catches up.
         // -1 = unset (first iter / cleared).
+        int next_seq_len_lower_bound = -1;
         int next_seq_len_upper_bound = -1;
+        // True once dispatchDecodeAsync() has published a valid async decode
+        // device state for this stream. Unlike hasMtpCacheSnapshot(), this
+        // remains true if handleRunning() invalidates the old GPU block-table
+        // snapshot after growing host blocks at a boundary on non-linear
+        // models, so gatherers still avoid racing worker-owned host metadata.
+        bool async_decode_state_ready = false;
+        // Opt-in from non-linear decode executors. The stream additionally
+        // verifies retained SWA tail width against max_mtp_advance before
+        // skipping a bookkeeping join at a capacity boundary.
+        bool allow_async_cache_reservation = false;
+        int  max_mtp_advance               = 0;
     };
 
     uint64_t setMtpAsyncDeviceState(MtpAsyncDeviceState state) {
@@ -739,10 +770,31 @@ public:
     bool hasMtpCacheSnapshot() const {
         return hasMtpCacheSnapshot(getMtpAsyncDeviceState());
     }
+    static bool hasMtpAsyncDecodeState(const MtpAsyncDeviceState& state) {
+        return state.async_decode_state_ready || hasMtpCacheSnapshot(state);
+    }
+    bool hasMtpAsyncDecodeState() const {
+        return hasMtpAsyncDecodeState(getMtpAsyncDeviceState());
+    }
+    bool           canReserveMtpCacheWithoutBookkeepingJoin(const MtpAsyncDeviceState& state) const;
+    bool           hasSafeSwaRetainedTailForAsyncOverlap(int max_advance) const;
+    bool           canPruneSwaBlocksWhileAsyncPending() const;
+    static int64_t mtpCacheSnapshotPhysicalWidth(const MtpAsyncDeviceState& state) {
+        const int64_t table_width = state.next_kv_cache_block_id_gpu.size(2);
+        return state.next_kv_cache_physical_blocks > 0 ? std::min(state.next_kv_cache_physical_blocks, table_width) :
+                                                         table_width;
+    }
+    static int64_t mtpCacheSnapshotKernelWidth(const MtpAsyncDeviceState& state) {
+        const int64_t table_width = state.next_kv_cache_kernel_block_id_gpu.size(2);
+        return state.next_kv_cache_kernel_blocks > 0 ? std::min(state.next_kv_cache_kernel_blocks, table_width) :
+                                                       table_width;
+    }
     void clearMtpCacheSnapshot() {
         std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
         mtp_async_state_.next_kv_cache_block_id_gpu        = torch::Tensor();
         mtp_async_state_.next_kv_cache_kernel_block_id_gpu = torch::Tensor();
+        mtp_async_state_.next_kv_cache_physical_blocks     = 0;
+        mtp_async_state_.next_kv_cache_kernel_blocks       = 0;
     }
     torch::Tensor getLastHiddenStatesGpu() const {
         std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
@@ -876,6 +928,7 @@ protected:
     // same mutex to commit accepted tokens/cache swaps.  Decide whether a
     // capacity-boundary join is needed before taking mutex_.
     bool needsAsyncBookkeepingJoinForKvReservation() const;
+    void tryReleaseResourceAfterBookkeeping();
 
     // Consumer-visible state is read and written under mutex_. Public readers
     // acquire the lock; already-locked engine paths use these helpers.
@@ -887,8 +940,8 @@ protected:
     bool         consumerFinishedWithoutLock() const;
     virtual bool consumerReadyWithoutLock() const;
 
-    int                      estimateKVNeedBlocks(int remaining_tokens, int target_batch_size) const;
-    bool                     reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
+    int  estimateKVNeedBlocks(int remaining_tokens, int target_batch_size) const;
+    bool reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>& error_info);
     bool prepareUpdateWithoutLock(const std::optional<ErrorInfo>& error_info, bool force_update_info);
     std::optional<ErrorInfo> updateNormalLogitProcessorStatus(const StreamUpdateInfo& update_info);
     std::optional<ErrorInfo> updateLogitProcessorStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens);
@@ -927,9 +980,30 @@ protected:
     // Prefill-to-decode transition is committed by the output/bookkeeping
     // worker and observed by the scheduler thread. Keep this flag atomic; the
     // shared_ptr preserves the existing CopyOnWrite sharing semantics.
+    // Value-copyable atomic counter so copied streams keep independent counts.
+    struct AtomicCounter {
+        std::atomic<size_t> value{0};
+
+        AtomicCounter() = default;
+        explicit AtomicCounter(size_t initial): value(initial) {}
+        AtomicCounter(const AtomicCounter& other): value(other.value.load(std::memory_order_relaxed)) {}
+        AtomicCounter& operator=(const AtomicCounter& other) {
+            value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            return *this;
+        }
+
+        size_t load(std::memory_order order = std::memory_order_relaxed) const {
+            return value.load(order);
+        }
+        size_t fetch_add(size_t delta, std::memory_order order = std::memory_order_relaxed) {
+            return value.fetch_add(delta, order);
+        }
+    };
+
     std::shared_ptr<std::atomic<bool>> is_context_stream_;
-    size_t                             iter_count_    = 0;
-    size_t                             sp_iter_count_ = 0;
+    AtomicCounter                      iter_count_;
+    size_t                             committed_iter_count_ = 0;
+    size_t                             sp_iter_count_        = 0;
     std::vector<int32_t>               speculative_accepted_tokens_per_pos_;
     size_t                             last_output_pos_      = 0;
     int                                initial_reuse_length_ = 0;
@@ -1002,7 +1076,8 @@ protected:
     // GenerateStream copies captured by async workers.
     struct AsyncBookkeepingCoordinator {
         std::atomic<int>        count{0};
-        std::atomic<bool>       defer_release{false};
+        bool                    defer_release{false};
+        bool                    gpu_unconfirmed{false};
         std::mutex              mu;
         std::condition_variable cv;
     };
@@ -1039,5 +1114,90 @@ protected:
 };
 
 typedef std::shared_ptr<GenerateStream> GenerateStreamPtr;
+
+// Owns one async bookkeeping round's stream claims and GPU completion fence
+// across runner.launch() and worker execution.
+class AsyncBookkeepingHold {
+public:
+    AsyncBookkeepingHold(std::list<GenerateStreamPtr> streams, std::shared_ptr<torch::Event> gpu_event):
+        streams_(std::move(streams)) {
+        if (gpu_event) {
+            query_fn_ = [gpu_event]() { return gpu_event->query(); };
+            sync_fn_  = [gpu_event]() { gpu_event->synchronize(); };
+        }
+        claimStreams();
+    }
+
+    AsyncBookkeepingHold(std::list<GenerateStreamPtr> streams,
+                         std::function<bool()>        query_fn,
+                         std::function<void()>        sync_fn):
+        streams_(std::move(streams)), query_fn_(std::move(query_fn)), sync_fn_(std::move(sync_fn)) {
+        claimStreams();
+    }
+
+    AsyncBookkeepingHold(const AsyncBookkeepingHold&)            = delete;
+    AsyncBookkeepingHold& operator=(const AsyncBookkeepingHold&) = delete;
+
+    ~AsyncBookkeepingHold() {
+        // Fallback when finish() was not reached (e.g. runner.launch() threw a
+        // prior round's exception before scheduling this task, or a queued task
+        // was destroyed during shutdown).
+        finish(/*first_err=*/nullptr);
+    }
+
+    // Synchronizes this round's GPU completion fence in normal control flow and
+    // releases every claimed stream. Any GPU sync or deferred-release exception
+    // is recorded in first_err so callers can rethrow outside destructors.
+    void finish(std::exception_ptr* first_err = nullptr) noexcept {
+        if (finished_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        bool gpu_ok = true;
+        if (query_fn_ || sync_fn_) {
+            try {
+                if (!query_fn_ || !query_fn_()) {
+                    if (sync_fn_) {
+                        sync_fn_();
+                    }
+                }
+            } catch (const std::exception& e) {
+                gpu_ok = false;
+                if (first_err != nullptr && !*first_err) {
+                    *first_err = std::current_exception();
+                }
+                try {
+                    RTP_LLM_LOG_ERROR("AsyncBookkeepingHold GPU event sync failed: %s", e.what());
+                } catch (...) {}
+            } catch (...) {
+                gpu_ok = false;
+                if (first_err != nullptr && !*first_err) {
+                    *first_err = std::current_exception();
+                }
+                try {
+                    RTP_LLM_LOG_ERROR("AsyncBookkeepingHold GPU event sync failed with unknown exception");
+                } catch (...) {}
+            }
+        }
+        for (auto& s : streams_) {
+            if (s) {
+                s->decPendingAsyncBookkeepingAndMaybeRelease(gpu_ok, first_err);
+            }
+        }
+    }
+
+private:
+    void claimStreams() {
+        for (auto& s : streams_) {
+            if (s) {
+                s->incPendingAsyncBookkeeping();
+            }
+        }
+    }
+
+    std::list<GenerateStreamPtr> streams_;
+    std::function<bool()>        query_fn_;
+    std::function<void()>        sync_fn_;
+    std::atomic<bool>            finished_{false};
+};
 
 }  // namespace rtp_llm

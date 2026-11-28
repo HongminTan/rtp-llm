@@ -9,6 +9,7 @@
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #endif
 #include "autil/EnvUtil.h"
+#include "rtp_llm/cpp/cache/CPSlotMapper.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
@@ -108,7 +109,7 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     cum_log_probs_ = torch::zeros({(int64_t)init_batch_size}, torch::kFloat32);
 
     is_context_stream_ = std::make_shared<std::atomic<bool>>(true);
-    generate_status_    = std::make_shared<GenerateStateMachine>(stream_cache_resource_);
+    generate_status_   = std::make_shared<GenerateStateMachine>(stream_cache_resource_);
     sub_generate_status_.reserve(maxBatchSize());
     sub_generate_status_.clear();
     resizeSubGenerateStatus(init_batch_size);
@@ -122,9 +123,8 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     if (!input->fake_query && chunk_size > 0 && input->generate_config->isPrefillOnly()
         && !model_config.hidden_state_capture_layer_ids.empty()
         && (resource_context.role_type == RoleType::PREFILL || resource_context.role_type == RoleType::PDFUSION)) {
-        reportEvent(StreamEvents::Error,
-                    ErrorCode::INVALID_PARAMS,
-                    "chunked prefill incompatible: hidden_state_capture");
+        reportEvent(
+            StreamEvents::Error, ErrorCode::INVALID_PARAMS, "chunked prefill incompatible: hidden_state_capture");
         return;
     }
     if (!input->fake_query && chunk_size > 0
@@ -138,13 +138,12 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
                              config.return_hidden_states                     ? "return_hidden_states" :
                              config.return_all_hidden_states                 ? "return_all_hidden_states" :
                              getReturnAllProbs() != ReturnAllProbsMode::NONE ? "return_all_probs" :
-                             input->custom_output_token_position >= 0       ? "custom_output" :
+                             input->custom_output_token_position >= 0        ? "custom_output" :
                              multimodalFeaturesLength() != 0                 ? "multimodal" :
                                                                                nullptr;
         if (reason != nullptr) {
-            reportEvent(StreamEvents::Error,
-                        ErrorCode::INVALID_PARAMS,
-                        "chunked prefill incompatible: " + std::string(reason));
+            reportEvent(
+                StreamEvents::Error, ErrorCode::INVALID_PARAMS, "chunked prefill incompatible: " + std::string(reason));
             return;
         }
         setChunkSize(static_cast<int>(chunk_size));
@@ -250,37 +249,122 @@ absl::Status GenerateStream::incrKVBlock() {
 
 void GenerateStream::releaseResource() {
     RTP_LLM_PROFILE_FUNCTION();
-    // Return KV blocks only after all workers that captured this stream finish.
-    // Earlier release could let a worker write into blocks owned by another stream.
-    waitPendingAsyncBookkeeping();
+    // Return KV blocks only after all workers that captured this stream finish
+    // and their recorded GPU work has been confirmed complete.
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(async_bookkeeping_->mu);
+            async_bookkeeping_->cv.wait(
+                lk, [this] { return async_bookkeeping_->count.load(std::memory_order_acquire) == 0; });
+            if (async_bookkeeping_->gpu_unconfirmed) {
+                return;
+            }
+        }
+        std::lock_guard<std::mutex> lock(*mutex_);
+        {
+            std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+            if (async_bookkeeping_->gpu_unconfirmed) {
+                return;
+            }
+            if (async_bookkeeping_->count.load(std::memory_order_acquire) > 0) {
+                continue;
+            }
+        }
+        if (!stream_cache_resource_->isResourceReleased()) {
+            stream_cache_resource_->releaseResource();
+        }
+        return;
+    }
+}
+
+void GenerateStream::tryReleaseResourceAfterBookkeeping() {
+    // A worker must never wait on cv for another task queued on its own runner.
+    // Recheck under mutex_ and re-defer if another claim arrived in between.
     std::lock_guard<std::mutex> lock(*mutex_);
+    {
+        std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+        if (async_bookkeeping_->gpu_unconfirmed) {
+            return;
+        }
+        if (async_bookkeeping_->count.load(std::memory_order_acquire) > 0) {
+            async_bookkeeping_->defer_release = true;
+            return;
+        }
+    }
     if (!stream_cache_resource_->isResourceReleased()) {
         stream_cache_resource_->releaseResource();
     }
 }
 
 void GenerateStream::incPendingAsyncBookkeeping() {
+    std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
     async_bookkeeping_->count.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void GenerateStream::decPendingAsyncBookkeepingAndMaybeRelease() {
-    int prev = async_bookkeeping_->count.fetch_sub(1, std::memory_order_acq_rel);
-    RTP_LLM_CHECK(prev >= 1);
-    if (prev == 1) {
-        {
-            std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+void GenerateStream::decPendingAsyncBookkeepingAndMaybeRelease(bool                gpu_completed,
+                                                               std::exception_ptr* err_out) noexcept {
+    if (!gpu_completed) {
+        // Publish Error before decrementing pending count so any waiter or
+        // scheduler waking on count == 0 already observes the terminal error.
+        try {
+            std::lock_guard<std::mutex> lock(*mutex_);
+            if (generate_status_->error_info.ok()) {
+                generate_status_->error_info.setErrorCode(ErrorCode::EXECUTION_EXCEPTION);
+            }
+            reportEventWithoutLock(StreamEvents::Error);
+        } catch (...) {}
+    }
+    int  prev           = 0;
+    bool should_release = false;
+    {
+        std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+        if (!gpu_completed) {
+            async_bookkeeping_->gpu_unconfirmed = true;
         }
+        prev = async_bookkeeping_->count.fetch_sub(1, std::memory_order_acq_rel);
+        RTP_LLM_CHECK(prev >= 1);
+        if (prev == 1 && async_bookkeeping_->defer_release) {
+            async_bookkeeping_->defer_release = false;
+            should_release                    = !async_bookkeeping_->gpu_unconfirmed;
+        }
+    }
+    if (prev == 1) {
         async_bookkeeping_->cv.notify_all();
-        // The last worker performs any deferred release after its update lock
-        // has unwound, so releaseResource() can safely re-enter mutex_.
-        if (async_bookkeeping_->defer_release.exchange(false, std::memory_order_acq_rel)) {
-            releaseResource();
+        // The last worker performs any deferred release without waiting on cv,
+        // avoiding self-deadlock if another task is queued on the same runner.
+        if (should_release) {
+            try {
+                tryReleaseResourceAfterBookkeeping();
+            } catch (const std::exception& e) {
+                if (err_out != nullptr && !*err_out) {
+                    *err_out = std::current_exception();
+                }
+                try {
+                    RTP_LLM_LOG_ERROR("Deferred releaseResource failed: %s", e.what());
+                } catch (...) {}
+            } catch (...) {
+                if (err_out != nullptr && !*err_out) {
+                    *err_out = std::current_exception();
+                }
+                try {
+                    RTP_LLM_LOG_ERROR("Deferred releaseResource failed with unknown exception");
+                } catch (...) {}
+            }
         }
     }
 }
 
+int GenerateStream::pendingAsyncBookkeepingCount() const {
+    return async_bookkeeping_->count.load(std::memory_order_acquire);
+}
+
 bool GenerateStream::hasPendingAsyncBookkeeping() const {
-    return async_bookkeeping_->count.load(std::memory_order_acquire) > 0;
+    return pendingAsyncBookkeepingCount() > 0;
+}
+
+bool GenerateStream::hasUnconfirmedAsyncGpuAccess() const {
+    std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+    return async_bookkeeping_->gpu_unconfirmed;
 }
 
 void GenerateStream::waitPendingAsyncBookkeeping() {
@@ -288,12 +372,21 @@ void GenerateStream::waitPendingAsyncBookkeeping() {
     async_bookkeeping_->cv.wait(lk, [this] { return async_bookkeeping_->count.load(std::memory_order_acquire) == 0; });
 }
 
-void GenerateStream::markDeferredRelease() {
-    async_bookkeeping_->defer_release.store(true, std::memory_order_release);
+bool GenerateStream::tryMarkDeferredRelease() {
+    std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+    if (async_bookkeeping_->gpu_unconfirmed) {
+        return true;
+    }
+    if (async_bookkeeping_->count.load(std::memory_order_acquire) > 0) {
+        async_bookkeeping_->defer_release = true;
+        return true;
+    }
+    return false;
 }
 
 bool GenerateStream::isDeferredReleasePending() const {
-    return async_bookkeeping_->defer_release.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lk(async_bookkeeping_->mu);
+    return async_bookkeeping_->defer_release;
 }
 void GenerateStream::setNeedReleaseResource(bool need_release_resource) {
     need_release_resource_ = need_release_resource;
@@ -305,13 +398,24 @@ int GenerateStream::nextNeedBlockNums(int reserve_step) const {
 }
 
 int GenerateStream::estimateKVNeedBlocks(int remaining_tokens, int target_batch_size) const {
-    const int reserve_step   = complete_token_ids_->getReserveStep();
-    int       common_seq_len = std::min(complete_token_ids_->commonSeqLength(), seqLength());
+    // Observe pending state before seqLength() so a concurrent worker commit
+    // (update release -> dec acq_rel) cannot make us read a stale seqLength()
+    // while seeing pending == false and skipping the MTP upper-bound padding.
+    const bool pending      = hasPendingAsyncBookkeeping();
+    const int  seq_len      = seqLength();
+    int        reserve_step = complete_token_ids_->getReserveStep();
+    if (pending && !stream_cache_resource_->hasLinearCacheGroup()) {
+        const auto mtp_state = getMtpAsyncDeviceState();
+        if (hasMtpAsyncDecodeState(mtp_state) && mtp_state.next_seq_len_upper_bound > seq_len) {
+            reserve_step += mtp_state.next_seq_len_upper_bound - seq_len;
+        }
+    }
+    int common_seq_len = std::min(complete_token_ids_->commonSeqLength(), seq_len);
     if (target_batch_size > 1) {
         common_seq_len = common_seq_len / seqSizePerBlock() * seqSizePerBlock();
     }
     return stream_cache_resource_->estimatePeakNeedBlocks(
-        seqLength(), common_seq_len, remaining_tokens, reserve_step, target_batch_size);
+        seq_len, common_seq_len, remaining_tokens, reserve_step, target_batch_size);
 }
 
 int GenerateStream::estimateInitialNeedBlocks() const {
@@ -453,11 +557,36 @@ bool GenerateStream::returnCumLogProbs() const {
 }
 
 bool GenerateStream::genTimeline() const {
-    return genTimelineAtSeqLength(seqLength());
+    if (!gen_timeline_) {
+        return false;
+    }
+    const int threshold = inputLength() + profileStep() - 1;
+    if (hasPendingAsyncBookkeeping()) {
+        const int normal_seq_len = getNormalAsyncDeviceState().next_real_seq_len;
+        if (normal_seq_len > 0) {
+            return normal_seq_len <= threshold;
+        }
+        const auto mtp_state = getMtpAsyncDeviceState();
+        if (mtp_state.next_seq_len_upper_bound > 0) {
+            if (mtp_state.next_seq_len_upper_bound <= threshold) {
+                return true;
+            }
+            if (mtp_state.next_seq_len_lower_bound > 0 && mtp_state.next_seq_len_lower_bound > threshold) {
+                return false;
+            }
+        }
+        std::unique_lock<std::mutex> lk(async_bookkeeping_->mu);
+        async_bookkeeping_->cv.wait(lk,
+                                    [this] { return async_bookkeeping_->count.load(std::memory_order_acquire) == 0; });
+    }
+    return seqLength() <= threshold;
 }
 
 bool GenerateStream::genTimelineAtSeqLength(int seq_length) const {
-    return seq_length <= inputLength() + profileStep() - 1 ? gen_timeline_ : false;
+    if (!gen_timeline_) {
+        return false;
+    }
+    return seq_length <= inputLength() + profileStep() - 1;
 }
 
 void GenerateStream::setGenTimeline(bool gen_timeline) {
@@ -739,7 +868,7 @@ vector<int> GenerateStream::currentExecuteTokens(int batch_idx) const {
 
 void GenerateStream::step() {
     // iter_count represents the times of the stream participates in running
-    iter_count_++;
+    iter_count_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GenerateStream::spStep() {
@@ -829,19 +958,25 @@ bool GenerateStream::reportUpdateErrorWithoutLock(const std::optional<ErrorInfo>
 }
 
 bool GenerateStream::prepareUpdateWithoutLock(const std::optional<ErrorInfo>& error_info, bool force_update_info) {
+    const bool middle_chunk = isMiddleChunk();
+    // Forced terminal updates may publish output, but must not advance a chunk.
+    // Treat pending GenerateDone (excluding PD-sep NeedRemoteGenerate handoff)
+    // as terminal so overlapped async updates—whether tokens or verify errors—
+    // cannot overwrite an already-linearized completion before moveToNext().
+    const bool terminal_pending = getStatus() == StreamState::RUNNING && hasEventWithoutLock(StreamEvents::GenerateDone)
+                                  && !hasEventWithoutLock(StreamEvents::NeedRemoteGenerate);
+    if ((hasErrorWithoutLock() || isFinished() || terminal_pending) && (!force_update_info || middle_chunk)) {
+        return false;
+    }
     if (reportUpdateErrorWithoutLock(error_info)) {
         return false;
     }
-
-    const bool middle_chunk = isMiddleChunk();
-    // Forced terminal updates may publish output, but must not advance a chunk.
-    if ((hasErrorWithoutLock() || isFinished()) && (!force_update_info || middle_chunk)) {
-        return false;
-    }
     if (middle_chunk) {
+        ++committed_iter_count_;
         advanceChunk();
         return false;
     }
+    ++committed_iter_count_;
     is_context_stream_->store(false, std::memory_order_release);
     return true;
 }
@@ -948,7 +1083,14 @@ StreamState GenerateStream::moveToNext() {
             && !generate_status_->checkFinished()) {
             return old_status;
         }
-        state                 = generate_status_->moveToNext();
+        try {
+            state = generate_status_->moveToNext();
+        } catch (...) {
+            if (getStatus() != old_status) {
+                consumer_cv_->notify_all();
+            }
+            throw;
+        }
         const auto new_status = getStatus();
 
         if ((old_status == StreamState::WAITING && new_status != StreamState::WAITING)
@@ -977,19 +1119,53 @@ StreamState GenerateStream::moveToNext() {
 }
 
 bool GenerateStream::needsAsyncBookkeepingJoinForKvReservation() const {
-    if (getStatus() != StreamState::RUNNING || !hasPendingAsyncBookkeeping()) {
+    const int pending_count = pendingAsyncBookkeepingCount();
+    if (getStatus() != StreamState::RUNNING || pending_count <= 0) {
         return false;
     }
 
     const auto state = getMtpAsyncDeviceState();
     // pending_async_bookkeeping_ is shared by normal decode and MTP.  Normal
-    // decode never publishes MtpAsyncDeviceState, so it must not be forced to
-    // wait on an MTP-only cache snapshot.  MTP publishes the state before it
-    // claims the async worker, making a non-zero epoch a stable mode marker.
+    // decode never publishes MtpAsyncDeviceState, so handle it separately.
+    // MTP publishes the state before claiming the async worker, making a
+    // non-zero epoch a stable mode marker.
     if (state.epoch == 0) {
+        if (stream_cache_resource_ == nullptr) {
+            return false;
+        }
+        const int normal_next_seq_len = getNormalAsyncDeviceState().next_real_seq_len;
+        if (normal_next_seq_len > 0) {
+            if (canPruneSwaBlocksWhileAsyncPending()) {
+                return false;
+            }
+            // Narrow SWA cannot prune safely while GPU work is pending; join at
+            // the block boundary symmetrically with MTP so pruning runs after
+            // completion without starving tight pools.
+            if (stream_cache_resource_->singleBatchNeedBlocks(normal_next_seq_len, static_cast<int>(reserve_step_))
+                <= 0) {
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(*mutex_);
+            return !generate_status_->checkFinished();
+        }
+        // Without NormalAsyncDeviceState (e.g. RTP_LLM_DEVICE_INPUT=0),
+        // seqLength() lags the in-flight worker by up to pending_count tokens.
+        // Join before KV reservation if those pending tokens cross a block
+        // boundary and the stream is not already finishing.
+        const int pending_seq_upper = seqLength() + pending_count;
+        if (stream_cache_resource_->singleBatchNeedBlocks(pending_seq_upper, static_cast<int>(reserve_step_)) <= 0) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(*mutex_);
+        return !generate_status_->checkFinished();
+    }
+    if (state.next_seq_len_upper_bound <= 0 || stream_cache_resource_ == nullptr) {
+        return true;
+    }
+    if (canReserveMtpCacheWithoutBookkeepingJoin(state)) {
         return false;
     }
-    if (!hasMtpCacheSnapshot(state) || state.next_seq_len_upper_bound <= 0 || stream_cache_resource_ == nullptr) {
+    if (!hasMtpCacheSnapshot(state)) {
         return true;
     }
 
@@ -999,6 +1175,58 @@ bool GenerateStream::needsAsyncBookkeepingJoinForKvReservation() const {
     return stream_cache_resource_->singleBatchNeedBlocks(state.next_seq_len_upper_bound,
                                                          static_cast<int>(reserve_step_))
            > 0;
+}
+
+bool GenerateStream::hasSafeSwaRetainedTailForAsyncOverlap(int max_advance) const {
+    if (max_advance <= 0 || !stream_cache_resource_ || maxBatchSize() != 1 || hasNumBeams()
+        || hasUnconfirmedAsyncGpuAccess()) {
+        return false;
+    }
+    const auto& manager = stream_cache_resource_->resourceContext().cache_manager;
+    if (!manager || (manager->cpSlotMapper() && manager->cpSlotMapper()->isSharded())) {
+        return false;
+    }
+    for (const auto& group : manager->cacheConfig().topology().groups()) {
+        if (group.policy.group_type == CacheGroupType::LINEAR) {
+            return false;
+        }
+        if (group.policy.group_type != CacheGroupType::SWA) {
+            continue;
+        }
+        const int64_t block_tokens = static_cast<int64_t>(group.seqSizePerBlock());
+        const int64_t retained_pages =
+            static_cast<int64_t>(std::max(1u, group.policy.active_tail_blocks)) + static_cast<int64_t>(reserve_step_);
+        // pre-sampler joins the preceding host commit before another dispatch.
+        // Thus the oldest unfinished KV consumer is at most two advances behind
+        // this bound. Account for window, forward reservation, and page
+        // alignment; pruning beyond this retained tail cannot touch its pages.
+        // A state-cache group without a declared window conservatively needs a
+        // whole logical page.
+        const int64_t history_tokens = group.policy.sliding_window_size > 0 ?
+                                           static_cast<int64_t>(group.policy.sliding_window_size) :
+                                           block_tokens;
+        if (block_tokens <= 0 || retained_pages < 2
+            || (retained_pages - 1) * block_tokens
+                   < history_tokens + 2LL * max_advance + static_cast<int64_t>(reserve_step_) + 2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool GenerateStream::canPruneSwaBlocksWhileAsyncPending() const {
+    const auto mtp_state = getMtpAsyncDeviceState();
+    const int  max_advance =
+        mtp_state.epoch > 0 ? mtp_state.max_mtp_advance : std::max(1, pendingAsyncBookkeepingCount());
+    return hasSafeSwaRetainedTailForAsyncOverlap(max_advance);
+}
+
+bool GenerateStream::canReserveMtpCacheWithoutBookkeepingJoin(const MtpAsyncDeviceState& state) const {
+    if (!state.allow_async_cache_reservation || state.max_mtp_advance <= 0 || state.next_seq_len_upper_bound <= 0
+        || !hasMtpAsyncDecodeState(state)) {
+        return false;
+    }
+    return hasSafeSwaRetainedTailForAsyncOverlap(state.max_mtp_advance);
 }
 
 bool GenerateStream::hasError() const {
@@ -1039,7 +1267,7 @@ std::string GenerateStream::stopReason() {
 }
 
 size_t GenerateStream::iterCount() const {
-    return iter_count_;
+    return iter_count_.load(std::memory_order_relaxed);
 }
 
 size_t GenerateStream::spIterCount() const {
@@ -1516,7 +1744,7 @@ void GenerateStream::reportStreamMetrics() {
             collector.effective_context_length =
                 std::max<int64_t>(0, collector.input_token_length - initial_reuse_length);
             collector.output_token_length    = outputTokenLen();
-            collector.iterate_count          = iter_count_;
+            collector.iterate_count          = iter_count_.load(std::memory_order_relaxed);
             collector.query_batch_size       = maxBatchSize();
             collector.total_latency_us       = autil::TimeUtility::currentTimeInMicroSeconds() - begin_time_us_;
             collector.first_token_latency_us = complete_token_ids_->firstTokenLatencyUs();

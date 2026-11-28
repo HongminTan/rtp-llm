@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "torch/all.h"
@@ -69,12 +70,12 @@ private:
     int max_seq_len_;
     int seq_size_per_block_;
 
-    int     seq_length_;
-    int     common_len_;
-    int     start_check_seq_length_;
-    int     reserve_step_           = 0;
-    int64_t first_token_time_us_    = 0;
-    int64_t first_token_latency_us_ = 0;
+    std::atomic<int> seq_length_{0};
+    std::atomic<int> common_len_{0};
+    int              start_check_seq_length_;
+    int              reserve_step_           = 0;
+    int64_t          first_token_time_us_    = 0;
+    int64_t          first_token_latency_us_ = 0;
 
     torch::Tensor                           complete_token_ids_;
     std::shared_ptr<const V41RequestInputs> v41_inputs_;

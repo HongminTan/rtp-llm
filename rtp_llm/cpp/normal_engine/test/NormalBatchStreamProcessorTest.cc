@@ -1006,6 +1006,85 @@ TEST_F(NormalBatchStreamProcessorTest, testMixedEmptyAndNonEmptyOrdinaryResource
     EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_kernel_block_id[0][1]), (std::vector<int32_t>{1, 2, 3}));
 }
 
+TEST_F(NormalBatchStreamProcessorTest, testBoundaryGrownMtpAsyncDecodeStreamUsesHostBlocksWithoutReadingTokenHistory) {
+    ModelConfig model;
+    model.num_layers  = 1;
+    model.vocab_size  = 16;
+    model.max_seq_len = 128;
+
+    CacheConfig config;
+    config.layer_num = 1;
+    initFullCacheConfig(config, model.num_layers);
+
+    auto make_decode_stream = [&](std::vector<int32_t> tokens, BatchKVCacheResource resource) {
+        auto query             = std::make_shared<GenerateInput>();
+        query->input_ids       = hostIntBuffer(tokens);
+        query->generate_config = std::make_shared<GenerateConfig>();
+        auto stream = std::make_shared<NormalGenerateStream>(query, model, RuntimeConfig{}, ResourceContext{}, nullptr);
+        stream->generate_status_->status = StreamState::RUNNING;
+        stream->setIsContextStream(false);
+        stream->setKVCache(std::move(resource));
+        return stream;
+    };
+
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+
+    // Stream 0: steady MTP decode stream with GPU block-table snapshot (width 3) and empty host resource.
+    BatchKVCacheResource empty_resource;
+    empty_resource.resetBatchSize(1);
+    auto steady = make_decode_stream({999}, std::move(empty_resource));
+    {
+        GenerateStream::MtpAsyncDeviceState state;
+        state.async_decode_state_ready          = true;
+        state.next_seq_len_upper_bound          = 4;
+        state.next_kv_cache_block_id_gpu        = torch::tensor({11, 12, 13}, cuda_i32).reshape({1, 1, 3});
+        state.next_kv_cache_kernel_block_id_gpu = torch::tensor({101, 102, 103}, cuda_i32).reshape({1, 1, 3});
+        steady->setMtpAsyncDeviceState(std::move(state));
+    }
+
+    // Stream 1: boundary-grown MTP decode stream (GPU snapshot cleared, async_decode_state_ready still true).
+    // Out-of-vocab token 999 in complete_token_ids proves gatherer never touches worker-owned token history.
+    BatchKVCacheResource grown_resource;
+    grown_resource.resetBatchSize(1);
+    grown_resource.initGroups(config.topologyPtr());
+    grown_resource.setBatchBlocks(0, "default", {21, 22, 23, 24});
+    auto grown = make_decode_stream({999}, std::move(grown_resource));
+    {
+        GenerateStream::MtpAsyncDeviceState state;
+        state.async_decode_state_ready          = true;
+        state.next_seq_len_upper_bound          = 5;
+        state.next_kv_cache_block_id_gpu        = torch::tensor({21, 22, 23}, cuda_i32).reshape({1, 1, 3});
+        state.next_kv_cache_kernel_block_id_gpu = torch::tensor({21, 22, 23}, cuda_i32).reshape({1, 1, 3});
+        grown->setMtpAsyncDeviceState(std::move(state));
+        grown->clearMtpCacheSnapshot();
+    }
+    ASSERT_FALSE(grown->hasMtpCacheSnapshot());
+    ASSERT_TRUE(grown->hasMtpAsyncDecodeState());
+
+    StreamGroups groups({steady, grown});
+    EXPECT_EQ(groups.totalDecodeBatchSize(), 2u);
+    EXPECT_EQ(groups.curBlocksNum(), 4u);
+    EXPECT_EQ(groups.maxSeqLen(), 5u);
+
+    NormalBatchStreamProcessor processor(model, PDSepConfig{}, ProfilingDebugLoggingConfig{}, config, false);
+    TensorHolder               holder;
+
+    auto inputs = processor.gatherModelInput(groups, holder);
+    ASSERT_TRUE(inputs.ok()) << inputs.status().ToString();
+    ASSERT_EQ(inputs->kv_cache_block_id.size(2), 4);
+    ASSERT_EQ(inputs->kv_cache_kernel_block_id.size(2), 4);
+    EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_block_id[0][0]), (std::vector<int32_t>{0, 0, 0, 0}));
+    EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_block_id[0][1]), (std::vector<int32_t>{21, 22, 23, 24}));
+    EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_kernel_block_id[0][0]), (std::vector<int32_t>{0, 0, 0, 0}));
+    EXPECT_EQ(toVec<int32_t>(inputs->kv_cache_kernel_block_id[0][1]), (std::vector<int32_t>{21, 22, 23, 24}));
+
+    auto kernel_table = processor.gatherKvCacheKernelBlockId(groups, {"default"}, holder);
+    ASSERT_TRUE(kernel_table.ok()) << kernel_table.status().ToString();
+    ASSERT_EQ(kernel_table->size(2), 4);
+    EXPECT_EQ(toVec<int32_t>((*kernel_table)[0][0]), (std::vector<int32_t>{101, 102, 103, 0}));
+    EXPECT_EQ(toVec<int32_t>((*kernel_table)[0][1]), (std::vector<int32_t>{21, 22, 23, 24}));
+}
+
 TEST_F(NormalBatchStreamProcessorTest, testGatherDistinguishesEmptyAndUnknownGroup) {
     ModelConfig model;
     model.num_layers  = 2;

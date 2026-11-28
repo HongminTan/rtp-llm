@@ -125,7 +125,13 @@ void StreamCacheResource::releaseResource() {
                       stream_->streamId(),
                       curBlocksNum(),
                       pd_kvcache_ref_.get());
-    tryReleaseKVBlock(curBlocksNum());
+    try {
+        tryReleaseKVBlock(curBlocksNum());
+    } catch (...) {
+        batch_kv_cache_resource_->clearBlocks();
+        resource_released_ = true;
+        throw;
+    }
     batch_kv_cache_resource_->clearBlocks();
     resource_released_ = true;
 }
@@ -149,6 +155,7 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
     RTP_LLM_CHECK(nums == total_blocks);
 
     if (total_blocks > 0) {
+        std::exception_ptr first_err;
         if (reuseCache() && !stream_->hasErrorWithoutLock() && stream_->getStatus() == StreamState::FINISHED) {
             const Tier target_tier = storeTarget();
             RTP_LLM_LOG_DEBUG("tryReleaseKVBlock: stream=%ld, storing cache, curBlocksNum=%d, target_tier=%s",
@@ -156,9 +163,20 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
                               total_blocks,
                               tierName(target_tier));
             if (target_tier != Tier::NONE) {
-                InsertInfo insert_info{batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), false, target_tier};
-                size_t     resident_prefix_length = 0;
-                resource_context_.cache_manager->insertIntoCache(insert_info, resident_prefix_length);
+                try {
+                    // The final sampled token has not been forwarded, so materialized KV
+                    // covers only the prefix [0, seqLength - 1).
+                    if (stream_->seqLength() > stream_->inputLength()) {
+                        resource_context_.cache_manager->syncCacheKeys(
+                            batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), stream_->seqLength() - 1);
+                    }
+                    InsertInfo insert_info{
+                        batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), false, target_tier};
+                    size_t resident_prefix_length = 0;
+                    resource_context_.cache_manager->insertIntoCache(insert_info, resident_prefix_length);
+                } catch (...) {
+                    first_err = std::current_exception();
+                }
             }
         } else {
             RTP_LLM_LOG_DEBUG("tryReleaseKVBlock: stream=%ld, NOT storing cache, reuseCache=%d, hasError=%d, status=%s",
@@ -171,7 +189,16 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
         FreeInfo free_info{batch_kv_cache_resource_, stream_->completeTokenIdsPtr()};
         free_info.request_id = stream_->streamId();
 
-        resource_context_.cache_manager->free(free_info);
+        try {
+            resource_context_.cache_manager->free(free_info);
+        } catch (...) {
+            if (!first_err) {
+                first_err = std::current_exception();
+            }
+        }
+        if (first_err) {
+            std::rethrow_exception(first_err);
+        }
     }
 
     return total_blocks;
@@ -423,14 +450,18 @@ absl::Status StreamCacheResource::incrKVBlock(int seq_len_override) {
     }
 
     MallocInfo malloc_info;
-    malloc_info.batch_kv_cache_resource      = batch_kv_cache_resource_;
-    malloc_info.complete_token_ids           = stream_->completeTokenIdsPtr();
-    malloc_info.request_id                   = stream_->streamId();
-    malloc_info.verbose                      = malloc_failed_times_ >= 10 ? malloc_failed_times_ % 100 == 0 : true;
-    malloc_info.reuse_cache                  = reuseCache();
-    malloc_info.enable_cache_lookup          = enableCacheLookup();
-    malloc_info.enable_remove_skipped_blocks = !(stream_->chunkedPrefillEnabled() && stream_->isContextStream());
-    malloc_info.incr_seq_len_override        = seq_len_override;
+    malloc_info.batch_kv_cache_resource = batch_kv_cache_resource_;
+    malloc_info.complete_token_ids      = stream_->completeTokenIdsPtr();
+    malloc_info.request_id              = stream_->streamId();
+    malloc_info.verbose                 = malloc_failed_times_ >= 10 ? malloc_failed_times_ % 100 == 0 : true;
+    malloc_info.reuse_cache             = reuseCache();
+    malloc_info.enable_cache_lookup     = enableCacheLookup();
+    const bool block_swa_prune_for_async_gpu =
+        stream_->hasUnconfirmedAsyncGpuAccess()
+        || (stream_->hasPendingAsyncBookkeeping() && !stream_->canPruneSwaBlocksWhileAsyncPending());
+    malloc_info.enable_remove_skipped_blocks =
+        !(stream_->chunkedPrefillEnabled() && stream_->isContextStream()) && !block_swa_prune_for_async_gpu;
+    malloc_info.incr_seq_len_override = seq_len_override;
 
     auto result = resource_context_.cache_manager->malloc(malloc_info);
     if (!result.success) {
@@ -596,6 +627,16 @@ void StreamCacheResource::swapLinearBlocks(int32_t batch_id, size_t rhs, size_t 
             batch_kv_cache_resource_->swapBlocks(batch_id, group.tag, rhs, lhs);
         }
     }
+}
+
+bool StreamCacheResource::hasLinearCacheGroup() const {
+    if (resource_context_.cache_manager == nullptr) {
+        return false;
+    }
+    const auto& groups = resource_context_.cache_manager->cacheConfig().topology().groups();
+    return std::any_of(groups.begin(), groups.end(), [](const auto& group) {
+        return group.policy.group_type == CacheGroupType::LINEAR;
+    });
 }
 
 void StreamCacheResource::holdKVCacheForPDSep() {

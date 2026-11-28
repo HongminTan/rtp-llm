@@ -794,41 +794,37 @@ absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           s
     auto  sampler_output_copy = std::move(sampler_output);
 
     // Claim each stream's KV resource before handing work to the runner so
-    // releaseResource defers while the worker reads/updates those blocks.
-    auto streams_for_inc = stream_groups_copy.allStreams();
-    for (auto& s : streams_for_inc) {
-        s->incPendingAsyncBookkeeping();
-    }
+    // releaseResource defers while the worker and GPU round still use those blocks.
+    auto hold = std::make_shared<AsyncBookkeepingHold>(stream_groups_copy.allStreams(), sampler_event);
 
     dispatch_runner_.launch([processor,
+                             hold,
                              stream_groups_copy  = std::move(stream_groups_copy),
                              model_output_copy   = std::move(model_output_copy),
                              sampler_output_copy = std::move(sampler_output_copy),
                              sampler_event]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.dispatch_output_worker");
 
-        auto worker_streams = stream_groups_copy.allStreams();
-
-        // RAII: every captured stream is decremented exactly once, and the
-        // value capture keeps GenerateStreamPtr alive until after dec runs.
-        auto dec_guard = std::shared_ptr<void>(nullptr, [worker_streams](void*) {
-            for (auto& s : worker_streams) {
-                s->decPendingAsyncBookkeepingAndMaybeRelease();
+        std::exception_ptr worker_err;
+        try {
+            // Queue a stream wait, then do pinned D2H on the worker stream while
+            // the main thread continues to the next gather.
+            if (sampler_event) {
+                sampler_event->block(cuda_graph::graphGetCurrentStream());
             }
-        });
 
-        // Queue a stream wait, then do pinned D2H on the worker stream while
-        // the main thread continues to the next gather.
-        if (sampler_event) {
-            sampler_event->block(cuda_graph::graphGetCurrentStream());
+            auto status =
+                processor->dispatch(stream_groups_copy, {std::move(model_output_copy), std::move(sampler_output_copy)});
+            if (!status.ok()) {
+                RTP_LLM_LOG_ERROR("[normal-stream-async] dispatch (worker) failed: %s", status.ToString().c_str());
+            }
+        } catch (...) {
+            worker_err = std::current_exception();
         }
-
-        auto status =
-            processor->dispatch(stream_groups_copy, {std::move(model_output_copy), std::move(sampler_output_copy)});
-        if (!status.ok()) {
-            RTP_LLM_LOG_ERROR("[normal-stream-async] dispatch (worker) failed: %s", status.ToString().c_str());
+        hold->finish(&worker_err);
+        if (worker_err) {
+            std::rethrow_exception(worker_err);
         }
-        // dec_guard destructs here, dec'ing each stream's pending count.
     });
 
     // Kineto requires profiler enable/disable on the same thread. Keep finish

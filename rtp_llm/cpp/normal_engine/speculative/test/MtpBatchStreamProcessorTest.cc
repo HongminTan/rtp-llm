@@ -2071,6 +2071,207 @@ TEST_F(MtpBatchStreamProcessorTest, testCacheSnapshotOverlayKeepsPhysicalKernelP
     EXPECT_ANY_THROW(processor.overlayMtpCacheSnapshots(StreamGroups({steady, fresh}), too_narrow, holder));
 }
 
+TEST_F(MtpBatchStreamProcessorTest, testCacheSnapshotOverlayPreservesBoundaryGrownAsyncDecodeRow) {
+    ModelConfig                 model_config;
+    RuntimeConfig               runtime_config;
+    SpeculativeExecutionConfig  sp_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
+    model_config.max_seq_len                 = 2048;
+    model_config.vocab_size                  = 8;
+    model_config.num_layers                  = 1;
+    sp_config.gen_num_per_cycle              = 3;
+
+    ResourceContext resource_context;
+    auto            steady0 = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
+    auto            grown   = createContextStream(model_config, runtime_config, resource_context, {2}, 2);
+    auto            steady2 = createContextStream(model_config, runtime_config, resource_context, {3}, 3);
+    steady0->setIsContextStream(false);
+    grown->setIsContextStream(false);
+    steady2->setIsContextStream(false);
+
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    auto       publish  = [&](const GenerateStreamPtr& stream, std::vector<int32_t> phys, std::vector<int32_t> kern) {
+        GenerateStream::MtpAsyncDeviceState state;
+        state.async_decode_state_ready   = true;
+        state.next_seq_len_upper_bound   = 8;
+        state.next_kv_cache_block_id_gpu = torch::tensor(phys, torch::kInt32).reshape({1, 1, -1}).to(cuda_i32);
+        state.next_kv_cache_kernel_block_id_gpu = torch::tensor(kern, torch::kInt32).reshape({1, 1, -1}).to(cuda_i32);
+        stream->setMtpAsyncDeviceState(std::move(state));
+    };
+    publish(steady0, {11, 12, 13}, {101, 102, 103});
+    publish(grown, {21, 22, 23}, {201, 202, 203});
+    publish(steady2, {31, 32, 33}, {301, 302, 303});
+
+    // Simulate handleRunning() growing the middle stream at a block boundary:
+    // GPU block-table snapshot is cleared, while async_decode_state_ready remains true.
+    grown->clearMtpCacheSnapshot();
+    ASSERT_FALSE(grown->hasMtpCacheSnapshot());
+    ASSERT_TRUE(grown->hasMtpAsyncDecodeState());
+
+    GptModelInputs model_input;
+    auto           pinned_i32            = torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true);
+    model_input.kv_cache_block_id        = torch::zeros({1, 3, 5}, pinned_i32);
+    model_input.kv_cache_kernel_block_id = torch::zeros({1, 3, 5}, pinned_i32);
+    model_input.kv_cache_block_id.select(1, 1).copy_(torch::tensor({21, 22, 23, 24, 25}, torch::kInt32));
+    model_input.kv_cache_kernel_block_id.select(1, 1).copy_(torch::tensor({201, 202, 203, 204, 205}, torch::kInt32));
+
+    TestableMtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+    TensorHolder holder;
+    processor.overlayMtpCacheSnapshots(StreamGroups({steady0, grown, steady2}), model_input, holder);
+
+    ASSERT_TRUE(model_input.kv_cache_block_id.is_cuda());
+    ASSERT_TRUE(model_input.kv_cache_kernel_block_id.is_cuda());
+    EXPECT_EQ((std::vector<int32_t>{11, 12, 13, 0, 0}), toVec<int32_t>(model_input.kv_cache_block_id.select(1, 0)));
+    EXPECT_EQ((std::vector<int32_t>{21, 22, 23, 24, 25}), toVec<int32_t>(model_input.kv_cache_block_id.select(1, 1)));
+    EXPECT_EQ((std::vector<int32_t>{31, 32, 33, 0, 0}), toVec<int32_t>(model_input.kv_cache_block_id.select(1, 2)));
+    EXPECT_EQ((std::vector<int32_t>{101, 102, 103, 0, 0}),
+              toVec<int32_t>(model_input.kv_cache_kernel_block_id.select(1, 0)));
+    EXPECT_EQ((std::vector<int32_t>{201, 202, 203, 204, 205}),
+              toVec<int32_t>(model_input.kv_cache_kernel_block_id.select(1, 1)));
+    EXPECT_EQ((std::vector<int32_t>{301, 302, 303, 0, 0}),
+              toVec<int32_t>(model_input.kv_cache_kernel_block_id.select(1, 2)));
+}
+
+// Normal multi-step and 1-step MTP restore explicit position IDs from
+// next_position_ids_gpu and resolve propose tokens per row in mixed batches.
+TEST_F(MtpBatchStreamProcessorTest, testNormalMtpRestoresExplicitPositionIdsAndMixedBatchProposePerRow) {
+    ModelConfig                 model_config;
+    RuntimeConfig               runtime_config;
+    SpeculativeExecutionConfig  sp_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config           = makeProcessorCacheConfig();
+    model_config.max_seq_len                           = 2048;
+    model_config.vocab_size                            = 32;
+    model_config.num_layers                            = 1;
+    model_config.mm_model_config.mm_position_ids_style = PositionIdsStyle::MROPE;
+    model_config.attn_config.rope_config.index_factor  = 3;
+    sp_config.gen_num_per_cycle                        = 3;
+
+    ResourceContext resource_context;
+    auto            steady = createContextStream(model_config, runtime_config, resource_context, {1, 2}, 1);
+    auto            fresh  = createContextStream(model_config, runtime_config, resource_context, {3, 4}, 2);
+    steady->setIsContextStream(false);
+    fresh->setIsContextStream(false);
+    steady->generateContextPositionIds();
+    fresh->generateContextPositionIds();
+    fresh->setSeqLength(13);  // generateNextPositionId => {12, 12, 12}
+
+    auto steady_sp    = std::make_shared<SpeculativeExecutorStreamOutput>();
+    steady_sp->tokens = torch::tensor({{1, 9}}, torch::kInt32);  // stale host proposal 9 must NOT be read
+    steady->setSPOutputBuffer(steady_sp);
+
+    auto fresh_sp    = std::make_shared<SpeculativeExecutorStreamOutput>();
+    fresh_sp->tokens = torch::tensor({{5, 6}}, torch::kInt32);  // fresh host proposal 6
+    fresh->setSPOutputBuffer(fresh_sp);
+
+    const auto                          cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    GenerateStream::MtpAsyncDeviceState state;
+    state.async_decode_state_ready = true;
+    state.next_seq_len_gpu         = torch::tensor({26}, cuda_i32);
+    state.propose_tokens_gpu       = torch::tensor({{7}}, cuda_i32);
+    state.next_position_ids_gpu    = torch::tensor({{25, 25, 25}}, cuda_i32);
+    state.accept_tokens_gpu        = torch::tensor({{10, 11, 12, 13}}, cuda_i32);
+    state.accept_len_gpu           = torch::tensor({2}, cuda_i32);
+    steady->setMtpAsyncDeviceState(std::move(state));
+
+    // NormalModelInputGatherer leaves sentinel zeros for steady row and real host coords for fresh row.
+    GptModelInputs model_input;
+    model_input.input_lengths      = torch::tensor({1, 1}, torch::kInt32);
+    model_input.sequence_lengths   = torch::tensor({0, 12}, torch::kInt32);
+    model_input.combo_position_ids = torch::tensor({0, 0, 0, 12, 12, 12}, torch::kInt32);
+
+    TestableMtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+    TensorHolder holder;
+    StreamGroups groups({steady, fresh});
+    processor.prepareDecodeDraftModelInput(groups, model_input, holder);
+
+    // First draft forward sees exact non-zero position 25 for steady and 12 for fresh; tokens {7, 6}.
+    EXPECT_EQ((std::vector<int32_t>{7, 6}), toVec<int32_t>(model_input.combo_tokens));
+    EXPECT_EQ((std::vector<int32_t>{25, 12}), toVec<int32_t>(model_input.sequence_lengths));
+    EXPECT_EQ((std::vector<int32_t>{25, 25, 25, 12, 12, 12}), toVec<int32_t>(model_input.combo_position_ids));
+
+    // Target verify expansion uses steady GPU base (25) and fresh host base (12) without racing steady host seqLength.
+    processor.expandTargetVerifyPositionIds(groups, model_input, &holder);
+    EXPECT_EQ((std::vector<int32_t>{25, 25, 25, 26, 26, 26, 27, 27, 27, 28, 28, 28,
+                                    12, 12, 12, 13, 13, 13, 14, 14, 14, 15, 15, 15}),
+              toVec<int32_t>(model_input.combo_position_ids));
+
+    // One-step MTP fast path also expands combo_position_ids to verify width (2).
+    sp_config.gen_num_per_cycle = 1;
+    TestableMtpBatchStreamProcessor one_step_processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+    GptModelInputs one_step_input;
+    one_step_input.input_lengths      = torch::tensor({1}, torch::kInt32);
+    one_step_input.sequence_lengths   = torch::tensor({0}, torch::kInt32);
+    one_step_input.combo_position_ids = torch::tensor({0, 0, 0}, torch::kInt32);
+    one_step_processor.prepareOneStepSpecDecodeModelInput(StreamGroups({steady}), one_step_input, holder);
+    EXPECT_EQ((std::vector<int32_t>{25, 25, 25, 26, 26, 26}), toVec<int32_t>(one_step_input.combo_position_ids));
+}
+
+// Remaining short steady streams shrink the batch block-table width back to
+// their valid block count after a wider stream exits.
+TEST_F(MtpBatchStreamProcessorTest, testCacheSnapshotOverlayShrinksTableWidthAfterLongStreamExits) {
+    ModelConfig                 model_config;
+    RuntimeConfig               runtime_config;
+    SpeculativeExecutionConfig  sp_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
+    model_config.max_seq_len                 = 2048;
+    model_config.vocab_size                  = 8;
+    model_config.num_layers                  = 1;
+    sp_config.gen_num_per_cycle              = 3;
+
+    ResourceContext resource_context;
+    auto            short_steady = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
+    auto            short_fresh  = createContextStream(model_config, runtime_config, resource_context, {2}, 2);
+    short_steady->setIsContextStream(false);
+    short_fresh->setIsContextStream(false);
+
+    BatchKVCacheResource fresh_res;
+    fresh_res.resetBatchSize(1);
+    fresh_res.initGroups(cache_config.topologyPtr());
+    fresh_res.setBatchBlocks(0, "default", {31, 32});
+    short_fresh->setKVCache(std::move(fresh_res));
+    auto fresh_sp           = std::make_shared<SpeculativeExecutorStreamOutput>();
+    fresh_sp->hidden_states = torch::zeros({1, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    short_fresh->setSPOutputBuffer(fresh_sp);
+
+    // short_steady carries an 8-wide padded view from an earlier batch containing
+    // an 8-block long stream, while its own valid block width is only 2.
+    const auto                          cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    GenerateStream::MtpAsyncDeviceState state;
+    state.async_decode_state_ready          = true;
+    state.next_seq_len_upper_bound          = 4;
+    state.next_kv_cache_block_id_gpu        = torch::tensor({11, 12, 0, 0, 0, 0, 0, 0}, cuda_i32).reshape({1, 1, 8});
+    state.next_kv_cache_kernel_block_id_gpu = torch::tensor({101, 102, 0, 0, 0, 0, 0, 0}, cuda_i32).reshape({1, 1, 8});
+    state.next_kv_cache_physical_blocks     = 2;
+    state.next_kv_cache_kernel_blocks       = 2;
+    state.last_hidden_states_gpu =
+        torch::zeros({1, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    short_steady->setMtpAsyncDeviceState(std::move(state));
+
+    StreamGroups groups({short_steady, short_fresh});
+    EXPECT_EQ(groups.curBlocksNum(), 2u);
+
+    TestableMtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+    TensorHolder holder;
+    auto         gathered = processor.gatherDecodeModelInput(groups, holder);
+    ASSERT_TRUE(gathered.ok()) << gathered.status().ToString();
+    ASSERT_EQ(gathered->kv_cache_block_id.size(2), 2);
+    ASSERT_EQ(gathered->kv_cache_kernel_block_id.size(2), 2);
+    EXPECT_EQ((std::vector<int32_t>{11, 12}), toVec<int32_t>(gathered->kv_cache_block_id.select(1, 0)));
+    EXPECT_EQ((std::vector<int32_t>{31, 32}), toVec<int32_t>(gathered->kv_cache_block_id.select(1, 1)));
+    EXPECT_EQ((std::vector<int32_t>{101, 102}), toVec<int32_t>(gathered->kv_cache_kernel_block_id.select(1, 0)));
+    EXPECT_EQ((std::vector<int32_t>{31, 32}), toVec<int32_t>(gathered->kv_cache_kernel_block_id.select(1, 1)));
+}
+
 TEST_F(MtpBatchStreamProcessorTest, testPrefillShiftsMultimodalMaskAndPackedLocations) {
     ModelConfig model_config;
     model_config.max_seq_len = 2048;
@@ -2111,6 +2312,98 @@ TEST_F(MtpBatchStreamProcessorTest, testPrefillShiftsMultimodalMaskAndPackedLoca
         EXPECT_EQ(input.mm_extra_input->at(0).numel(), 8);
         EXPECT_EQ(input.mm_extra_input->at(1).numel(), 8);
     }
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testOneStepMixedBatchUnifiesDevicesAndGatherPreservesInputLength) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA unavailable";
+    }
+    autil::EnvGuard device_input_guard("RTP_LLM_DEVICE_INPUT", "1");
+    autil::EnvGuard device_state_guard("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "1");
+
+    ModelConfig                 model_config;
+    RuntimeConfig               runtime_config;
+    SpeculativeExecutionConfig  sp_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
+    model_config.max_seq_len                 = 2048;
+    model_config.vocab_size                  = 8;
+    model_config.num_layers                  = 1;
+    sp_config.gen_num_per_cycle              = 1;
+
+    ResourceContext resource_context;
+    auto            steady = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3, 4}, 1);
+    auto            fresh  = createContextStream(model_config, runtime_config, resource_context, {5, 6, 7, 1}, 2);
+    steady->setIsContextStream(false);
+    fresh->setIsContextStream(false);
+
+    BatchKVCacheResource steady_res;
+    steady_res.resetBatchSize(1);
+    steady_res.initGroups(cache_config.topologyPtr());
+    steady_res.setBatchBlocks(0, "default", {11, 12});
+    steady->setKVCache(std::move(steady_res));
+
+    BatchKVCacheResource fresh_res;
+    fresh_res.resetBatchSize(1);
+    fresh_res.initGroups(cache_config.topologyPtr());
+    fresh_res.setBatchBlocks(0, "default", {21, 22});
+    fresh->setKVCache(std::move(fresh_res));
+
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    const auto cuda_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // Steady stream uses CUDA device-state proposal/probs; fresh stream falls back to CPU proposal/probs.
+    GenerateStream::MtpAsyncDeviceState state;
+    state.async_decode_state_ready          = true;
+    state.next_seq_len_upper_bound          = 6;
+    state.accept_len_gpu                    = torch::tensor({1}, cuda_i32);
+    state.accept_tokens_gpu                 = torch::tensor({{4, 0}}, cuda_i32);
+    state.next_seq_len_gpu                  = torch::tensor({6}, cuda_i32);
+    state.propose_tokens_gpu                = torch::tensor({{6}}, cuda_i32);
+    state.draft_all_probs_gpu               = torch::full({1, 8}, 0.25f, cuda_f32);
+    state.last_hidden_states_gpu            = torch::zeros({1, 2}, cuda_f32);
+    state.next_kv_cache_block_id_gpu        = torch::tensor({11, 12}, cuda_i32).reshape({1, 1, 2});
+    state.next_kv_cache_kernel_block_id_gpu = torch::tensor({11, 12}, cuda_i32).reshape({1, 1, 2});
+    state.next_kv_cache_physical_blocks     = 2;
+    state.next_kv_cache_kernel_blocks       = 2;
+    steady->setMtpAsyncDeviceState(std::move(state));
+
+    auto steady_sp                = std::make_shared<SpeculativeExecutorStreamOutput>();
+    steady_sp->propose_step       = 1;
+    steady_sp->propose_tokens_gpu = torch::tensor({{6}}, cuda_i32);
+    steady_sp->all_probs          = torch::full({1, 8}, 0.25f, cuda_f32);
+    steady_sp->hidden_states      = torch::zeros({1, 2}, cuda_f32);
+    steady->setSPOutputBuffer(steady_sp);
+
+    auto fresh_sp           = std::make_shared<SpeculativeExecutorStreamOutput>();
+    fresh_sp->propose_step  = 1;
+    fresh_sp->tokens        = torch::tensor({{1, 7}}, torch::kInt32);  // CPU fallback proposal = 7
+    fresh_sp->all_probs     = torch::full({1, 8}, 0.5f, torch::kFloat32);
+    fresh_sp->hidden_states = torch::zeros({1, 2}, cuda_f32);
+    fresh->setSPOutputBuffer(fresh_sp);
+
+    StreamGroups                    groups({steady, fresh});
+    TestableMtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+    TensorHolder holder;
+
+    // 1. Gather preserves immutable prompt input_lengths ([4, 4]) on both steady and fresh rows.
+    auto gathered = processor.gatherDecodeModelInput(groups, holder);
+    ASSERT_TRUE(gathered.ok()) << gathered.status().ToString();
+    EXPECT_EQ((std::vector<int32_t>{4, 4}), toVec<int32_t>(gathered->input_lengths));
+
+    // 2. One-step draft sampler output unifies mixed CUDA/CPU proposal slices before torch::cat/stack.
+    SamplerOutput draft_sampler_output;
+    torch::Tensor draft_token_probs_d_t;
+    ASSERT_NO_THROW(
+        processor.updateOneStepDraftSamplerOutput(groups, draft_sampler_output, draft_token_probs_d_t, holder));
+    ASSERT_TRUE(draft_sampler_output.token_ids.defined());
+    EXPECT_TRUE(draft_sampler_output.token_ids.is_cuda());
+    EXPECT_EQ((std::vector<int32_t>{6, 7}), toVec<int32_t>(draft_sampler_output.token_ids));
+    ASSERT_TRUE(draft_token_probs_d_t.defined());
+    EXPECT_TRUE(draft_token_probs_d_t.is_cuda());
+    EXPECT_EQ(draft_token_probs_d_t.sizes(), (torch::IntArrayRef{2, 1, 8}));
 }
 
 }  // namespace rtp_llm

@@ -62,6 +62,11 @@ public:
     bool         detachSharedBlocksForRecompute(const BatchKVCacheResourcePtr& resource, int device_ready_reuse_length);
     // Outputs the resident key-prefix count; ordinary inserts report zero.
     void insertIntoCache(const InsertInfo& insert_info, size_t& resident_prefix_length);
+    // Synchronize full-block rolling cache keys up to max_seq_len (defaults to
+    // complete_token_ids->seqLength() when negative) before cache insertion.
+    void syncCacheKeys(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
+                       const CompleteTokenIdsPtr&     complete_token_ids,
+                       int                            max_seq_len = -1);
 
     // Decode-side P/D admission allocates destination blocks before cache handoff.  When pools are
     // temporarily full, waiters use this generation instead of polling malloc in a tight loop.
@@ -149,9 +154,9 @@ public:
     }
 
 private:
-    std::function<void()> allocationChangeCallback() const;
-    void                  reportMetricsLoop();
-    void reportPrefillCacheHitMetrics(const MallocInfo& malloc_info, bool is_first_malloc);
+    std::function<void()>             allocationChangeCallback() const;
+    void                              reportMetricsLoop();
+    void                              reportPrefillCacheHitMetrics(const MallocInfo& malloc_info, bool is_first_malloc);
     std::shared_ptr<BroadcastManager> createMultiRankBlockTransferManager() const;
 
     // 成员变量
