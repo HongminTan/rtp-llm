@@ -16,7 +16,9 @@ void debugPrintPyModelInputs(const torch_ext::PyModelInputs& inputs);
 // Copy common attention metadata to every tag while retaining each tag's block tables.
 void refreshTaggedAttentionInputs(torch_ext::PyModelInputs& inputs);
 // Defaults to true. Implementations may declare
-// prepare_cuda_graph_reads_host_metadata = False to skip D2H refreshes.
+// prepare_cuda_graph_reads_host_metadata = False when neither prepare nor
+// replay reads host metadata mirrors, allowing CudaGraphRunner to skip host
+// mirror refreshes and D2H copies.
 bool attnImplReadsHostMetadata(const py::object& attn_pyobj);
 
 }  // namespace rtp_llm

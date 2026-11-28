@@ -19,25 +19,37 @@ void refreshTaggedAttentionInputs(torch_ext::PyModelInputs& inputs) {
     }
 }
 
-// Tagged implementations require host metadata if any member needs it.
-bool attnImplReadsHostMetadata(const py::object& attn_pyobj) {
-    py::gil_scoped_acquire gil;
-    if (!attn_pyobj || attn_pyobj.is_none()) {
-        return false;  // nothing runs prepare_cuda_graph
+namespace {
+
+bool attnHandleReadsHostMetadata(const py::handle& impl) {
+    if (!impl || impl.is_none()) {
+        return true;
     }
-    const auto reads = [](const py::handle& impl) {
-        return !py::hasattr(impl, "prepare_cuda_graph_reads_host_metadata")
-               || impl.attr("prepare_cuda_graph_reads_host_metadata").cast<bool>();
-    };
-    if (py::isinstance<py::dict>(attn_pyobj)) {
-        for (auto item : attn_pyobj.cast<py::dict>()) {
-            if (reads(item.second)) {
+    if (py::isinstance<py::dict>(impl)) {
+        const auto impls = py::reinterpret_borrow<py::dict>(impl);
+        if (impls.size() == 0) {
+            return true;
+        }
+        for (auto item : impls) {
+            if (attnHandleReadsHostMetadata(item.second)) {
                 return true;
             }
         }
         return false;
     }
-    return reads(attn_pyobj);
+    return !py::hasattr(impl, "prepare_cuda_graph_reads_host_metadata")
+           || impl.attr("prepare_cuda_graph_reads_host_metadata").cast<bool>();
+}
+
+}  // namespace
+
+// Defaults to true unless every captured attention backend explicitly sets
+// prepare_cuda_graph_reads_host_metadata = False. Returning None or an empty
+// dict does not opt out, because the captured graph forward itself may still
+// consume host mirrors.
+bool attnImplReadsHostMetadata(const py::object& attn_pyobj) {
+    py::gil_scoped_acquire gil;
+    return attnHandleReadsHostMetadata(attn_pyobj);
 }
 
 // Helper function to print tensor info and data

@@ -34,7 +34,10 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-from rtp_llm.config.cuda_graph import CudaGraphSelectionMode, GenerationPrefillCudaGraphUnsupportedBackend
+from rtp_llm.config.cuda_graph import (
+    CudaGraphSelectionMode,
+    GenerationPrefillCudaGraphUnsupportedBackend,
+)
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.model_desc.deepseek_v4_model import DeepSeekV4Model
@@ -234,6 +237,9 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
             sched_meta_cache={},
             prepare_cuda_graph=lambda _attention_inputs: None,
             support_cuda_graph=lambda: True,
+            # Commit/proposal math reads device length mirrors and block
+            # tables; no host metadata values are consumed during replay.
+            prepare_cuda_graph_reads_host_metadata=False,
         )
 
     def _load_extra_weights(self, weights: ModelWeights) -> None:

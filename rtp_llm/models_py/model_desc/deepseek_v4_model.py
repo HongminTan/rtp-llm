@@ -527,6 +527,11 @@ class DeepSeekV4Model(GptModelBase):
             self._capture_canonical_final,
         )
 
+    @property
+    def supports_device_only_attention_metadata(self) -> bool:
+        """True when all attention/graph metadata consumers read device tensors."""
+        return bool(self.fp8_kv_cache)
+
     def _capture_canonical_layer(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None
     ) -> torch.Tensor:

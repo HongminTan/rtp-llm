@@ -257,7 +257,23 @@ class DSparkCudaGraphContractTest(unittest.TestCase):
         self.assertIsNotNone(metadata)
         self.assertEqual(metadata.sched_meta_cache, {})
         self.assertTrue(metadata.support_cuda_graph())
+        self.assertIs(metadata.prepare_cuda_graph_reads_host_metadata, False)
         metadata.prepare_cuda_graph(None)
+
+    def test_supports_device_only_attention_metadata_follows_fp8_kv_cache(self) -> None:
+        from rtp_llm.models_py.model_desc.deepseek_v4_model import DeepSeekV4Model
+
+        target = DeepSeekV4Model.__new__(DeepSeekV4Model)
+        target.fp8_kv_cache = True
+        self.assertTrue(target.supports_device_only_attention_metadata)
+        target.fp8_kv_cache = False
+        self.assertFalse(target.supports_device_only_attention_metadata)
+
+        dspark = _dspark_harness()
+        dspark.fp8_kv_cache = True
+        self.assertTrue(dspark.supports_device_only_attention_metadata)
+        dspark.fp8_kv_cache = False
+        self.assertFalse(dspark.supports_device_only_attention_metadata)
 
     def test_commit_write_uses_request_ids_positions_and_committed_ends(self) -> None:
         """The DSpARK commit call must not reconstruct positions from a QSL."""
